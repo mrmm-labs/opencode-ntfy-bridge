@@ -11,5 +11,11 @@
   "arrowParens": "always",
   "bracketSameLine": false,
   "bracketSpacing": true,
-  "ignorePatterns": ["CHANGELOG.md", "docs", "pnpm-lock.yaml", "graphify-out", ".release-please-manifest.json"]
+  "ignorePatterns": [
+    "CHANGELOG.md",
+    "docs",
+    "pnpm-lock.yaml",
+    "graphify-out",
+    ".release-please-manifest.json"
+  ]
 }
