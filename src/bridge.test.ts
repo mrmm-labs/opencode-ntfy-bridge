@@ -43,8 +43,10 @@ function setup(over: Record<string, unknown> = {}) {
   const replies: Array<{ sessionID: string; formID: string; answer: Answer }> =
     []
   let replyError: Error | undefined
+  let down = false
   const ntfy = {
     publish: async (p: Publish) => {
+      if (down) return undefined
       published.push(p)
       return `m${published.length}`
     },
@@ -70,6 +72,7 @@ function setup(over: Record<string, unknown> = {}) {
     advance: (ms: number) => (t += ms),
     now,
     failReplies: (e: Error) => (replyError = e),
+    setDown: (v: boolean) => (down = v),
     inbound: (message: string, time = Math.floor(t / 1000)) =>
       bridge.onInbound({ id: `in${time}`, time, message } satisfies Incoming),
   }
@@ -136,6 +139,20 @@ describe("Bridge routing", () => {
     })
     await s.bridge.onEvent(form("frm_3", "root"))
     assert.equal(s.published.length, 1, "back at the keyboard")
+  })
+
+  it("AC-12: no stray update when the prompt's push never went out", async () => {
+    const s = setup()
+    s.router.set("root", true)
+    s.setDown(true)
+    await s.bridge.onEvent(form("frm_1", "root"))
+    s.setDown(false)
+    await s.bridge.onEvent({
+      type: "form.replied",
+      data: { id: "frm_1", sessionID: "root" },
+    })
+    assert.equal(s.published.length, 0)
+    assert.equal(s.store.list()[0].state, "answered")
   })
 
   it("AC-2: a prompt answered in the TUI marks the push", async () => {

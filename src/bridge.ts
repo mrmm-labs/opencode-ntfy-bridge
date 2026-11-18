@@ -307,7 +307,8 @@ export class Bridge {
       answeredBy: "tui",
       answeredAt: this.now(),
     })
-    await this.update(p, note)
+    // Nothing reached the phone, so there is nothing to mark.
+    if (p.ntfyMessageID) await this.update(p, note)
   }
 
   private update(p: Pending, message: string) {
