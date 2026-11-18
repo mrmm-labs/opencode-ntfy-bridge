@@ -1,0 +1,115 @@
+/** Decides which sessions are mirrored to ntfy. */
+import { execFile } from "node:child_process"
+
+import type { Rule } from "./config.ts"
+import { log } from "./logger.ts"
+
+export type SessionFacts = { id: string; agent?: string; directory?: string }
+
+export type Classify = (argv: string[], s: SessionFacts) => Promise<boolean>
+
+/** Glob over `/`-separated paths: `**` any depth, `*` one segment, `?` one char. */
+export function globToRegExp(glob: string): RegExp {
+  let re = ""
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i]
+    if (c === "*" && glob[i + 1] === "*") {
+      i++
+      if (glob[i + 1] === "/") {
+        i++
+        re += "(?:.*/)?"
+      } else re += ".*"
+    } else if (c === "*") re += "[^/]*"
+    else if (c === "?") re += "[^/]"
+    else re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+  }
+  return new RegExp(`^${re}$`)
+}
+
+/** Runs a classifier: exit 0 means the session routes. Async, never through a shell. */
+export const runClassifier: Classify = ([cmd, ...args], s) =>
+  new Promise((resolve) => {
+    execFile(
+      cmd,
+      args,
+      {
+        timeout: 5000,
+        env: {
+          ...process.env,
+          NTFY_BRIDGE_SESSION: s.id,
+          NTFY_BRIDGE_AGENT: s.agent ?? "",
+          NTFY_BRIDGE_DIRECTORY: s.directory ?? "",
+        },
+      },
+      (err) => {
+        if (err && typeof err.code !== "number")
+          log("classifier_error", { message: err.message })
+        resolve(!err)
+      },
+    )
+  })
+
+export class Router {
+  private lastInput: number
+  private readonly manual = new Map<string, boolean>()
+  private readonly classified = new Map<string, Promise<boolean>>()
+
+  private readonly cfg: { away: { minutes: number }; rules: Rule[] }
+  private readonly classify: Classify
+  private readonly now: () => number
+
+  constructor(
+    cfg: { away: { minutes: number }; rules: Rule[] },
+    classify: Classify = runClassifier,
+    now: () => number = Date.now,
+  ) {
+    this.cfg = cfg
+    this.classify = classify
+    this.now = now
+    // Starting the TUI counts as input: nothing routes on away until the idle time passes.
+    this.lastInput = now()
+  }
+
+  /** Records operator input in the TUI. */
+  touch(): void {
+    this.lastInput = this.now()
+  }
+
+  away(): boolean {
+    return this.now() - this.lastInput >= this.cfg.away.minutes * 60_000
+  }
+
+  /** `true` / `false` force routing for a top-level session; `undefined` returns it to auto. */
+  set(rootSessionID: string, on: boolean | undefined): void {
+    if (on === undefined) this.manual.delete(rootSessionID)
+    else this.manual.set(rootSessionID, on)
+  }
+
+  mode(rootSessionID: string): "on" | "off" | "auto" {
+    const m = this.manual.get(rootSessionID)
+    return m === undefined ? "auto" : m ? "on" : "off"
+  }
+
+  async routes(root: SessionFacts): Promise<boolean> {
+    const m = this.manual.get(root.id)
+    if (m !== undefined) return m
+    if (!this.away()) return false
+    if (this.cfg.rules.length === 0) return true
+    for (const rule of this.cfg.rules)
+      if (await this.matches(rule, root)) return true
+    return false
+  }
+
+  private async matches(rule: Rule, s: SessionFacts): Promise<boolean> {
+    if (rule.agent && !rule.agent.test(s.agent ?? "")) return false
+    if (rule.directory && !globToRegExp(rule.directory).test(s.directory ?? ""))
+      return false
+    if (rule.command) {
+      const key = `${s.id}\0${rule.command.join("\0")}`
+      let p = this.classified.get(key)
+      if (!p) this.classified.set(key, (p = this.classify(rule.command, s)))
+      if (!(await p)) return false
+    }
+    return true
+  }
+}

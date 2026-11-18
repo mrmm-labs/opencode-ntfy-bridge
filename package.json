@@ -1,0 +1,61 @@
+{
+  "name": "opencode-ntfy-bridge",
+  "version": "0.0.0",
+  "description": "OpenCode plugin that mirrors questions and permission prompts of selected sessions to ntfy and lets you answer questions from your phone.",
+  "keywords": [
+    "notifications",
+    "ntfy",
+    "opencode",
+    "plugin"
+  ],
+  "homepage": "https://github.com/mrmm-labs/opencode-ntfy-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/mrmm-labs/opencode-ntfy-bridge/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mrmm-labs/opencode-ntfy-bridge.git"
+  },
+  "files": [
+    "index.js",
+    "tui.tsx",
+    "dist",
+    "ntfy-bridge.example.jsonc"
+  ],
+  "type": "module",
+  "main": "index.js",
+  "module": "index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./index.js",
+      "default": "./index.js"
+    },
+    "./tui": "./tui.tsx"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "OPENCODE_NTFY_BRIDGE_CONFIG=/nonexistent/ntfy-bridge.jsonc OPENCODE_NTFY_BRIDGE_DATA=/nonexistent/ntfy-bridge OPENCODE_NTFY_BRIDGE_LOG=/dev/null node --test --test-timeout=60000 --experimental-strip-types 'src/**/*.test.ts'",
+    "test:e2e": "OPENCODE_NTFY_BRIDGE_CONFIG=/nonexistent/ntfy-bridge.jsonc OPENCODE_NTFY_BRIDGE_DATA=/nonexistent/ntfy-bridge OPENCODE_NTFY_BRIDGE_LOG=/dev/null node --test --test-timeout=120000 --experimental-strip-types src/e2e.test.ts",
+    "lint": "oxlint && oxfmt --check .",
+    "lint:fix": "oxlint --fix . && oxfmt --write .",
+    "format": "oxfmt --write .",
+    "prepublishOnly": "pnpm run build && pnpm test"
+  },
+  "devDependencies": {
+    "@opencode/client": "2.3.2",
+    "@opencode/plugin": "2.3.2",
+    "@types/node": "^25.5.0",
+    "oxfmt": "0.41.0",
+    "oxlint": "1.56.0",
+    "typescript": "^5.0.0"
+  },
+  "packageManager": "pnpm@10.32.1"
+}
