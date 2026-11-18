@@ -84,7 +84,9 @@ file, default `bridge.log` in the state directory).
   become a numbered list. A subagent's question carries its agent name as a tag and the top-level
   session's title.
 - **Permission**: title `<project> · <agent> needs permission`, the action and its resources.
-- **Session finished / failed**: one low-priority push per run of a mirrored top-level session.
+- **Session finished / failed**: one low-priority push each time a mirrored top-level session
+  stops working. A session woken up again (for example by a background subagent reporting back)
+  sends another.
 - When a prompt is answered in the TUI, its notification is updated to say so.
 
 ### Replying
@@ -121,6 +123,9 @@ itself.
 - Each running TUI sends its own pushes: with two TUIs open you get every push twice.
 - Away means no prompt typed in any session of this TUI; keystrokes alone do not count.
 - Tier 2 (remote permission replies) is not implemented.
+- In OpenCode 2.3 the built-in subagents have no `question` tool, so subagent questions only come
+  from agents you give it to. Subagent permission prompts are mirrored as usual.
+- A session that is interrupted (for example by rejecting a permission) sends no finished push.
 
 ## Development
 
