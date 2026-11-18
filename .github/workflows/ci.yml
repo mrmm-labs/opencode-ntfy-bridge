@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - run: mise run lint
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - run: mise run build
+      # The built plugin must load: a server entry and a TUI entry.
+      - run: node -e "Promise.all([import('./index.js'), import('./dist/tui.js')]).then(([s, t]) => { if (s.default.id !== 'ntfy-bridge' || t.default.id !== 'ntfy-bridge.tui' || typeof t.default.setup !== 'function') process.exit(1) })"
+      # Lists what npm would ship, in the job log.
+      - run: npm pack --dry-run
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # The e2e job runs it against a real ntfy.
+      NTFY_E2E_SKIP: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - run: mise run test
+
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      # Service containers cannot pass a command, and ntfy needs `serve`.
+      - run: docker run -d --name ntfy -p 8080:80 binwiederhier/ntfy serve
+      - run: mise run install
+      - run: pnpm run test:e2e
+        env:
+          NTFY_E2E_URL: http://127.0.0.1:8080
+      - if: failure()
+        run: docker logs ntfy
