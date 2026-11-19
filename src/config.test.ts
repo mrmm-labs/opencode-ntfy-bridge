@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, it } from "node:test"
@@ -77,7 +77,7 @@ describe("parseConfig", () => {
 
 describe("loadConfig", () => {
   it("returns undefined when the file is missing (inert)", async () => {
-    assert.equal(await loadConfig("/nonexistent/ntfy-bridge.jsonc"), undefined)
+    assert.equal(await loadConfig("/nonexistent/oob-bridge.jsonc"), undefined)
   })
 
   it("reads jsonc", async () => {
@@ -90,7 +90,7 @@ describe("loadConfig", () => {
   })
 
   it("accepts the shipped example", async () => {
-    const example = join(import.meta.dirname, "..", "ntfy-bridge.example.jsonc")
+    const example = join(import.meta.dirname, "..", "oob-bridge.example.jsonc")
     const c = (await loadConfig(example)) as Config
     assert.equal(c.topics.out, "oc-3k9f2x7q-out")
     assert.equal(c.rules.length, 2)
@@ -98,14 +98,45 @@ describe("loadConfig", () => {
 
   it("resolves paths from the environment", () => {
     assert.equal(
-      configPath({ OPENCODE_NTFY_BRIDGE_CONFIG: "/x.jsonc" }),
+      configPath({ OPENCODE_OOB_BRIDGE_CONFIG: "/x.jsonc" }),
       "/x.jsonc",
     )
     assert.equal(
       configPath({ XDG_CONFIG_HOME: "/cfg" }),
-      "/cfg/opencode/ntfy-bridge.jsonc",
+      "/cfg/opencode/oob-bridge.jsonc",
     )
-    assert.equal(dataDir({ XDG_DATA_HOME: "/d" }), "/d/opencode/ntfy-bridge")
-    assert.equal(dataDir({ OPENCODE_NTFY_BRIDGE_DATA: "/e" }), "/e")
+    assert.equal(dataDir({ XDG_DATA_HOME: "/d" }), "/d/opencode/oob-bridge")
+    assert.equal(dataDir({ OPENCODE_OOB_BRIDGE_DATA: "/e" }), "/e")
+  })
+
+  it("falls back to the pre-rename names", async () => {
+    assert.equal(
+      configPath({ OPENCODE_NTFY_BRIDGE_CONFIG: "/o.jsonc" }),
+      "/o.jsonc",
+    )
+    assert.equal(dataDir({ OPENCODE_NTFY_BRIDGE_DATA: "/o" }), "/o")
+    const base = await mkdtemp(join(tmpdir(), "oobb-legacy-"))
+    await mkdir(join(base, "opencode"))
+    await writeFile(
+      join(base, "opencode", "ntfy-bridge.jsonc"),
+      JSON.stringify({
+        server: "https://n.example",
+        topics: { out: "a", in: "b" },
+      }),
+    )
+    const keys = ["XDG_CONFIG_HOME", "OPENCODE_OOB_BRIDGE_CONFIG"] as const
+    const prev = keys.map((k) => process.env[k])
+    process.env.XDG_CONFIG_HOME = base
+    delete process.env.OPENCODE_OOB_BRIDGE_CONFIG
+    try {
+      assert.equal(((await loadConfig()) as Config).server, "https://n.example")
+      assert.equal(await loadConfig(join(base, "other.jsonc")), undefined)
+    } finally {
+      keys.forEach((k, i) =>
+        prev[i] === undefined
+          ? delete process.env[k]
+          : (process.env[k] = prev[i]),
+      )
+    }
   })
 })

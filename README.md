@@ -1,4 +1,4 @@
-# opencode-ntfy-bridge
+# opencode-oob-bridge
 
 An OpenCode plugin that sends the questions and permission prompts of selected sessions to
 [ntfy](https://ntfy.sh), and lets you answer the questions from your phone.
@@ -7,6 +7,10 @@ When you step away from the terminal, a session that asks a question stops and w
 plugin the question arrives on your phone as a notification with one button per option. Tap a
 button, or reply with text, and the session continues. Permission prompts are sent too, but only
 as a heads-up: they are always answered in the TUI.
+
+Renamed from `opencode-ntfy-bridge` in 0.4.0: "out-of-band" because more channels than ntfy are
+planned. The old config file (`ntfy-bridge.jsonc`), state directory and `OPENCODE_NTFY_BRIDGE_*`
+variables are still read when the new ones are absent.
 
 ## Install
 
@@ -20,11 +24,11 @@ Put the folder where OpenCode loads plugins from (OpenCode 2 loads a directory t
 `index.js`, and its TUI through `tui.tsx`), or list the published package in your OpenCode config:
 
 ```jsonc
-{ "plugins": ["opencode-ntfy-bridge"] }
+{ "plugins": ["opencode-oob-bridge"] }
 ```
 
-Then copy [`ntfy-bridge.example.jsonc`](ntfy-bridge.example.jsonc) to
-`~/.config/opencode/ntfy-bridge.jsonc` and restart the TUI. **Without a config file the plugin does
+Then copy [`oob-bridge.example.jsonc`](oob-bridge.example.jsonc) to
+`~/.config/opencode/oob-bridge.jsonc` and restart the TUI. **Without a config file the plugin does
 nothing and opens no connection.**
 
 ## Configuration
@@ -32,7 +36,7 @@ nothing and opens no connection.**
 ```jsonc
 {
   "server": "https://ntfy.example.com",
-  "token": { "env": "NTFY_BRIDGE_TOKEN" }, // or { "command": ["pass", "show", "ntfy/opencode"] }
+  "token": { "env": "OOB_BRIDGE_TOKEN" }, // or { "command": ["pass", "show", "ntfy/opencode"] }
   "topics": { "out": "oc-3k9f2x7q-out", "in": "oc-3k9f2x7q-in" },
   "away": { "minutes": 10 },
   "rules": [{ "agent": "^coordinator$" }, { "directory": "**/my-app" }],
@@ -57,7 +61,7 @@ nothing and opens no connection.**
 
 A rule has any of `agent` (regular expression on the session's agent), `directory` (glob on the
 session's directory: `**` any depth, `*` one segment) and `command` (argv; exit code 0 routes; it
-gets `NTFY_BRIDGE_SESSION`, `NTFY_BRIDGE_AGENT` and `NTFY_BRIDGE_DIRECTORY`). Fields in one rule
+gets `OOB_BRIDGE_SESSION`, `OOB_BRIDGE_AGENT` and `OOB_BRIDGE_DIRECTORY`). Fields in one rule
 must all match; any matching rule routes the session. Rules look at the top-level session, so a
 subagent follows its parent.
 
@@ -67,7 +71,7 @@ Each push kind (`question`, `permission`, `finished`, `failed`, `closed`, `notic
 `title`, `message`, `tags` and `priority`, defined in `src/messages.ts`. Override any field in
 `messages`; a `profiles` entry (`agent` regular expression and/or `directory` glob, plus
 `messages`) overrides it again for matching sessions. `{{name}}` placeholders are filled per push
-and an unknown name renders empty; the placeholder list is in `ntfy-bridge.example.jsonc`. Text
+and an unknown name renders empty; the placeholder list is in `oob-bridge.example.jsonc`. Text
 from the session is redacted before it is placed, so `redact` still applies.
 
 ```jsonc
@@ -77,14 +81,14 @@ from the session is redacted before it is placed, so `redact` still applies.
 ]
 ```
 
-Environment overrides: `OPENCODE_NTFY_BRIDGE_CONFIG` (config file), `OPENCODE_NTFY_BRIDGE_DATA`
-(state directory, default `~/.local/share/opencode/ntfy-bridge`), `OPENCODE_NTFY_BRIDGE_LOG` (log
+Environment overrides: `OPENCODE_OOB_BRIDGE_CONFIG` (config file), `OPENCODE_OOB_BRIDGE_DATA`
+(state directory, default `~/.local/share/opencode/oob-bridge`), `OPENCODE_OOB_BRIDGE_LOG` (log
 file, default `bridge.log` in the state directory).
 
 ## Which sessions are mirrored
 
-- `/ntfy on` in a session mirrors it now; `/ntfy off` never mirrors it; `/ntfy auto` returns it to
-  the away rule; `/ntfy` shows the current mode. The setting covers the session's subagents.
+- `/oob on` in a session mirrors it now; `/oob off` never mirrors it; `/oob auto` returns it to
+  the away rule; `/oob` shows the current mode. `/ntfy` still works as an alias. The setting covers the session's subagents.
 - Otherwise, a session is mirrored when nobody has typed a message in the TUI for `away.minutes`
   and a rule matches. Typing again stops it for new prompts.
 

@@ -36,6 +36,10 @@ export const runClassifier: Classify = ([cmd, ...args], s) =>
         timeout: 5000,
         env: {
           ...process.env,
+          OOB_BRIDGE_SESSION: s.id,
+          OOB_BRIDGE_AGENT: s.agent ?? "",
+          OOB_BRIDGE_DIRECTORY: s.directory ?? "",
+          // Pre-rename names, for classifiers written against 0.x.
           NTFY_BRIDGE_SESSION: s.id,
           NTFY_BRIDGE_AGENT: s.agent ?? "",
           NTFY_BRIDGE_DIRECTORY: s.directory ?? "",

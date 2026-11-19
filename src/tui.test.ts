@@ -77,7 +77,7 @@ async function withEnv<T>(
 
 describe("TUI entry", () => {
   it("exports an OpenCode 2 TUI plugin", () => {
-    assert.equal(plugin.id, "ntfy-bridge.tui")
+    assert.equal(plugin.id, "oob-bridge.tui")
     assert.equal(typeof plugin.setup, "function")
   })
 
@@ -91,7 +91,7 @@ describe("TUI entry", () => {
     }) as typeof fetch
     try {
       const cleanup = await withEnv(
-        { OPENCODE_NTFY_BRIDGE_CONFIG: "/nonexistent/ntfy-bridge.jsonc" },
+        { OPENCODE_OOB_BRIDGE_CONFIG: "/nonexistent/oob-bridge.jsonc" },
         () => setup(f.ctx),
       )
       assert.equal(cleanup, undefined)
@@ -113,7 +113,7 @@ describe("TUI entry", () => {
     const cfg = join(dir, "c.jsonc")
     await writeFile(cfg, JSON.stringify({ server: "x", token: "literal" }))
     const f = fakeCtx()
-    const cleanup = await withEnv({ OPENCODE_NTFY_BRIDGE_CONFIG: cfg }, () =>
+    const cleanup = await withEnv({ OPENCODE_OOB_BRIDGE_CONFIG: cfg }, () =>
       setup(f.ctx),
     )
     assert.equal(cleanup, undefined)
@@ -135,17 +135,17 @@ describe("TUI entry", () => {
     const f = fakeCtx()
     const cleanup = await withEnv(
       {
-        OPENCODE_NTFY_BRIDGE_CONFIG: cfg,
-        OPENCODE_NTFY_BRIDGE_DATA: dir,
+        OPENCODE_OOB_BRIDGE_CONFIG: cfg,
+        OPENCODE_OOB_BRIDGE_DATA: dir,
         NTFYB_T: "tk_test_token_abcdefghijklmnop",
       },
       () => setup(f.ctx),
     )
     assert.ok(cleanup)
     assert.ok(f.handlers.has("form.created"))
-    const cmd = f.commands.find((c) => c.slash?.name === "ntfy")!
+    const cmd = f.commands.find((c) => c.slash?.name === "oob")!
     cmd.run("on")
-    assert.equal(f.toasts.at(-1), "ntfy routing: on")
+    assert.equal(f.toasts.at(-1), "oob routing: on")
     cmd.run("bogus")
     assert.match(f.toasts.at(-1)!, /Usage/)
 

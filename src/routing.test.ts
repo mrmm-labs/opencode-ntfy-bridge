@@ -80,7 +80,7 @@ describe("Router", () => {
     assert.equal(await runClassifier(["false"], { id: "s" }), false)
     assert.equal(
       await runClassifier(
-        ["sh", "-c", 'test "$NTFY_BRIDGE_AGENT" = coordinator'],
+        ["sh", "-c", 'test "$OOB_BRIDGE_AGENT" = coordinator'],
         {
           id: "s",
           agent: "coordinator",

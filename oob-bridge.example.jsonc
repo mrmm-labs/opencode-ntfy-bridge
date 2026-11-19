@@ -1,4 +1,4 @@
-// Copy to ~/.config/opencode/ntfy-bridge.jsonc (or set OPENCODE_NTFY_BRIDGE_CONFIG).
+// Copy to ~/.config/opencode/oob-bridge.jsonc (or set OPENCODE_OOB_BRIDGE_CONFIG).
 // Without this file the plugin does nothing and opens no connection.
 {
   // Your ntfy server.
@@ -6,7 +6,7 @@
 
   // Access token: from an environment variable, or from a command's stdout.
   // A token written directly in this file is refused.
-  "token": { "env": "NTFY_BRIDGE_TOKEN" },
+  "token": { "env": "OOB_BRIDGE_TOKEN" },
   // "token": { "command": ["pass", "show", "ntfy/opencode"] },
 
   // Pushes go to "out"; replies come back on "in". Use long random names.
@@ -25,8 +25,8 @@
   "rules": [
     { "agent": "^coordinator$" },
     { "directory": "**/my-app" },
-    // Exit code 0 routes. Gets NTFY_BRIDGE_SESSION, NTFY_BRIDGE_AGENT and
-    // NTFY_BRIDGE_DIRECTORY in its environment.
+    // Exit code 0 routes. Gets OOB_BRIDGE_SESSION, OOB_BRIDGE_AGENT and
+    // OOB_BRIDGE_DIRECTORY in its environment.
     // { "command": ["/usr/local/bin/should-notify"] },
   ],
 
