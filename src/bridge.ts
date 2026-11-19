@@ -1,24 +1,35 @@
 /**
- * The bridge: OpenCode events in, ntfy pushes out, ntfy replies back in.
+ * The bridge: OpenCode events in, pushes out to the enabled connectors, replies
+ * back in from any of them. It reads connector capabilities, never their type.
  *
- * Questions (tier 1) can be answered from ntfy. Permission prompts are tier 3:
- * push only. There is deliberately no code path that replies to a permission.
+ * Questions (tier 1) can be answered from a channel. Permission prompts are
+ * tier 3: push only. There is deliberately no code path that replies to one.
  */
 import { basename } from "node:path"
 
+import type {
+  Connector,
+  ConnectorStatus,
+  Inbound,
+  Outcome,
+  Pairing,
+  Push,
+  SendStats,
+} from "./connectors/types.ts"
 import type { Config } from "./config.ts"
 import { redact } from "./filter.ts"
 import {
-  parseReply,
   resolveAnswer,
   type Answer,
   type Question,
+  type Reply,
 } from "./inbound.ts"
 import { log } from "./logger.ts"
 import { format, type Kind, type Vars } from "./messages.ts"
-import type { HttpAction, Incoming, Ntfy } from "./ntfy.ts"
+import { noTelemetry, type Telemetry } from "./otel.ts"
 import type { Pending, PendingStore } from "./pending.ts"
 import type { Router, SessionFacts } from "./routing.ts"
+import { truncate } from "./util.ts"
 
 export type SessionInfo = {
   id: string
@@ -100,16 +111,11 @@ export type BridgeEvent =
       data: { sessionID: string }
     }
 
-const MAX_BUTTONS = 3
-const LABEL_MAX = 24
 const DETAIL_MAX = 60
 const THREAD_MAX = 40
 const EXPIRY_MS = 24 * 60 * 60 * 1000
 
 const str = (v: unknown) => (typeof v === "string" ? v : undefined)
-
-export const truncate = (s: string, n: number) =>
-  s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s
 
 function option(o: FormOption): { label: string; detail?: string } {
   if (typeof o === "string") return { label: o }
@@ -168,93 +174,116 @@ export function questionBody(qs: Question[]): string {
   return qs.map((q, i) => `${i + 1}) ${q.header}\n${block(q)}`).join("\n\n")
 }
 
-const buttons = (qs: Question[]) =>
-  qs.length === 1 &&
-  !qs[0].multiple &&
-  qs[0].options.length > 0 &&
-  qs[0].options.length <= MAX_BUTTONS
+const no = (text: string): Outcome => ({ ok: false, text })
 
-export function replyHint(id: string, qs: Question[], inTopic: string): string {
-  const to = `to topic ${inTopic}`
-  if (qs.length !== 1) return `Post \`#${id} <answer 1> | <answer 2> …\` ${to}`
-  if (qs[0].multiple) return `Post \`#${id} 1,3\` (numbers) ${to}`
-  if (buttons(qs)) return `Tap a button, or post \`#${id} <n or text>\` ${to}`
-  return `Reply by number: post \`#${id} <n or text>\` ${to}`
-}
-
-/** The question push: body and buttons. */
-export function renderQuestion(
-  cfg: Pick<Config, "server" | "topics" | "redact" | "messages">,
-  id: string,
-  questions: Question[],
-  threadTitle?: string,
-): { message: string; actions?: HttpAction[]; vars: Vars } {
-  const vars: Vars = {
-    id,
-    thread: threadTitle ? `[${truncate(threadTitle, THREAD_MAX)}]\n` : "",
-    body: redact(questionBody(questions), cfg.redact),
-    hint: replyHint(id, questions, cfg.topics.in),
-  }
-  const actions: HttpAction[] | undefined = buttons(questions)
-    ? questions[0].options.map((label, i) => ({
-        action: "http",
-        label: truncate(label, LABEL_MAX),
-        url: `${cfg.server}/${cfg.topics.in}`,
-        method: "POST",
-        body: JSON.stringify({ id, choice: i + 1 }),
-        // Kept on screen: the answer replaces it through sequence_id.
-        clear: false,
-      }))
-    : undefined
-  return {
-    message: format("question", vars, cfg.messages).message,
-    actions,
-    vars,
-  }
+export type BridgeStatus = {
+  channels: Array<{ id: string; enabled: boolean } & ConnectorStatus>
+  pending: number
 }
 
 export class Bridge {
-  private readonly abort = new AbortController()
+  private readonly controllers = new Map<string, AbortController>()
 
   private readonly cfg: Config
   private readonly host: Host
-  private readonly ntfy: Ntfy
+  private readonly channels: Connector[]
   private readonly store: PendingStore
   private readonly router: Router
   private readonly now: () => number
+  private readonly tel: Telemetry
 
   constructor(
     cfg: Config,
     host: Host,
-    ntfy: Ntfy,
+    channels: Connector[],
     store: PendingStore,
     router: Router,
     now: () => number = Date.now,
+    tel: Telemetry = noTelemetry(),
   ) {
+    this.tel = tel
     this.cfg = cfg
     this.host = host
-    this.ntfy = ntfy
+    this.channels = channels
     this.store = store
     this.router = router
     this.now = now
   }
 
-  /** Starts the reply subscription; returns at once. */
+  /** Every connector, enabled or not. */
+  connectors(): readonly Connector[] {
+    return this.channels
+  }
+
+  /** Starts the reply subscription of every enabled channel; returns at once. */
   start(): void {
+    for (const ch of this.channels) if (ch.enabled) this.run(ch)
+  }
+
+  private run(ch: Connector): void {
+    if (this.controllers.has(ch.id)) return
     const open = this.store.list().filter((p) => p.state === "pending")
-    // After a restart, replay the in topic from the oldest unanswered prompt.
-    const since = open.length
-      ? String(Math.floor(Math.min(...open.map((p) => p.askedAt)) / 1000))
-      : undefined
-    void this.ntfy.subscribe(
-      (m) => void this.onInbound(m),
-      this.abort.signal,
-      since,
+    const ac = new AbortController()
+    this.controllers.set(ch.id, ac)
+    ch.start(
+      (m) => this.onInbound(ch, m),
+      ac.signal,
+      open.length ? Math.min(...open.map((p) => p.askedAt)) : undefined,
     )
   }
 
+  /** Turns a channel on or off now. False when there is no such channel. */
+  setEnabled(id: string, on: boolean): boolean {
+    const ch = this.channels.find((c) => c.id === id)
+    if (!ch) return false
+    ch.enabled = on
+    if (on) this.run(ch)
+    else {
+      this.controllers.get(id)?.abort()
+      this.controllers.delete(id)
+    }
+    return true
+  }
+
+  status(): BridgeStatus {
+    return {
+      channels: this.channels.map((c) => ({
+        id: c.id,
+        enabled: c.enabled,
+        ...c.status(),
+      })),
+      pending: this.store.list().filter((p) => p.state === "pending").length,
+    }
+  }
+
+  /** A notice to every enabled channel; which of them took it. */
+  async test(): Promise<Array<{ id: string; ok: boolean }>> {
+    const f = this.fmt("notice", { text: "Test push: this channel works." })
+    const to = this.active()
+    const { ok } = await this.dispatch("notice", to, () => f, {})
+    return to.map((c) => ({ id: c.id, ok: ok[c.id] === true }))
+  }
+
+  /** Starts pairing a connector; the span lasts until it is paired or the code expires. */
+  async pair(c: Connector): Promise<Pairing | undefined> {
+    if (!c.capabilities.pairing || !c.pair) return undefined
+    const span = this.tel.begin("oob.pair", {
+      attrs: { "connector.type": c.type },
+    })
+    try {
+      const p = await c.pair()
+      void p.done.then((ok) => span.end({ ok }, ok ? undefined : "expired"))
+      return p
+    } catch (err) {
+      span.end({ ok: false }, (err as Error).name)
+      log("pair_error", { channel: c.id, message: (err as Error).message })
+      return undefined
+    }
+  }
+
   async stop(): Promise<void> {
-    this.abort.abort()
+    for (const ac of this.controllers.values()) ac.abort()
+    this.controllers.clear()
     await this.store.flush()
   }
 
@@ -288,6 +317,23 @@ export class Bridge {
     }
   }
 
+  private active(): Connector[] {
+    return this.channels.filter((c) => c.enabled)
+  }
+
+  /** A channel never throws by contract; a bug in one must not stop the others. */
+  private async safely<T>(
+    ch: Connector,
+    fn: () => Promise<T>,
+  ): Promise<T | undefined> {
+    try {
+      return await fn()
+    } catch (err) {
+      log("channel_error", { channel: ch.id, message: (err as Error).message })
+      return undefined
+    }
+  }
+
   /** Root facts when the session routes, else undefined. */
   private async routed(sessionID: string) {
     const rootID = this.host.root(sessionID)
@@ -296,7 +342,21 @@ export class Bridge {
       rootID === sessionID ? undefined : this.host.session(sessionID),
     ])
     const facts = { id: rootID, agent: root?.agent, directory: root?.directory }
-    if (!(await this.router.routes(facts))) return undefined
+    const decision = await this.router.decide(facts)
+    const to = decision.routes ? this.targets(rootID) : []
+    this.tel
+      .begin("oob.route", {
+        session: rootID,
+        attrs: {
+          mode: decision.mode,
+          reason: decision.reason,
+          routes: decision.routes,
+          channel: this.router.channel(rootID) ?? this.cfg.defaultChannel,
+          targets: to.length,
+        },
+      })
+      .end()
+    if (!decision.routes) return undefined
     const project = root?.directory ? basename(root.directory) : "opencode"
     const who = asking ?? root
     const vars: Vars = {
@@ -307,7 +367,101 @@ export class Bridge {
       sessionID: rootID,
       directory: root?.directory ?? "",
     }
-    return { rootID, root, facts, vars }
+    const session = {
+      id: rootID,
+      name:
+        this.cfg.redact.mode === "title"
+          ? project
+          : `${project} · ${vars.session}`,
+    }
+    return { rootID, root, facts, vars, session, to }
+  }
+
+  /** Enabled channels a session's pushes go to: its own choice, else the default. */
+  private targets(rootID: string): Connector[] {
+    const pick = this.router.channel(rootID) ?? this.cfg.defaultChannel
+    return this.active().filter((c) => pick === "all" || c.id === pick)
+  }
+
+  /** What a connector can use of the session and the question: the rest is dropped, so it degrades to plain text. */
+  private shape(
+    ch: Connector,
+    session: NonNullable<Push["session"]>,
+    prompt?: NonNullable<Push["prompt"]>,
+  ): Pick<Push, "session" | "prompt"> {
+    const cap = ch.capabilities
+    const buttons =
+      prompt &&
+      cap.buttons &&
+      prompt.questions.every((q) => !q.multiple || cap.multiselect)
+    return {
+      session: cap.threads ? session : undefined,
+      prompt: buttons ? prompt : undefined,
+    }
+  }
+
+  /**
+   * Sends one push to the given connectors under an `oob.push` span, one child
+   * span per connector. With `refs` it marks earlier messages instead: edited
+   * where the connector can, a follow-up message where it cannot.
+   */
+  private async dispatch(
+    kind: Kind,
+    to: Connector[],
+    build: (ch: Connector) => Push,
+    o: { root?: string; pending?: string; refs?: Record<string, string> },
+  ): Promise<{ refs: Record<string, string>; ok: Record<string, boolean> }> {
+    const span = this.tel.begin("oob.push", {
+      session: o.root,
+      attrs: { "push.kind": kind, "pending.id": o.pending },
+    })
+    const refs: Record<string, string> = {}
+    const ok: Record<string, boolean> = {}
+    await Promise.all(
+      to.map(async (ch) => {
+        const old = o.refs?.[ch.id]
+        // Nothing reached that connector, so there is nothing to mark.
+        if (o.refs && old === undefined) return
+        const edit = old !== undefined && ch.capabilities.edit && ch.update
+        const stats: SendStats = {}
+        const attrs = { "connector.type": ch.type, "push.kind": kind }
+        const child = this.tel.begin(edit ? "oob.update" : "oob.send", {
+          session: o.root,
+          parent: span.id,
+          attrs: { ...attrs, "pending.id": o.pending },
+        })
+        const push = { ...build(ch), stats }
+        const res = await this.safely(ch, async () =>
+          edit ? ch.update!(old, push) : ch.send(push),
+        )
+        const sent = res !== undefined && res !== false
+        ok[ch.id] = sent
+        if (typeof res === "string") refs[ch.id] = res
+        this.tel.count(sent ? "oob.pushes" : "oob.push.errors", attrs)
+        child.end(
+          { ok: sent, http_status: stats.httpStatus, retries: stats.retries },
+          sent ? undefined : "send-failed",
+        )
+      }),
+    )
+    span.end({ targets: to.length })
+    return { refs, ok }
+  }
+
+  /** Records where a prompt's messages went. */
+  private remember(p: Pending, refs: Record<string, string>) {
+    if (Object.keys(refs).length)
+      this.store.update(p.id, {
+        refs: { ...this.store.get(p.id)?.refs, ...refs },
+      })
+  }
+
+  private pendingGauge() {
+    this.tel.gauge(
+      "oob.pending",
+      {},
+      this.store.list().filter((p) => p.state === "pending").length,
+    )
   }
 
   private async onForm(
@@ -319,22 +473,35 @@ export class Bridge {
     const r = await this.routed(form.sessionID)
     if (!r) return
     const id = this.store.newId()
-    const q = renderQuestion(this.cfg, id, questions, r.root?.title)
-    const f = this.fmt("question", { ...r.vars, ...q.vars }, r.facts)
-    const title = f.title
+    const qvars = (hint: string): Vars => ({
+      ...r.vars,
+      id,
+      thread: r.root?.title ? `[${truncate(r.root.title, THREAD_MAX)}]\n` : "",
+      body: redact(questionBody(questions), this.cfg.redact),
+      hint,
+    })
     const p = this.store.put({
       id,
       kind: "question",
       requestID: form.id,
       sessionID: form.sessionID,
       rootSessionID: r.rootID,
-      title,
+      title: this.fmt("question", qvars(""), r.facts).title,
       questions,
       askedAt: this.now(),
       state: "pending",
     })
-    const msgID = await this.ntfy.publish({ ...f, actions: q.actions })
-    if (msgID) this.store.update(p.id, { ntfyMessageID: msgID })
+    this.pendingGauge()
+    const sent = await this.dispatch(
+      "question",
+      r.to,
+      (ch) => ({
+        ...this.fmt("question", qvars(ch.hint(id, questions)), r.facts),
+        ...this.shape(ch, r.session, { id, questions }),
+      }),
+      { root: r.rootID, pending: id },
+    )
+    this.remember(p, sent.refs)
   }
 
   private async onPermission(
@@ -357,27 +524,36 @@ export class Bridge {
       },
       r.facts,
     )
-    const title = f.title
     const p = this.store.put({
       id,
       kind: "permission",
       requestID: d.id,
       sessionID: d.sessionID,
       rootSessionID: r.rootID,
-      title,
+      title: f.title,
       askedAt: this.now(),
       state: "pending",
     })
-    const msgID = await this.ntfy.publish(f)
-    if (msgID) this.store.update(p.id, { ntfyMessageID: msgID })
+    this.pendingGauge()
+    const sent = await this.dispatch(
+      "permission",
+      r.to,
+      (ch) => ({ ...f, ...this.shape(ch, r.session) }),
+      { root: r.rootID, pending: id },
+    )
+    this.remember(p, sent.refs)
   }
 
   private async onFinished(sessionID: string, failed: boolean) {
     if (this.host.root(sessionID) !== sessionID) return
     const r = await this.routed(sessionID)
     if (!r) return
-    await this.ntfy.publish(
-      this.fmt(failed ? "failed" : "finished", r.vars, r.facts),
+    const f = this.fmt(failed ? "failed" : "finished", r.vars, r.facts)
+    await this.dispatch(
+      failed ? "failed" : "finished",
+      r.to,
+      (c) => ({ ...f, ...this.shape(c, r.session) }),
+      { root: r.rootID },
     )
   }
 
@@ -387,19 +563,31 @@ export class Bridge {
     if (!p) return this.router.touch()
     if (p.state !== "pending") return
     this.router.touch()
+    const cancelled = note === "Cancelled"
     this.store.update(p.id, {
-      state: note === "Cancelled" ? "cancelled" : "answered",
+      state: cancelled ? "cancelled" : "answered",
       answeredBy: "tui",
       answeredAt: this.now(),
     })
-    // Nothing reached the phone, so there is nothing to mark.
-    if (p.ntfyMessageID) await this.update(p, note)
+    this.pendingGauge()
+    if (!cancelled) this.answered(p, "tui")
+    await this.markAnswered(p, note)
   }
 
-  private update(p: Pending, note: string) {
-    return this.ntfy.publish({
-      ...this.fmt("closed", { id: p.id, title: p.title, note }),
-      sequence_id: p.ntfyMessageID,
+  /** Counts an answer and how long the prompt waited for it. */
+  private answered(p: Pending, by: "phone" | "tui", ch?: Connector) {
+    const attrs = { answered_by: by, "connector.type": ch?.type }
+    this.tel.count("oob.answers", attrs)
+    this.tel.record("oob.answer.latency_ms", attrs, this.now() - p.askedAt)
+  }
+
+  /** Marks the prompt's message on every connector that carries it. */
+  private async markAnswered(p: Pending, note: string) {
+    const f = this.fmt("closed", { id: p.id, title: p.title, note })
+    await this.dispatch("closed", this.active(), () => f, {
+      root: p.rootSessionID,
+      pending: p.id,
+      refs: p.refs ?? {},
     })
   }
 
@@ -407,62 +595,119 @@ export class Bridge {
     return format(kind, vars, this.cfg.messages, this.cfg.profiles, facts)
   }
 
-  private notice(message: string) {
-    return this.ntfy.publish(this.fmt("notice", { text: message }))
-  }
-
-  async onInbound(m: Incoming): Promise<void> {
+  private async onInbound(
+    ch: Connector,
+    m: Inbound,
+  ): Promise<Outcome | undefined> {
+    const span = this.tel.begin("oob.inbound", {
+      attrs: { kind: m.kind, "connector.type": ch.type },
+    })
+    const info: { outcome: string; pending?: Pending } = { outcome: "ignored" }
     try {
-      const reply = parseReply(m.message)
-      if (!reply) return
-      const p = this.store.get(reply.id)
-      if (!p || this.now() - p.askedAt > EXPIRY_MS)
-        return void (await this.notice(
-          `#${reply.id}: unknown or expired id, not applied.`,
-        ))
-      if (p.state !== "pending") {
-        // A reply older than the answer is a replay after reconnect, not a second answer.
-        if (m.id === p.replyID) return
-        if (
-          p.answeredAt !== undefined &&
-          m.time < Math.floor(p.answeredAt / 1000)
-        )
-          return
-        return void (await this.notice(
-          `#${p.id}: already answered, not applied.`,
-        ))
+      const out = await this.apply(ch, m, info)
+      if (out && !out.ok && !m.inline) {
+        const f = this.fmt("notice", { text: out.text })
+        await this.dispatch("notice", [ch], () => f, {
+          root: info.pending?.rootSessionID,
+          pending: info.pending?.id,
+        })
       }
-      if (p.kind === "permission")
-        return void (await this.notice(
-          `#${p.id}: permissions can only be answered in the OpenCode TUI.`,
-        ))
-      const answer = resolveAnswer(p.questions ?? [], reply)
-      if (!answer)
-        return void (await this.notice(
-          `#${p.id}: could not read that answer. ${replyHint(p.id, p.questions ?? [], this.cfg.topics.in)}`,
-        ))
-      // Claimed before the await: the first answer wins, from either side.
-      this.store.update(p.id, {
-        state: "answered",
-        answeredBy: "phone",
-        answeredAt: this.now(),
-        replyID: m.id,
-      })
-      try {
-        await this.host.replyForm(p.sessionID, p.requestID, answer)
-      } catch (err) {
-        log("reply_error", { id: p.id, message: (err as Error).message })
-        this.store.update(p.id, { state: "failed" })
-        return void (await this.notice(
-          `#${p.id}: not applied (already answered or expired).`,
-        ))
-      }
-      await this.update(
-        p,
-        `Answered from ntfy: ${redact(Object.values(answer).flat().join(" | "), this.cfg.redact)}`,
+      if (info.outcome !== "applied" && info.outcome !== "ignored")
+        this.tel.count("oob.inbound.rejected", {
+          "connector.type": ch.type,
+          reason: info.outcome,
+        })
+      span.setSession(info.pending?.rootSessionID)
+      span.end(
+        { outcome: info.outcome, "pending.id": info.pending?.id },
+        out && !out.ok ? info.outcome : undefined,
       )
+      return out
     } catch (err) {
       log("inbound_error", { message: (err as Error).message })
+      span.end({ outcome: "error" }, "error")
+      return undefined
     }
+  }
+
+  private async apply(
+    ch: Connector,
+    m: Inbound,
+    info: { outcome: string; pending?: Pending },
+  ): Promise<Outcome | undefined> {
+    // Sending text into a session is not built: nothing is applied.
+    if (m.kind !== "answer") {
+      log("inbound_ignored", { connector: ch.id, kind: m.kind })
+      return undefined
+    }
+    let id: string
+    let reply: Reply
+    if (m.pendingId) {
+      id = m.pendingId
+      reply =
+        m.choice !== undefined ? { id, choice: m.choice } : { id, text: m.text }
+    } else if (m.replyTo) {
+      // A reply to the message itself; one that answers nothing we track is not ours.
+      const target = this.store.byRef(ch.id, m.replyTo)
+      if (!target) return undefined
+      id = target.id
+      reply = { id, text: m.text }
+    } else return undefined
+    const p = this.store.get(id)
+    info.pending = p
+    if (!p || this.now() - p.askedAt > EXPIRY_MS) {
+      info.outcome = "expired"
+      return no(`#${id}: unknown or expired id, not applied.`)
+    }
+    if (p.state !== "pending") {
+      // A reply older than the answer is a replay after reconnect, not a second answer.
+      if (m.id === p.replyID) return undefined
+      if (
+        p.answeredAt !== undefined &&
+        m.time < Math.floor(p.answeredAt / 1000)
+      )
+        return undefined
+      info.outcome = "duplicate"
+      return no(`#${p.id}: already answered, not applied.`)
+    }
+    if (p.kind === "permission") {
+      info.outcome = "permission-refused"
+      return no(
+        `#${p.id}: permissions can only be answered in the OpenCode TUI.`,
+      )
+    }
+    const answer = resolveAnswer(p.questions ?? [], reply)
+    if (!answer) {
+      info.outcome = "unreadable"
+      return no(
+        `#${p.id}: could not read that answer. ${ch.hint(p.id, p.questions ?? [])}`,
+      )
+    }
+    // Claimed before the await: the first answer wins, from either side.
+    this.store.update(p.id, {
+      state: "answered",
+      answeredBy: "phone",
+      answeredVia: ch.id,
+      answeredAt: this.now(),
+      replyID: m.id,
+    })
+    this.pendingGauge()
+    try {
+      await this.host.replyForm(p.sessionID, p.requestID, answer)
+    } catch (err) {
+      log("reply_error", { id: p.id, message: (err as Error).message })
+      this.store.update(p.id, { state: "failed" })
+      this.pendingGauge()
+      info.outcome = "failed"
+      return no(`#${p.id}: not applied (already answered or expired).`)
+    }
+    const given = redact(
+      Object.values(answer).flat().join(" | "),
+      this.cfg.redact,
+    )
+    info.outcome = "applied"
+    this.answered(p, "phone", ch)
+    await this.markAnswered(p, `Answered from ${ch.id}: ${given}`)
+    return { ok: true, text: `Answered: ${given}` }
   }
 }

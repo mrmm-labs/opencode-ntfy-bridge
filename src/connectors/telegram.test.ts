@@ -1,0 +1,832 @@
+import assert from "node:assert/strict"
+import { mkdtemp, readFile, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { describe, it } from "node:test"
+
+import { Bridge, toQuestions, type BridgeEvent } from "../bridge.ts"
+import { parseConfig, type Config } from "../config.ts"
+import { PendingStore } from "../pending.ts"
+import { Router } from "../routing.ts"
+import { sleep } from "../util.ts"
+import { fakeTelegram } from "./fake-telegram.test-util.ts"
+import { TelegramConnector, type TelegramOptions } from "./telegram.ts"
+import type { Connector, Inbound, Outcome } from "./types.ts"
+
+const CHAT = 4242
+
+/** What an inbound says, in the shape the old reply grammar had. */
+const said = (g: Inbound) =>
+  g.replyTo
+    ? { ref: g.replyTo, text: g.text }
+    : g.choice !== undefined
+      ? { id: g.pendingId, choice: g.choice }
+      : { id: g.pendingId, text: g.text }
+
+const from = { connector: "ntfy", chat: "x" }
+
+const yesNo = toQuestions([
+  {
+    key: "q0",
+    type: "string",
+    title: "Deploy",
+    description: "Deploy <now> & go?",
+    options: [{ label: "Yes" }, { label: "No" }],
+  },
+])
+const pick = toQuestions([
+  {
+    key: "q0",
+    type: "multiselect",
+    description: "Which?",
+    options: [{ label: "a" }, { label: "b" }, { label: "c" }],
+  },
+])
+
+async function rig(
+  over: Partial<TelegramOptions> = {},
+  handler: (m: Inbound) => Promise<Outcome | undefined> | undefined = () =>
+    undefined,
+) {
+  const tg = await fakeTelegram()
+  const dir = await mkdtemp(join(tmpdir(), "oobb-tg-"))
+  const channel = new TelegramConnector({
+    token: async () => tg.token,
+    chatId: String(CHAT),
+    apiBase: tg.url,
+    offsetFile: join(dir, "offset.json"),
+    backoff: { min: 10, max: 40 },
+    pollSeconds: 1,
+    toastAfterMs: 400,
+    ...over,
+  })
+  const got: Inbound[] = []
+  const ac = new AbortController()
+  channel.start(async (m) => {
+    got.push(m)
+    return handler(m)
+  }, ac.signal)
+  return {
+    tg,
+    dir,
+    channel,
+    got,
+    ac,
+    async done() {
+      ac.abort()
+      await tg.close()
+    },
+  }
+}
+
+describe("TelegramConnector outbound", () => {
+  it("sends a question with one button per option, HTML-escaped", async () => {
+    const r = await rig()
+    const ref = await r.channel.send({
+      title: "shop · agent asks",
+      message: "Deploy <now> & go?\nkey=password: hunter2222",
+      priority: 4,
+      prompt: { id: "ab12", questions: yesNo },
+    })
+    assert.equal(ref, "501")
+    const c = r.tg.of("sendMessage")[0].body
+    assert.equal(c.chat_id, String(CHAT))
+    assert.equal(c.parse_mode, "HTML")
+    assert.equal(c.disable_notification, false)
+    assert.match(c.text, /^<b>shop · agent asks<\/b>\n/)
+    assert.match(c.text, /Deploy &lt;now&gt; &amp; go\?/)
+    assert.doesNotMatch(c.text, /hunter2222/)
+    assert.deepEqual(c.reply_markup.inline_keyboard, [
+      [{ text: "Yes", callback_data: "ab12:1" }],
+      [{ text: "No", callback_data: "ab12:2" }],
+    ])
+    assert.ok(
+      c.reply_markup.inline_keyboard
+        .flat()
+        .every(
+          (b: { callback_data: string }) =>
+            Buffer.byteLength(b.callback_data) <= 64,
+        ),
+    )
+    await r.done()
+  })
+
+  it("is silent for low priority and sends no keyboard without a prompt", async () => {
+    const r = await rig()
+    await r.channel.send({ title: "t", message: "m", priority: 2 })
+    const c = r.tg.of("sendMessage")[0].body
+    assert.equal(c.disable_notification, true)
+    assert.equal(c.reply_markup, undefined)
+    await r.done()
+  })
+
+  it("offers numbered text replies, not buttons, for several questions or many options", async () => {
+    const r = await rig()
+    const two = [...yesNo, ...yesNo.map((q) => ({ ...q, key: "q1" }))]
+    await r.channel.send({
+      message: "m",
+      prompt: { id: "ab12", questions: two },
+    })
+    const many = toQuestions([
+      {
+        key: "q0",
+        type: "string",
+        options: Array.from({ length: 11 }, (_, i) => ({ label: `o${i}` })),
+      },
+    ])
+    await r.channel.send({
+      message: "m",
+      prompt: { id: "cd34", questions: many },
+    })
+    for (const c of r.tg.of("sendMessage"))
+      assert.equal(c.body.reply_markup, undefined)
+    assert.match(r.channel.hint("ab12", two), /one answer per question/)
+    assert.match(r.channel.hint("cd34", many), /number or text/)
+    await r.done()
+  })
+
+  it("update replaces the text and removes the keyboard", async () => {
+    const r = await rig()
+    const ref = await r.channel.send({
+      message: "q",
+      prompt: { id: "ab12", questions: yesNo },
+    })
+    await r.channel.update(ref!, { title: "Deploy", message: "Answered" })
+    const c = r.tg.of("editMessageText")[0].body
+    assert.equal(c.message_id, Number(ref))
+    assert.match(c.text, /Answered/)
+    assert.deepEqual(c.reply_markup, { inline_keyboard: [] })
+    await r.done()
+  })
+
+  it("never sends without a paired chat, and a failed send returns undefined", async () => {
+    const r = await rig({ chatId: undefined })
+    assert.equal(await r.channel.send({ message: "m" }), undefined)
+    assert.equal(r.tg.of("sendMessage").length, 0)
+    r.channel.setChat(String(CHAT))
+    r.tg.fail("sendMessage", 400)
+    assert.equal(await r.channel.send({ message: "m" }), undefined)
+    assert.match(r.channel.status().lastError ?? "", /sendMessage failed/)
+    await r.done()
+  })
+
+  it("honours retry_after on 429", async () => {
+    const r = await rig()
+    r.tg.fail("sendMessage", 429, { parameters: { retry_after: 0 } })
+    const ref = await r.channel.send({ message: "m" })
+    assert.ok(ref)
+    assert.equal(r.tg.of("sendMessage").length, 2)
+    await r.done()
+  })
+})
+
+describe("TelegramConnector inbound", () => {
+  it("a button tap answers the callback and hands the choice on", async () => {
+    const r = await rig({}, async () => ({ ok: true, text: "Answered: No" }))
+    const ref = await r.channel.send({
+      message: "q",
+      prompt: { id: "ab12", questions: yesNo },
+    })
+    r.tg.callback(CHAT, Number(ref), "ab12:2")
+    await r.tg.waitFor(() => r.tg.of("answerCallbackQuery")[0])
+    assert.equal(r.got[0].inline, true)
+    assert.deepEqual(said(r.got[0]), { id: "ab12", choice: 2 })
+    assert.equal(r.tg.of("answerCallbackQuery")[0].body.text, "Answered: No")
+    await r.done()
+  })
+
+  it("clears the spinner at once when the outcome is slow", async () => {
+    const r = await rig({ toastAfterMs: 20 }, async () => {
+      await sleep(300)
+      return { ok: true, text: "late" }
+    })
+    r.tg.callback(CHAT, 1, "ab12:1")
+    const t = await r.tg.waitFor(() => r.tg.of("answerCallbackQuery")[0])
+    assert.equal(t.body.text, "Sending…")
+    await r.done()
+  })
+
+  it("multiple choice toggles ticks in place and Done sends the numbers", async () => {
+    const r = await rig({}, async () => ({ ok: true, text: "ok" }))
+    const ref = await r.channel.send({
+      message: "q",
+      prompt: { id: "ab12", questions: pick },
+    })
+    const first = r.tg.of("sendMessage")[0].body.reply_markup.inline_keyboard
+    assert.deepEqual(first.at(-1), [{ text: "Done", callback_data: "ab12:d" }])
+
+    r.tg.callback(CHAT, Number(ref), "ab12:d")
+    const none = await r.tg.waitFor(() => r.tg.of("answerCallbackQuery")[0])
+    assert.match(none.body.text, /at least one/)
+    assert.equal(r.got.length, 0)
+
+    r.tg.callback(CHAT, Number(ref), "ab12:t3")
+    r.tg.callback(CHAT, Number(ref), "ab12:t1")
+    await r.tg.waitFor(() => r.tg.of("editMessageReplyMarkup")[1])
+    const kb = r.tg.of("editMessageReplyMarkup")[1].body.reply_markup
+      .inline_keyboard
+    assert.deepEqual(
+      kb.map((row: Array<{ text: string }>) => row[0].text),
+      ["✓ a", "b", "✓ c", "Done"],
+    )
+    r.tg.callback(CHAT, Number(ref), "ab12:d")
+    await r.tg.waitFor(() => r.got[0])
+    assert.deepEqual(said(r.got[0]), { id: "ab12", text: "1,3" })
+    await r.done()
+  })
+
+  it("a toggle on a prompt this process does not know says so", async () => {
+    const r = await rig()
+    r.tg.callback(CHAT, 1, "zz99:t1")
+    const t = await r.tg.waitFor(() => r.tg.of("answerCallbackQuery")[0])
+    assert.match(t.body.text, /No longer active/)
+    assert.equal(r.got.length, 0)
+    await r.done()
+  })
+
+  it("a text reply to the message, or #id text, becomes a reply", async () => {
+    const r = await rig()
+    r.tg.message(CHAT, "later", 501)
+    r.tg.message(CHAT, "#ab12 2 | yes")
+    r.tg.message(CHAT, "#cd34 1", 501)
+    r.tg.message(CHAT, "just chatting")
+    await r.tg.waitFor(() => r.got[2])
+    assert.deepEqual(r.got.map(said), [
+      { ref: "501", text: "later" },
+      { id: "ab12", text: "2 | yes" },
+      { id: "cd34", text: "1" },
+    ])
+    assert.ok(r.got.every((g) => !g.inline))
+    await r.done()
+  })
+
+  it("hears only the paired chat", async () => {
+    const r = await rig()
+    r.tg.message(999, "#ab12 1")
+    r.tg.message(999, "hi", 501)
+    r.tg.callback(999, 501, "ab12:1")
+    r.tg.message(CHAT, "#ab12 1")
+    await r.tg.waitFor(() => r.got[0])
+    assert.equal(r.got.length, 1)
+    assert.equal(r.tg.of("answerCallbackQuery").length, 0)
+    await r.done()
+  })
+
+  it("keeps polling through errors and resumes from the stored offset", async () => {
+    const r = await rig()
+    r.tg.fail("getUpdates", 502)
+    r.tg.message(CHAT, "#ab12 1")
+    await r.tg.waitFor(() => r.got[0])
+    assert.equal(r.channel.status().connected, true)
+    await r.tg.waitFor(async () => {
+      try {
+        return JSON.parse(await readFile(join(r.dir, "offset.json"), "utf8"))
+      } catch {}
+    })
+    const saved = JSON.parse(await readFile(join(r.dir, "offset.json"), "utf8"))
+    assert.equal(typeof saved.offset, "number")
+    r.ac.abort()
+    await sleep(50)
+    const before = r.tg.of("getUpdates").length
+    await sleep(300)
+    assert.ok(r.tg.of("getUpdates").length - before <= 1, "stopped polling")
+
+    const again = new TelegramConnector({
+      token: async () => r.tg.token,
+      chatId: String(CHAT),
+      apiBase: r.tg.url,
+      offsetFile: join(r.dir, "offset.json"),
+      pollSeconds: 1,
+    })
+    const ac = new AbortController()
+    again.start(async () => undefined, ac.signal)
+    const last = await r.tg.waitFor(() => r.tg.of("getUpdates").at(-1))
+    await r.tg.waitFor(
+      () =>
+        r.tg.of("getUpdates").at(-1)!.body.offset === saved.offset || undefined,
+    )
+    assert.ok(last)
+    ac.abort()
+    await r.tg.close()
+  })
+})
+
+describe("TelegramConnector pairing", () => {
+  it("stores the chat that sends the one-time code and ignores others", async () => {
+    const paired: string[] = []
+    const r = await rig({
+      chatId: undefined,
+      onPaired: (c) => paired.push(c),
+    })
+    const p = await r.channel.pair()
+    assert.match(p.code, /^[A-Z2-9]{6}$/)
+    assert.equal(p.link, `https://t.me/oob_test_bot?start=${p.code}`)
+    assert.ok(p.expiresAt > Date.now())
+    r.tg.message(777, "WRONG1")
+    r.tg.message(777, "hello")
+    r.tg.message(888, `/start ${p.code.toLowerCase()}`)
+    assert.equal(await p.done, true)
+    assert.deepEqual(paired, ["888"])
+    assert.equal(r.channel.paired(), true)
+    assert.equal(r.got.length, 0, "no reply reached the bridge")
+    const hello = await r.tg.waitFor(() => r.tg.of("sendMessage")[0])
+    assert.equal(hello.body.chat_id, "888")
+    // Now only that chat is heard, and the code is spent.
+    r.tg.message(777, p.code)
+    r.tg.message(888, "#ab12 1")
+    await r.tg.waitFor(() => r.got[0])
+    assert.equal(r.got.length, 1)
+    assert.equal(r.channel.status().lastError, undefined)
+    await r.done()
+  })
+
+  it("the code expires", async () => {
+    const r = await rig({ chatId: undefined, pairTtlMs: 30 })
+    const p = await r.channel.pair()
+    assert.equal(await p.done, false)
+    r.tg.message(777, p.code)
+    await sleep(100)
+    assert.equal(r.channel.paired(), false)
+    await r.done()
+  })
+
+  it("does not poll while unpaired and not pairing", async () => {
+    const r = await rig({ chatId: undefined })
+    await sleep(100)
+    assert.equal(r.tg.of("getUpdates").length, 0)
+    assert.equal(r.channel.status().lastError, "not paired")
+    await r.done()
+  })
+})
+
+// The bridge around real channel objects.
+function stubChannel(id: string) {
+  const sent: Array<{ message: string; title?: string; prompt?: unknown }> = []
+  const updates: Array<{ ref: string; message: string }> = []
+  let onInbound: ((m: Inbound) => Promise<Outcome | undefined>) | undefined
+  const ch: Connector = {
+    id,
+    type: id,
+    capabilities: {
+      buttons: true,
+      edit: true,
+      multiselect: false,
+      threads: false,
+      pairing: false,
+      inboundPrompt: false,
+    },
+    enabled: true,
+    start: (cb) => void (onInbound = cb),
+    hint: () => `answer via ${id}`,
+    send: async (p) => {
+      sent.push(p)
+      return `${id}${sent.length}`
+    },
+    update: async (ref, p) => {
+      updates.push({ ref, message: p.message })
+      return true
+    },
+    status: () => ({}),
+  }
+  return { ch, sent, updates, reply: (m: Inbound) => onInbound!(m) }
+}
+
+async function bridgeRig(over: Record<string, unknown> = {}) {
+  const t = await rig()
+  const cfg = parseConfig({
+    channels: {
+      ntfy: { server: "https://ntfy.example", topics: { out: "o", in: "i" } },
+      telegram: { token: { env: "X" } },
+    },
+    ...over,
+  }) as Config
+  const stub = stubChannel("ntfy")
+  const replies: unknown[] = []
+  const sessions: Record<
+    string,
+    { id: string; agent: string; directory: string; title: string }
+  > = {
+    root: { id: "root", agent: "coord", directory: "/w/shop", title: "Fix" },
+  }
+  const router = new Router(cfg, async () => true)
+  router.set("root", true)
+  const store = new PendingStore()
+  const bridge = new Bridge(
+    cfg,
+    {
+      session: async (id) => sessions[id],
+      root: (id) => id,
+      replyForm: async (sessionID, formID, answer) => {
+        replies.push({ sessionID, formID, answer })
+      },
+    },
+    [stub.ch, t.channel],
+    store,
+    router,
+  )
+  bridge.start()
+  const ask = (id: string, fields: unknown[]) =>
+    bridge.onEvent({
+      type: "form.created",
+      data: {
+        form: {
+          id,
+          sessionID: "root",
+          metadata: { kind: "question" },
+          fields,
+        },
+      },
+    } as BridgeEvent)
+  return { ...t, stub, replies, bridge, store, ask, router }
+}
+
+const yesNoField = {
+  key: "q0",
+  type: "string",
+  description: "Go?",
+  options: [{ label: "Yes" }, { label: "No" }],
+}
+
+describe("Bridge with telegram and another channel", () => {
+  it("fans a question out to both channels, each with its own hint", async () => {
+    const b = await bridgeRig()
+    await b.ask("frm_1", [yesNoField])
+    const id = b.store.list()[0].id
+    assert.match(b.stub.sent[0].message, /answer via ntfy/)
+    const tgMsg = b.tg.of("sendMessage")[0].body
+    assert.match(tgMsg.text, /Tap a button, or reply/)
+    assert.equal(
+      tgMsg.reply_markup.inline_keyboard[0][0].callback_data,
+      `${id}:1`,
+    )
+    assert.deepEqual(b.store.list()[0].refs, { ntfy: "ntfy1", telegram: "501" })
+    await b.done()
+  })
+
+  it("a tap on telegram answers the form and marks both messages", async () => {
+    const b = await bridgeRig()
+    await b.ask("frm_1", [yesNoField])
+    const id = b.store.list()[0].id
+    b.tg.callback(CHAT, 501, `${id}:1`)
+    await b.tg.waitFor(() => b.tg.of("editMessageText")[0])
+    assert.deepEqual(b.replies, [
+      { sessionID: "root", formID: "frm_1", answer: { q0: "Yes" } },
+    ])
+    const toast = b.tg.of("answerCallbackQuery")[0].body.text
+    assert.equal(toast, "Answered: Yes")
+    const edit = b.tg.of("editMessageText")[0].body
+    assert.match(edit.text, /Answered from telegram: Yes/)
+    assert.deepEqual(edit.reply_markup, { inline_keyboard: [] })
+    assert.deepEqual(b.stub.updates, [
+      { ref: "ntfy1", message: "Answered from telegram: Yes" },
+    ])
+    assert.equal(b.store.get(id)!.answeredVia, "telegram")
+
+    // A second tap is refused with a toast, not applied.
+    b.tg.callback(CHAT, 501, `${id}:2`)
+    await b.tg.waitFor(() => b.tg.of("answerCallbackQuery")[1])
+    assert.match(
+      b.tg.of("answerCallbackQuery")[1].body.text,
+      /already answered/,
+    )
+    assert.equal(b.replies.length, 1)
+    assert.equal(b.tg.of("sendMessage").length, 1, "no notice for a tap")
+    await b.done()
+  })
+
+  it("an answer from the other channel updates the telegram message", async () => {
+    const b = await bridgeRig()
+    await b.ask("frm_1", [yesNoField])
+    const id = b.store.list()[0].id
+    await b.stub.reply({
+      kind: "answer",
+      id: "n1",
+      time: Math.floor(Date.now() / 1000),
+      pendingId: id,
+      text: "2",
+      from,
+    })
+    assert.deepEqual(b.replies, [
+      { sessionID: "root", formID: "frm_1", answer: { q0: "No" } },
+    ])
+    const edit = b.tg.of("editMessageText")[0].body
+    assert.match(edit.text, /Answered from ntfy: No/)
+    await b.done()
+  })
+
+  it("an answer in the TUI updates both, and a late tap is refused", async () => {
+    const b = await bridgeRig()
+    await b.ask("frm_1", [yesNoField])
+    const id = b.store.list()[0].id
+    await b.bridge.onEvent({
+      type: "form.replied",
+      data: { id: "frm_1", sessionID: "root" },
+    })
+    assert.match(b.tg.of("editMessageText")[0].body.text, /Answered in the TUI/)
+    assert.match(b.stub.updates[0].message, /Answered in the TUI/)
+    b.tg.callback(CHAT, 501, `${id}:1`)
+    await b.tg.waitFor(() => b.tg.of("answerCallbackQuery")[0])
+    assert.match(
+      b.tg.of("answerCallbackQuery")[0].body.text,
+      /already answered/,
+    )
+    assert.equal(b.replies.length, 0)
+    await b.done()
+  })
+
+  it("a text reply to the telegram message answers it, even a custom answer", async () => {
+    const b = await bridgeRig()
+    await b.ask("frm_1", [yesNoField])
+    b.tg.message(CHAT, "tomorrow", 501)
+    await b.tg.waitFor(() => b.replies[0])
+    assert.deepEqual(b.replies[0], {
+      sessionID: "root",
+      formID: "frm_1",
+      answer: { q0: "tomorrow" },
+    })
+    await b.done()
+  })
+
+  it("a reply the bridge cannot read gets a notice in the chat it came from only", async () => {
+    const b = await bridgeRig()
+    await b.ask("frm_1", [{ ...yesNoField, custom: false }])
+    b.tg.message(CHAT, "maybe", 501)
+    const n = await b.tg.waitFor(() => b.tg.of("sendMessage")[1])
+    assert.match(n.body.text, /could not read that answer/)
+    assert.equal(b.stub.sent.length, 1, "ntfy heard nothing about it")
+    await b.done()
+  })
+
+  it("several questions: no buttons, one numbered reply answers all", async () => {
+    const b = await bridgeRig()
+    await b.ask("frm_1", [
+      { ...yesNoField, key: "q0", title: "A" },
+      { ...yesNoField, key: "q1", title: "B" },
+    ])
+    assert.equal(b.tg.of("sendMessage")[0].body.reply_markup, undefined)
+    b.tg.message(CHAT, "1 | no", 501)
+    await b.tg.waitFor(() => b.replies[0])
+    assert.deepEqual((b.replies[0] as { answer: unknown }).answer, {
+      q0: "Yes",
+      q1: "No",
+    })
+    await b.done()
+  })
+
+  it("permissions: message without buttons, never answerable", async () => {
+    const b = await bridgeRig()
+    await b.bridge.onEvent({
+      type: "permission.asked",
+      data: {
+        id: "per_1",
+        sessionID: "root",
+        action: "bash",
+        resources: ["rm -rf x"],
+      },
+    })
+    const m = b.tg.of("sendMessage")[0].body
+    assert.equal(m.reply_markup, undefined)
+    assert.match(m.text, /bash: rm -rf x/)
+    assert.match(m.text, /Answer in the OpenCode TUI/)
+    b.tg.message(CHAT, "1", 501)
+    const n = await b.tg.waitFor(() => b.tg.of("sendMessage")[1])
+    assert.match(n.body.text, /only be answered in the OpenCode TUI/)
+    assert.equal(b.replies.length, 0)
+    await b.done()
+  })
+
+  it("finished pushes reach every channel; a disabled channel is skipped", async () => {
+    const b = await bridgeRig()
+    await b.bridge.onEvent({
+      type: "session.execution.succeeded",
+      data: { sessionID: "root" },
+    })
+    assert.equal(b.stub.sent.length, 1)
+    assert.equal(b.tg.of("sendMessage").length, 1)
+    b.bridge.setEnabled("telegram", false)
+    await b.bridge.onEvent({
+      type: "session.execution.succeeded",
+      data: { sessionID: "root" },
+    })
+    assert.equal(b.stub.sent.length, 2)
+    assert.equal(b.tg.of("sendMessage").length, 1)
+    assert.deepEqual(
+      b.bridge.status().channels.map((c) => [c.id, c.enabled]),
+      [
+        ["ntfy", true],
+        ["telegram", false],
+      ],
+    )
+    assert.deepEqual(await b.bridge.test(), [{ id: "ntfy", ok: true }])
+    b.bridge.setEnabled("telegram", true)
+    assert.deepEqual(await b.bridge.test(), [
+      { id: "ntfy", ok: true },
+      { id: "telegram", ok: true },
+    ])
+    await b.done()
+  })
+
+  it("one channel failing does not stop the other", async () => {
+    const b = await bridgeRig()
+    b.tg.fail("sendMessage", 500)
+    await b.ask("frm_1", [yesNoField])
+    assert.equal(b.stub.sent.length, 1)
+    assert.deepEqual(b.store.list()[0].refs, { ntfy: "ntfy1" })
+    await b.done()
+  })
+})
+
+const finish = (b: Awaited<ReturnType<typeof bridgeRig>>) =>
+  b.bridge.onEvent({
+    type: "session.execution.succeeded",
+    data: { sessionID: "root" },
+  })
+
+describe("Bridge channel choice", () => {
+  it("uses every enabled channel by default", async () => {
+    const b = await bridgeRig()
+    await finish(b)
+    assert.equal(b.stub.sent.length, 1)
+    assert.equal(b.tg.of("sendMessage").length, 1)
+    await b.done()
+  })
+
+  it("defaultChannel limits pushes to that channel", async () => {
+    const b = await bridgeRig({ defaultChannel: "telegram" })
+    await finish(b)
+    await b.ask("frm_1", [yesNoField])
+    assert.equal(b.stub.sent.length, 0)
+    assert.equal(b.tg.of("sendMessage").length, 2)
+    assert.deepEqual(b.store.list()[0].refs, { telegram: "502" })
+    await b.done()
+  })
+
+  it("a session's own channel beats the default, and subagents follow their root", async () => {
+    const b = await bridgeRig({ defaultChannel: "telegram" })
+    b.router.set("root", true, "ntfy")
+    await finish(b)
+    assert.equal(b.stub.sent.length, 1)
+    assert.equal(b.tg.of("sendMessage").length, 0)
+    b.router.set("root", true, "all")
+    await finish(b)
+    assert.equal(b.stub.sent.length, 2)
+    assert.equal(b.tg.of("sendMessage").length, 1)
+    b.router.set("root", true)
+    await finish(b)
+    assert.equal(b.stub.sent.length, 2, "back to the default: telegram only")
+    assert.equal(b.tg.of("sendMessage").length, 2)
+    await b.done()
+  })
+
+  it("a chosen channel that is switched off gets nothing, and the others stay quiet", async () => {
+    const b = await bridgeRig()
+    b.router.set("root", true, "telegram")
+    b.bridge.setEnabled("telegram", false)
+    await finish(b)
+    assert.equal(b.stub.sent.length, 0)
+    assert.equal(b.tg.of("sendMessage").length, 0)
+    await b.done()
+  })
+
+  it("replies are taken from any channel whatever the session chose", async () => {
+    const b = await bridgeRig()
+    b.router.set("root", true, "telegram")
+    await b.ask("frm_1", [yesNoField])
+    const id = b.store.list()[0].id
+    await b.stub.reply({
+      kind: "answer",
+      id: "n1",
+      time: Math.floor(Date.now() / 1000),
+      pendingId: id,
+      text: "1",
+      from,
+    })
+    assert.equal(b.replies.length, 1)
+    await b.done()
+  })
+})
+
+describe("TelegramConnector forum topics", () => {
+  const session = { id: "root", name: "shop · Fix checkout" }
+
+  it("outside a forum posts to the main chat with no thread", async () => {
+    const r = await rig()
+    await r.channel.send({ message: "m", session })
+    assert.equal(r.tg.of("createForumTopic").length, 0)
+    assert.equal(r.tg.of("sendMessage")[0].body.message_thread_id, undefined)
+    await r.channel.send({ message: "again", session })
+    assert.equal(r.tg.of("getChat").length, 1, "asked once")
+    await r.done()
+  })
+
+  it("in a forum, one topic per session, named project · title, reused", async () => {
+    const r = await rig({ topicsFile: undefined })
+    r.tg.forum = true
+    await Promise.all([
+      r.channel.send({ message: "a", session }),
+      r.channel.send({ message: "b", session }),
+    ])
+    await r.channel.send({
+      message: "c",
+      session: { id: "other", name: "api · Docs" },
+    })
+    const topics = r.tg.of("createForumTopic")
+    assert.deepEqual(
+      topics.map((t) => t.body.name),
+      ["shop · Fix checkout", "api · Docs"],
+    )
+    const threads = r.tg.of("sendMessage").map((c) => c.body.message_thread_id)
+    assert.deepEqual(threads, [9001, 9001, 9002])
+    await r.done()
+  })
+
+  it("remembers topics across restarts", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "oobb-topics-"))
+    const topicsFile = join(dir, "topics.json")
+    const first = await rig({ topicsFile })
+    first.tg.forum = true
+    await first.channel.send({ message: "a", session })
+    const saved = JSON.parse(await readFile(topicsFile, "utf8"))
+    assert.deepEqual(saved, { [`${CHAT}:root`]: 9001 })
+    await first.done()
+
+    const second = await rig({ topicsFile })
+    second.tg.forum = true
+    await second.channel.send({ message: "b", session })
+    assert.equal(second.tg.of("createForumTopic").length, 0)
+    assert.equal(second.tg.of("sendMessage")[0].body.message_thread_id, 9001)
+    await second.done()
+  })
+
+  it("makes a new topic when the old one was deleted, once", async () => {
+    const r = await rig()
+    r.tg.forum = true
+    await r.channel.send({ message: "a", session })
+    r.tg.fail("sendMessage", 400, {
+      description: "Bad Request: message thread not found",
+    })
+    const ref = await r.channel.send({ message: "b", session })
+    assert.ok(ref)
+    assert.equal(r.tg.of("createForumTopic").length, 2)
+    assert.equal(r.tg.of("sendMessage").at(-1)!.body.message_thread_id, 9002)
+    await r.done()
+  })
+
+  it("falls back to the main chat when the topic cannot be created", async () => {
+    const r = await rig()
+    r.tg.forum = true
+    r.tg.fail("createForumTopic", 400, { description: "not enough rights" })
+    const ref = await r.channel.send({ message: "a", session })
+    assert.ok(ref)
+    assert.equal(r.tg.of("sendMessage")[0].body.message_thread_id, undefined)
+    assert.match(r.channel.status().lastError ?? "", /not enough rights/)
+    await r.done()
+  })
+
+  it("a plain message in a topic is not a reply, a real reply and #id still are", async () => {
+    const r = await rig()
+    r.tg.message(CHAT, "hello", 9001, 9001)
+    r.tg.message(CHAT, "later", 777, 9001)
+    r.tg.message(CHAT, "#ab12 1", 9001, 9001)
+    await r.tg.waitFor(() => r.got[1])
+    assert.deepEqual(r.got.map(said), [
+      { ref: "777", text: "later" },
+      { id: "ab12", text: "1" },
+    ])
+    await r.done()
+  })
+
+  it("the bridge names a topic after the project and session, or the project alone when hidden", async () => {
+    const a = await bridgeRig()
+    a.tg.forum = true
+    await a.bridge.onEvent({
+      type: "session.execution.succeeded",
+      data: { sessionID: "root" },
+    })
+    assert.equal(a.tg.of("createForumTopic")[0].body.name, "shop · Fix")
+    await a.done()
+    const b = await bridgeRig({ redact: "title" })
+    b.tg.forum = true
+    await b.bridge.onEvent({
+      type: "session.execution.succeeded",
+      data: { sessionID: "root" },
+    })
+    assert.equal(b.tg.of("createForumTopic")[0].body.name, "shop")
+    await b.done()
+  })
+})
+
+describe("pending store refs", () => {
+  it("reads the pre-channel ntfyMessageID field", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "oobb-pend-"))
+    const file = join(dir, "pending.jsonl")
+    await writeFile(
+      file,
+      `${JSON.stringify({ id: "ab12", kind: "question", requestID: "f", sessionID: "s", rootSessionID: "s", title: "t", askedAt: Date.now(), state: "pending", ntfyMessageID: "m9" })}\n`,
+    )
+    const store = new PendingStore(file)
+    await store.load()
+    assert.deepEqual(store.get("ab12")!.refs, { ntfy: "m9" })
+    assert.equal(store.byRef("ntfy", "m9")!.id, "ab12")
+  })
+})

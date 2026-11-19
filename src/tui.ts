@@ -1,18 +1,21 @@
 /**
  * TUI entry: wires OpenCode 2 TUI events and the form reply API to the bridge,
- * and adds the `/oob on|off|auto` command. Without a config file it returns
- * before touching the network.
+ * and adds the `/oob` command and settings menu. Without a config file it
+ * returns before touching the network.
  */
 import type { Plugin } from "@opencode/plugin/tui"
 import { join } from "node:path"
 
 import { Bridge, type BridgeEvent, type Host } from "./bridge.ts"
+import { connectorTypes } from "./connectors/index.ts"
+import type { Connector } from "./connectors/types.ts"
 import { dataDir, loadConfig } from "./config.ts"
 import { log } from "./logger.ts"
-import { Ntfy } from "./ntfy.ts"
+import { runCommand, type App } from "./menu.ts"
+import { resolveOtel, Telemetry } from "./otel.ts"
 import { PendingStore } from "./pending.ts"
 import { Router } from "./routing.ts"
-import { resolveToken } from "./token.ts"
+import { SettingsStore } from "./settings.ts"
 
 type Context = Plugin.Context
 
@@ -56,8 +59,8 @@ export async function setup(
   ctx: Context,
 ): Promise<(() => Promise<void>) | undefined> {
   // Registered before any await: OpenCode 2.3.2 ignores keymap layers
-  // registered after setup has yielded, so /ntfy never appeared.
-  let router: Router | undefined
+  // registered after setup has yielded, so /oob never appeared.
+  let app: App | undefined
   // A layer defaults to the "base" input mode, which is inactive while the
   // prompt has focus, so slash completion never saw the command.
   ctx.keymap.layer(() => ({
@@ -66,35 +69,10 @@ export async function setup(
     commands: [
       {
         id: "oob-bridge.route",
-        title: "ntfy: route this session (on, off, auto)",
+        title: "oob: settings, routing and channels",
+        palette: true,
         slash: { name: "oob", aliases: ["ntfy"], arguments: true },
-        run: (input) => {
-          if (!router)
-            return ctx.ui.toast.show({
-              message: "ntfy bridge is not configured or still starting",
-              variant: "warning",
-            })
-          router.touch()
-          const route = ctx.ui.router.current()
-          if (route.type !== "session")
-            return ctx.ui.toast.show({
-              message: "Open a session first",
-              variant: "warning",
-            })
-          const root = ctx.data.session.root(route.sessionID) || route.sessionID
-          const arg = (input ?? "").trim().toLowerCase()
-          if (arg === "on" || arg === "off" || arg === "auto")
-            router.set(root, arg === "auto" ? undefined : arg === "on")
-          else if (arg)
-            return ctx.ui.toast.show({
-              message: "Usage: /oob on|off|auto",
-              variant: "warning",
-            })
-          ctx.ui.toast.show({
-            message: `oob routing: ${router.mode(root)}`,
-            variant: "info",
-          })
-        },
+        run: (input) => runCommand(ctx, app, input),
       },
     ],
   }))
@@ -106,22 +84,46 @@ export async function setup(
     return undefined
   }
 
-  let token: Promise<string | undefined> | undefined
-  const ntfy = new Ntfy({
-    server: cfg.server,
-    topics: cfg.topics,
-    actionAuth: cfg.actionAuth,
-    // Resolved once; a failed command is retried on the next request.
-    token: () =>
-      (token ??= resolveToken(cfg.token).catch((err) => {
-        token = undefined
-        throw err
-      })),
-  })
-  const store = new PendingStore(join(dataDir(), "pending.jsonl"))
+  // Off unless an endpoint is configured, here or in the OTLP environment variables.
+  const tel = new Telemetry(resolveOtel(cfg.otel))
+  const dir = dataDir()
+  const settings = new SettingsStore(join(dir, "settings.json"))
+  await settings.load()
+  const connectors: Connector[] = Object.entries(cfg.channels).map(
+    ([name, c]) => {
+      const connector = connectorTypes[c.type].create(
+        {
+          name,
+          dir,
+          tel,
+          settings: {
+            get: () => settings.channel(name),
+            set: (patch) => settings.set(name, patch),
+          },
+        },
+        c.options,
+      )
+      // A choice made in the TUI wins over the file.
+      connector.enabled = settings.channel(name).enabled ?? c.enabled
+      return connector
+    },
+  )
+
+  const store = new PendingStore(join(dir, "pending.jsonl"))
   await store.load()
-  router = new Router(cfg)
-  const bridge = new Bridge(cfg, host(ctx), ntfy, store, router)
+  const router = new Router(cfg)
+  for (const [id, v] of Object.entries(settings.sessions()))
+    router.set(id, v.on, v.channel)
+  const bridge = new Bridge(
+    cfg,
+    host(ctx),
+    connectors,
+    store,
+    router,
+    Date.now,
+    tel,
+  )
+  app = { router, bridge, settings }
 
   const off = EVENTS.map((type) =>
     ctx.data.on(
@@ -131,10 +133,16 @@ export async function setup(
   )
 
   bridge.start()
-  log("started", { server: cfg.server, rules: cfg.rules.length })
+  log("started", {
+    otel: tel.enabled(),
+    channels: connectors.map((c) => c.id),
+    rules: cfg.rules.length,
+  })
   return async () => {
     for (const f of off) f()
     await bridge.stop()
+    await settings.flush()
+    await tel.dispose()
   }
 }
 

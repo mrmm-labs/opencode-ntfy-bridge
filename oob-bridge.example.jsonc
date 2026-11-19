@@ -1,21 +1,42 @@
 // Copy to ~/.config/opencode/oob-bridge.jsonc (or set OPENCODE_OOB_BRIDGE_CONFIG).
 // Without this file the plugin does nothing and opens no connection.
 {
-  // Your ntfy server.
-  "server": "https://ntfy.example.com",
+  // Delivery channels. The key is the channel's name; "type" defaults to the
+  // name ("ntfy", "telegram"), so a second instance of a type needs an
+  // explicit type, e.g. "phone": { "type": "telegram", ... }.
+  "channels": {
+    "ntfy": {
+      // Your ntfy server.
+      "server": "https://ntfy.example.com",
 
-  // Access token: from an environment variable, or from a command's stdout.
-  // A token written directly in this file is refused.
-  "token": { "env": "OOB_BRIDGE_TOKEN" },
-  // "token": { "command": ["pass", "show", "ntfy/opencode"] },
+      // Access token: from an environment variable, or from a command's stdout.
+      // A token written directly in this file is refused.
+      "token": { "env": "OOB_BRIDGE_TOKEN" },
+      // "token": { "command": ["pass", "show", "ntfy/opencode"] },
 
-  // Pushes go to "out"; replies come back on "in". Use long random names.
-  "topics": { "out": "oc-3k9f2x7q-out", "in": "oc-3k9f2x7q-in" },
+      // Pushes go to "out"; replies come back on "in". Use long random names.
+      "topics": { "out": "oc-3k9f2x7q-out", "in": "oc-3k9f2x7q-in" },
 
-  // Buttons carry the token so they work on a server that denies anonymous
-  // writes. The token is then readable by anyone who can read "out".
-  // false: buttons carry nothing; grant anonymous write-only on "in" instead.
-  "actionAuth": true,
+      // Buttons carry the token so they work on a server that denies anonymous
+      // writes. The token is then readable by anyone who can read "out".
+      // false: buttons carry nothing; grant anonymous write-only on "in" instead.
+      "actionAuth": true,
+
+      // "enabled": false,
+    },
+
+    // A bot from @BotFather. Then run /oob pair telegram in the TUI: it shows a
+    // link and QR code, and stores the chat. Or set "chatId" yourself.
+    // Telegram bot chats are not end-to-end encrypted: see "redact" below.
+    // "telegram": {
+    //   "token": { "command": ["pass", "show", "telegram/opencode-bot"] },
+    //   // "chatId": 123456789,
+    // },
+  },
+
+  // Where pushes go for a session that chose no channel with /oob on <channel>:
+  // "all" (every enabled channel), "ntfy" or "telegram".
+  "defaultChannel": "all",
 
   // Mirror sessions after this many minutes without input in the TUI.
   "away": { "minutes": 10 },
@@ -53,4 +74,10 @@
 
   // Only 3 (push only) is supported.
   "permissions": { "tier": 3 },
+
+  // OpenTelemetry (OTLP/HTTP JSON). Off unless an endpoint is set here or in
+  // OTEL_EXPORTER_OTLP_ENDPOINT (and OTEL_EXPORTER_OTLP_HEADERS). Spans and
+  // metrics carry ids, kinds, counts and timings: never message text, titles,
+  // answers, tokens, chat ids or URLs.
+  // "otel": { "endpoint": "http://localhost:4318", "headers": { "authorization": "Bearer ..." } },
 }

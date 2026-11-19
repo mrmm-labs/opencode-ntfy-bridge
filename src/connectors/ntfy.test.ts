@@ -3,7 +3,7 @@ import { createServer } from "node:net"
 import { describe, it } from "node:test"
 
 import { fakeNtfy } from "./fake-ntfy.test-util.ts"
-import { registerSecret } from "./filter.ts"
+import { registerSecret } from "../filter.ts"
 import { Ntfy, type Incoming } from "./ntfy.ts"
 
 const topics = { out: "oc-out", in: "oc-in" }

@@ -3,7 +3,7 @@ import { describe, it } from "node:test"
 
 import {
   Bridge,
-  renderQuestion,
+  questionBody,
   toQuestions,
   type BridgeEvent,
   type Host,
@@ -11,7 +11,16 @@ import {
 } from "./bridge.ts"
 import { parseConfig, type Config } from "./config.ts"
 import type { Answer } from "./inbound.ts"
-import type { Incoming, Ntfy, Publish } from "./ntfy.ts"
+import { format } from "./messages.ts"
+import {
+  NtfyConnector,
+  questionActions,
+  replyHint,
+  type Incoming,
+  type Ntfy,
+  type NtfyConfig,
+  type Publish,
+} from "./connectors/ntfy.ts"
 import { PendingStore } from "./pending.ts"
 import { Router } from "./routing.ts"
 
@@ -64,7 +73,13 @@ function setup(over: Record<string, unknown> = {}) {
   }
   const router = new Router(c, async () => true, now)
   const store = new PendingStore()
-  const bridge = new Bridge(c, host, ntfy, store, router, now)
+  const channel = new NtfyConnector(
+    "ntfy",
+    ntfy,
+    c.channels.ntfy.options as NtfyConfig,
+  )
+  const bridge = new Bridge(c, host, [channel], store, router, now)
+  bridge.start()
   return {
     bridge,
     router,
@@ -76,7 +91,7 @@ function setup(over: Record<string, unknown> = {}) {
     failReplies: (e: Error) => (replyError = e),
     setDown: (v: boolean) => (down = v),
     inbound: (message: string, time = Math.floor(t / 1000)) =>
-      bridge.onInbound({ id: `in${time}`, time, message } satisfies Incoming),
+      channel.handle({ id: `in${time}`, time, message } satisfies Incoming),
   }
 }
 
@@ -288,14 +303,15 @@ describe("Bridge outbound", () => {
         ],
       },
     ])
-    const r = renderQuestion(
-      cfg(),
-      "ab12",
-      qs,
-      "A very long session title that keeps going and going",
-    )
+    const id = "ab12"
+    const message = format("question", {
+      thread: "[A very long session title that keeps go…]\n",
+      body: questionBody(qs),
+      hint: replyHint(id, qs, "oc-in"),
+    }).message
+    const actions = questionActions("https://ntfy.example", "oc-in", id, qs)
     assert.equal(
-      r.message,
+      message,
       [
         "[A very long session title that keeps go…]",
         "Which context fixes should I apply first?",
@@ -307,10 +323,10 @@ describe("Bridge outbound", () => {
       ].join("\n"),
     )
     assert.deepEqual(
-      r.actions!.map((a) => a.label),
+      actions!.map((a) => a.label),
       ["Read cap + prefix trim…", "Also compaction tuning", "Nothing yet"],
     )
-    assert.ok(r.actions!.every((a) => a.label.length <= 24))
+    assert.ok(actions!.every((a) => a.label.length <= 24))
   })
 
   it("AC-5: title redaction hides the question", async () => {

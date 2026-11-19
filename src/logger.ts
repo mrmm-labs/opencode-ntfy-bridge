@@ -1,7 +1,7 @@
 import { appendFile, mkdir, rename, stat } from "node:fs/promises"
 import { dirname } from "node:path"
 
-import { logPath } from "./config.ts"
+import { logPath } from "./paths.ts"
 import { filterSecrets } from "./filter.ts"
 
 const MAX_BYTES = 1_000_000

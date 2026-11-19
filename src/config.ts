@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises"
-import { homedir } from "node:os"
-import { join } from "node:path"
 
+import { legacyConfigPath, configPath, legacy } from "./paths.ts"
+import { connectorTypes } from "./connectors/index.ts"
 import { parseRedact, type Redact } from "./filter.ts"
 import { parseJsonc } from "./jsonc.ts"
 import {
@@ -10,8 +10,8 @@ import {
   type Formats,
   type Profile,
 } from "./messages.ts"
-
-export type TokenSource = { env: string } | { command: string[] }
+import type { OtelTarget } from "./otel.ts"
+import { isArgv, isObject, URL_RE } from "./util.ts"
 
 export type Rule = {
   agent?: RegExp
@@ -19,88 +19,92 @@ export type Rule = {
   command?: string[]
 }
 
+/** One configured connector instance. */
+export type ChannelConfig = {
+  /** Key in `connectorTypes`. */
+  type: string
+  enabled: boolean
+  /** What the connector type's `parse` made of the instance's config. */
+  options: unknown
+}
+
 export type Config = {
-  server: string
-  token?: TokenSource
-  topics: { out: string; in: string }
-  actionAuth: boolean
+  /** By instance name. */
+  channels: Record<string, ChannelConfig>
+  /** `all`, or the name of a channel, for a session that chose none. */
+  defaultChannel: string
   away: { minutes: number }
   rules: Rule[]
   redact: Redact
   messages: Formats
   profiles: Profile[]
+  /** Set when `otel.endpoint` is; the environment may still turn telemetry on. */
+  otel?: OtelTarget
 }
 
-type Env = NodeJS.ProcessEnv
+const NAME = /^[A-Za-z0-9][-_A-Za-z0-9]{0,23}$/
 
-// Read for installs made before the rename from opencode-ntfy-bridge.
-const legacy = (env: Env, key: string) =>
-  env[`OPENCODE_OOB_BRIDGE_${key}`] || env[`OPENCODE_NTFY_BRIDGE_${key}`]
+function parseChannels(
+  raw: Record<string, unknown>,
+): { channels: Record<string, ChannelConfig> } | { error: string } {
+  if (raw.channels !== undefined && !isObject(raw.channels))
+    return { error: "channels must be an object" }
+  const given = isObject(raw.channels) ? raw.channels : {}
+  const entries: Array<[name: string, cfg: unknown, at: string]> =
+    Object.entries(given).map(([name, cfg]) => [name, cfg, `channels.${name}.`])
 
-const configDir = (env: Env) =>
-  join(env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode")
+  // The pre-`channels` form: a type's own keys at the top level mean an instance named after the type.
+  for (const [type, t] of Object.entries(connectorTypes)) {
+    const keys = (t.legacyKeys ?? []).filter((k) => raw[k] !== undefined)
+    if (keys.length === 0) continue
+    if (given[type] !== undefined)
+      return {
+        error: `${keys.join(", ")} at the top level is the old form of channels.${type}: use one`,
+      }
+    entries.push([type, Object.fromEntries(keys.map((k) => [k, raw[k]])), ""])
+  }
 
-export function configPath(env: Env = process.env): string {
-  return legacy(env, "CONFIG") || join(configDir(env), "oob-bridge.jsonc")
+  const types = Object.keys(connectorTypes).join(", ")
+  const out: Record<string, ChannelConfig> = {}
+  for (const [name, cfg, at] of entries) {
+    if (!NAME.test(name))
+      return {
+        error: `channels.${name}: use letters, digits, - and _ (24 at most)`,
+      }
+    if (!isObject(cfg)) return { error: `channels.${name} must be an object` }
+    const type = cfg.type ?? name
+    if (typeof type !== "string" || !connectorTypes[type])
+      return {
+        error: `${at || `channels.${name}.`}type ${String(type)} is unknown (use ${types})`,
+      }
+    const enabled = cfg.enabled ?? true
+    if (typeof enabled !== "boolean")
+      return { error: `${at}enabled must be true or false` }
+    const options = connectorTypes[type].parse(cfg, at)
+    if (isObject(options) && typeof options.error === "string")
+      return { error: options.error }
+    out[name] = { type, enabled, options }
+  }
+  if (Object.keys(out).length === 0)
+    return { error: "configure a channel under channels" }
+  return { channels: out }
 }
-
-/** Read when the default config file is missing. */
-export function legacyConfigPath(env: Env = process.env): string {
-  return join(configDir(env), "ntfy-bridge.jsonc")
-}
-
-export function dataDir(env: Env = process.env): string {
-  if (legacy(env, "DATA")) return legacy(env, "DATA")!
-  const base = env.XDG_DATA_HOME || join(homedir(), ".local", "share")
-  return join(base, "opencode", "oob-bridge")
-}
-
-export function logPath(env: Env = process.env): string {
-  return legacy(env, "LOG") || join(dataDir(env), "bridge.log")
-}
-
-const TOPIC = /^[-_A-Za-z0-9]{1,64}$/
-
-const isObject = (v: unknown): v is Record<string, unknown> =>
-  typeof v === "object" && v !== null && !Array.isArray(v)
-
-const isArgv = (v: unknown): v is string[] =>
-  Array.isArray(v) && v.length > 0 && v.every((s) => typeof s === "string")
 
 /** Validates a parsed config file. Returns the config or the first problem. */
 export function parseConfig(raw: unknown): Config | { error: string } {
   if (!isObject(raw)) return { error: "config must be an object" }
-  const server = raw.server
-  if (typeof server !== "string" || !/^https?:\/\/[^\s/]+/.test(server))
-    return { error: "server must be an http(s) URL" }
 
-  let token: TokenSource | undefined
-  if (raw.token !== undefined) {
-    const t = raw.token
-    if (isObject(t) && typeof t.env === "string" && t.env)
-      token = { env: t.env }
-    else if (isObject(t) && isArgv(t.command)) token = { command: t.command }
-    // A literal token in the file is refused: it belongs in the environment or a secret store.
-    else
-      return { error: 'token must be { "env": NAME } or { "command": [...] }' }
-  }
+  const parsed = parseChannels(raw)
+  if ("error" in parsed) return parsed
+  const configured = parsed.channels
 
-  const topics = raw.topics
-  if (
-    !isObject(topics) ||
-    typeof topics.out !== "string" ||
-    typeof topics.in !== "string" ||
-    !TOPIC.test(topics.out) ||
-    !TOPIC.test(topics.in) ||
-    topics.out === topics.in
-  )
+  const defaultChannel = raw.defaultChannel ?? "all"
+  if (typeof defaultChannel !== "string")
+    return { error: "defaultChannel must be a channel name or all" }
+  if (defaultChannel !== "all" && !configured[defaultChannel])
     return {
-      error: "topics.out and topics.in must be two different topic names",
+      error: `defaultChannel is ${defaultChannel}, which is not configured`,
     }
-
-  const actionAuth = raw.actionAuth ?? true
-  if (typeof actionAuth !== "boolean")
-    return { error: "actionAuth must be true or false" }
 
   const away = isObject(raw.away) ? raw.away : {}
   const minutes = away.minutes === undefined ? 10 : away.minutes
@@ -131,21 +135,42 @@ export function parseConfig(raw: unknown): Config | { error: string } {
   if (tier !== undefined && tier !== 3)
     return { error: "permissions.tier: only 3 (push only) is supported" }
 
+  let otel: OtelTarget | undefined
+  if (raw.otel !== undefined) {
+    if (!isObject(raw.otel)) return { error: "otel must be an object" }
+    if (raw.otel.endpoint !== undefined) {
+      if (
+        typeof raw.otel.endpoint !== "string" ||
+        !URL_RE.test(raw.otel.endpoint)
+      )
+        return { error: "otel.endpoint must be an http(s) URL" }
+      const h = raw.otel.headers
+      if (
+        h !== undefined &&
+        (!isObject(h) || !Object.values(h).every((v) => typeof v === "string"))
+      )
+        return { error: "otel.headers must map names to strings" }
+      otel = {
+        endpoint: raw.otel.endpoint,
+        headers: h as Record<string, string> | undefined,
+      }
+    }
+  }
+
   const messages = parseFormats(raw.messages, "messages")
   if (typeof messages === "string") return { error: messages }
   const profiles = parseProfiles(raw.profiles)
   if (typeof profiles === "string") return { error: profiles }
 
   return {
-    server: server.replace(/\/+$/, ""),
-    token,
-    topics: { out: topics.out, in: topics.in },
-    actionAuth,
+    channels: configured,
+    defaultChannel,
     away: { minutes },
     rules,
     redact,
     messages,
     profiles,
+    otel,
   }
 }
 
@@ -172,3 +197,5 @@ export async function loadConfig(
     return { error: `cannot parse ${path}: ${(err as Error).message}` }
   }
 }
+
+export { configPath, dataDir, legacyConfigPath, logPath } from "./paths.ts"

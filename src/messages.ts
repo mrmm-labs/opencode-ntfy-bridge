@@ -35,7 +35,7 @@ export const DEFAULTS: Record<Kind, Required<Format>> = {
   permission: {
     title: "{{project}} · {{agent}} needs permission",
     message:
-      "{{detail}}\n\nAnswer in the OpenCode TUI. Permissions are never applied from ntfy.",
+      "{{detail}}\n\nAnswer in the OpenCode TUI. Permissions are never applied remotely.",
     tags: ["lock", "{{subagent}}"],
     priority: 4,
   },
@@ -58,7 +58,7 @@ export const DEFAULTS: Record<Kind, Required<Format>> = {
     priority: 1,
   },
   notice: {
-    title: "ntfy bridge",
+    title: "oob bridge",
     message: "{{text}}",
     tags: ["warning"],
     priority: 2,
