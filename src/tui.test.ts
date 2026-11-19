@@ -17,6 +17,7 @@ function fakeCtx() {
     slash?: { name: string }
     run: (i?: string) => unknown
   }> = []
+  const modes: Array<string | undefined> = []
   const sessions: Record<string, Record<string, unknown>> = {
     root: {
       id: "root",
@@ -43,15 +44,18 @@ function fakeCtx() {
     },
     client: { session: { get: async () => undefined } },
     keymap: {
-      layer: (f: () => { commands: typeof commands }) =>
-        commands.push(...f().commands),
+      layer: (f: () => { mode?: string; commands: typeof commands }) => {
+        const l = f()
+        modes.push(l.mode)
+        commands.push(...l.commands)
+      },
     },
     ui: {
       router: { current: () => ({ type: "session", sessionID: "root" }) },
       toast: { show: (o: { message: string }) => toasts.push(o.message) },
     },
   }
-  return { ctx: ctx as never, handlers, replies, toasts, commands }
+  return { ctx: ctx as never, handlers, replies, toasts, commands, modes }
 }
 
 async function withEnv<T>(
@@ -100,6 +104,8 @@ describe("TUI entry", () => {
     // /ntfy is registered before any await (OpenCode 2.3.2 drops later layers);
     // without config it only explains itself.
     assert.equal(f.commands.length, 1)
+    // The default "base" mode is inactive while the prompt has focus.
+    assert.deepEqual(f.modes, ["global"])
   })
 
   it("stays inert on an invalid config", async () => {
