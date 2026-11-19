@@ -31,6 +31,12 @@
     // "telegram": {
     //   "token": { "command": ["pass", "show", "telegram/opencode-bot"] },
     //   // "chatId": 123456789,
+    //   // In a forum group: one pinned status card per session topic.
+    //   // "statusCard": true,
+    //   // Session-end pushes. "finished" is true only when statusCard is false.
+    //   // "notify": { "finished": false, "failed": true },
+    //   // Topic icon by agent regex or project glob.
+    //   // "icons": { "^coordinator$": "🎯", "api*": "🛠" },
     // },
   },
 

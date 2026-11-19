@@ -70,14 +70,11 @@ export type Vars = Record<string, string | undefined>
 const fill = (t: string, vars: Vars) =>
   t.replace(/\{\{\s*(\w+)\s*\}\}/g, (_, k: string) => vars[k] ?? "")
 
-export function format(
-  kind: Kind,
-  vars: Vars,
-  messages: Formats = {},
-  profiles: Profile[] = [],
+const pickProfile = (
+  profiles: Profile[],
   session?: { agent?: string; directory?: string },
-): Required<Format> {
-  const profile = session
+) =>
+  session
     ? profiles.find(
         (p) =>
           (!p.agent || p.agent.test(session.agent ?? "")) &&
@@ -85,6 +82,28 @@ export function format(
             globToRegExp(p.directory).test(session.directory ?? "")),
       )
     : undefined
+
+/** Whether the user set any field of this kind in `messages` or a matching profile. */
+export function isCustomized(
+  kind: Kind,
+  messages: Formats = {},
+  profiles: Profile[] = [],
+  session?: { agent?: string; directory?: string },
+): boolean {
+  const has = (f?: Format) => f !== undefined && Object.keys(f).length > 0
+  return (
+    has(messages[kind]) || has(pickProfile(profiles, session)?.messages[kind])
+  )
+}
+
+export function format(
+  kind: Kind,
+  vars: Vars,
+  messages: Formats = {},
+  profiles: Profile[] = [],
+  session?: { agent?: string; directory?: string },
+): Required<Format> {
+  const profile = pickProfile(profiles, session)
   const f = { ...DEFAULTS[kind], ...messages[kind], ...profile?.messages[kind] }
   return {
     title: fill(f.title, vars),

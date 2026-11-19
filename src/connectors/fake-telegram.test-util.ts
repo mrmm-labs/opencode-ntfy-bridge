@@ -20,6 +20,21 @@ export async function fakeTelegram(token = "123456:TESTTOKEN") {
   let messageSeq = 500
   let threadSeq = 9000
   let forum = false
+  let chatTitle: string | undefined
+  let stickers: Array<{ emoji: string; custom_emoji_id: string }> = [
+    "🎯",
+    "🛠",
+    "🔥",
+    "💡",
+    "📚",
+    "🧪",
+    "🚀",
+    "🧩",
+    "🔔",
+    "🌱",
+    "🏁",
+    "🧭",
+  ].map((emoji, i) => ({ emoji, custom_emoji_id: `e${i}` }))
   let pollLimit = Infinity
   const polls = new Set<() => void>()
 
@@ -70,13 +85,15 @@ export async function fakeTelegram(token = "123456:TESTTOKEN") {
       if (m[2] === "getChat")
         return send(200, {
           ok: true,
-          result: { id: body.chat_id, is_forum: forum },
+          result: { id: body.chat_id, is_forum: forum, title: chatTitle },
         })
       if (m[2] === "createForumTopic")
         return send(200, {
           ok: true,
           result: { message_thread_id: ++threadSeq, name: body.name },
         })
+      if (m[2] === "getForumTopicIconStickers")
+        return send(200, { ok: true, result: stickers })
       if (m[2] === "getMe")
         return send(200, { ok: true, result: { username: "oob_test_bot" } })
       send(200, { ok: true, result: true })
@@ -95,31 +112,47 @@ export async function fakeTelegram(token = "123456:TESTTOKEN") {
     set forum(v: boolean) {
       forum = v
     },
+    set title(v: string | undefined) {
+      chatTitle = v
+    },
+    set stickers(v: Array<{ emoji: string; custom_emoji_id: string }>) {
+      stickers = v
+    },
     /** Makes the next call of `method` fail with this status and body. */
     fail(method: string, status: number, body: Record<string, unknown> = {}) {
       failures.push({ method, status, body })
     },
-    message(chat: number, text: string, replyTo?: number, thread?: number) {
+    message(
+      chat: number,
+      text: string,
+      replyTo?: number,
+      thread?: number,
+      chatExtra: Record<string, unknown> = {},
+    ) {
       updates.push({
         update_id: ++updateSeq,
         message: {
           message_id: ++messageSeq,
           date: Math.floor(Date.now() / 1000),
           text,
-          chat: { id: chat },
+          chat: { id: chat, ...chatExtra },
           message_thread_id: thread,
           reply_to_message: replyTo ? { message_id: replyTo } : undefined,
         },
       })
       wake()
     },
-    callback(chat: number, messageID: number, data: string) {
+    callback(chat: number, messageID: number, data: string, thread?: number) {
       updates.push({
         update_id: ++updateSeq,
         callback_query: {
           id: `cbq${updateSeq}`,
           data,
-          message: { message_id: messageID, chat: { id: chat } },
+          message: {
+            message_id: messageID,
+            message_thread_id: thread,
+            chat: { id: chat },
+          },
         },
       })
       wake()

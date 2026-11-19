@@ -22,7 +22,15 @@ import {
   TOKEN_ERROR,
   type TokenSource,
 } from "../token.ts"
-import { sleep, truncate, URL_RE } from "../util.ts"
+import { isObject, sleep, truncate, URL_RE } from "../util.ts"
+import { globToRegExp } from "../routing.ts"
+import {
+  esc,
+  keycap,
+  renderPush,
+  renderStatus,
+  starred,
+} from "./telegram-render.ts"
 import type {
   Capabilities,
   Connector,
@@ -34,15 +42,26 @@ import type {
   Pairing,
   Push,
   SendStats,
+  SessionState,
 } from "./types.ts"
 
 const MAX_BUTTONS = 10
 const LABEL_MAX = 40
-const TEXT_MAX = 3500
 const POLL_SECONDS = 30
 const PAIR_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 const PAIR_TTL_MS = 10 * 60_000
 const TOAST_MAX = 190
+const TOPIC_RETRY_MS = 5 * 60_000
+const TOPIC_NOTICE_MS = 60 * 60_000
+const RENAME_GAP_MS = 60_000
+const CARD_GAP_MS = 10_000
+// The six colors Telegram allows for a topic icon.
+const COLORS = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047]
+// Sessions of one project draw their icon from this many neighbours.
+const FAMILY = 4
+const RIGHTS = /not enough rights|admin/i
+const RIGHTS_NOTICE =
+  "⚠️ I need the Manage Topics admin right to give each session its own topic. Posting in General until then."
 
 export type TelegramOptions = {
   /** Instance name; defaults to "telegram". */
@@ -65,6 +84,14 @@ export type TelegramOptions = {
   pairTtlMs?: number
   /** How long a button tap waits for its outcome before the toast goes out anyway. */
   toastAfterMs?: number
+  /** One status card per session topic; on unless false. */
+  statusCard?: boolean
+  /** Session-end pushes wanted; finished defaults to off while the card shows it. */
+  notify?: { finished?: boolean; failed?: boolean }
+  /** `agent regex or project glob` to the emoji it picks for a topic icon. */
+  icons?: Record<string, string>
+  /** Clock, for the topic and card limits. */
+  now?: () => number
 }
 
 type Update = {
@@ -73,14 +100,18 @@ type Update = {
     message_id: number
     date: number
     text?: string
-    chat: { id: number }
+    chat: { id: number; title?: string; is_forum?: boolean }
     message_thread_id?: number
     reply_to_message?: { message_id: number }
   }
   callback_query?: {
     id: string
     data?: string
-    message?: { message_id: number; chat: { id: number } }
+    message?: {
+      message_id: number
+      message_thread_id?: number
+      chat: { id: number }
+    }
   }
 }
 
@@ -88,20 +119,33 @@ type Markup = {
   inline_keyboard: Array<Array<{ text: string; callback_data: string }>>
 }
 
-const esc = (s: string) =>
-  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-
-function render(push: Push): string {
-  const title = push.title
-    ? `<b>${esc(truncate(filterSecrets(push.title), 300))}</b>\n`
-    : ""
-  return `${title}${esc(truncate(filterSecrets(push.message), TEXT_MAX))}`
-}
-
 const buttonable = (qs: Question[]) =>
   qs.length === 1 &&
   qs[0].options.length > 0 &&
   qs[0].options.length <= MAX_BUTTONS
+
+/** What is kept of a session's topic. A bare number is the older file format. */
+type Topic = {
+  thread: number
+  card?: number
+  name?: string
+  iconId?: string
+  icon?: string
+  /** What the card shows now; not kept across restarts. */
+  cardText?: string
+}
+
+type Sticker = { emoji?: string; custom_emoji_id?: string }
+
+/** FNV-1a: the same text always picks the same icon and color. */
+export function hash(text: string): number {
+  let h = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return h >>> 0
+}
 
 export class TelegramConnector implements Connector {
   readonly type = "telegram"
@@ -109,12 +153,14 @@ export class TelegramConnector implements Connector {
     buttons: true,
     edit: true,
     multiselect: true,
+    rich: true,
     threads: true,
     pairing: true,
     // Sending prompts into sessions from a chat is not built yet.
     inboundPrompt: false,
   }
   readonly id: string
+  readonly notify: { finished: boolean; failed: boolean }
   enabled: boolean
 
   private chatId: string | undefined
@@ -126,19 +172,46 @@ export class TelegramConnector implements Connector {
   private offset: number | undefined
   /** Whether the paired chat is a forum; undefined until asked. */
   private forum: boolean | undefined
-  private topics: Map<string, number> | undefined
+  private topics: Map<string, Topic> | undefined
   private readonly topicJobs = new Map<string, Promise<number | undefined>>()
+  /** Topic icons the bot may use: undefined until fetched, empty when the call failed. */
+  private stickers: Sticker[] | undefined
+  private stickersAt = -Infinity
+  /** Per session: the state to show, and when the topic and card were last edited. */
+  private readonly live = new Map<
+    string,
+    {
+      want: SessionState
+      renamedAt: number
+      editedAt: number
+      timer?: ReturnType<typeof setTimeout>
+    }
+  >()
+  /** No topic creation before this time, after a failure. */
+  private topicRetryAt = 0
+  private topicNoticeAt = -Infinity
+  /** Set while topic creation is refused for missing rights. */
+  private topicWarning: string | undefined
+  /** Force-reply prompts: message id to the pending prompt it collects a typed answer for. */
+  private readonly typing = new Map<string, string>()
   private pairing:
     | { code: string; finish: (chatId: string | undefined) => void }
     | undefined
-  /** Multiple-choice prompts with a keyboard: the options and what is ticked. */
+  /** Prompts with a keyboard: the options and what is ticked. */
   private readonly prompts = new Map<
     string,
-    { options: string[]; selected: Set<number>; ref?: string }
+    {
+      options: string[]
+      multiple: boolean
+      custom: boolean
+      selected: Set<number>
+      ref?: string
+    }
   >()
 
   private readonly opts: TelegramOptions
   private readonly fetch: typeof fetch
+  private readonly now: () => number
 
   constructor(opts: TelegramOptions, enabled = true) {
     this.opts = opts
@@ -146,11 +219,20 @@ export class TelegramConnector implements Connector {
     this.enabled = enabled
     this.chatId = opts.chatId
     this.fetch = opts.fetch ?? globalThis.fetch
+    this.now = opts.now ?? Date.now
+    this.notify = {
+      finished: opts.notify?.finished ?? opts.statusCard === false,
+      failed: opts.notify?.failed ?? true,
+    }
   }
 
   start(onInbound: OnInbound, signal: AbortSignal): void {
     this.onInbound = onInbound
     this.signal = signal
+    signal.addEventListener("abort", () => {
+      for (const l of this.live.values()) clearTimeout(l.timer)
+      this.live.clear()
+    })
     this.poll()
   }
 
@@ -168,18 +250,20 @@ export class TelegramConnector implements Connector {
     return {
       connected: this.connected,
       lastError: this.lastError ?? (this.chatId ? undefined : "not paired"),
+      warning: this.topicWarning,
     }
   }
 
   hint(id: string, qs: Question[]): string {
     if (qs.length !== 1)
       return `Reply to this message with one answer per question, separated by | (for example: 1 | yes | 2,3). Options are numbered.`
-    if (qs[0].multiple)
+    const q = qs[0]
+    const type = q.custom ? ", ✏️ to type" : ""
+    if (q.multiple)
       return buttonable(qs)
-        ? `Tick options, then tap Done. Or reply with numbers, like 1,3.`
+        ? `Tick options${type}, then tap Done. Or reply with numbers, like 1,3.`
         : `Reply to this message with numbers, like 1,3.`
-    if (buttonable(qs))
-      return `Tap a button, or reply to this message with a number or text.`
+    if (buttonable(qs)) return `Tap a button${type}, or reply.`
     return `Reply to this message with a number or text (or send "#${id} <answer>").`
   }
 
@@ -187,10 +271,12 @@ export class TelegramConnector implements Connector {
     if (!this.chatId) return undefined
     const q = push.prompt
     const live = q && buttonable(q.questions) ? q : undefined
-    const multi = live?.questions[0].multiple ? live : undefined
-    if (multi)
-      this.prompts.set(multi.id, {
-        options: multi.questions[0].options,
+    const one = live?.questions[0]
+    if (live && one)
+      this.prompts.set(live.id, {
+        options: one.options,
+        multiple: one.multiple,
+        custom: one.custom,
         selected: new Set(),
       })
     try {
@@ -202,25 +288,37 @@ export class TelegramConnector implements Connector {
             {
               chat_id: this.chatId,
               message_thread_id: thread,
-              text: render(push),
+              text: renderPush(push, {
+                inTopic: thread !== undefined,
+                footer:
+                  q && push.card?.kind === "question"
+                    ? this.hint(q.id, q.questions)
+                    : undefined,
+              }),
               parse_mode: "HTML",
               link_preview_options: { is_disabled: true },
-              disable_notification: (push.priority ?? 3) <= 2,
-              reply_markup: live
-                ? this.keyboard(
-                    live.id,
-                    live.questions[0].options,
-                    live.questions[0].multiple,
-                    new Set(),
-                  )
-                : undefined,
+              // A failure needs attention: it is the one push that may make a sound.
+              disable_notification:
+                push.card?.kind === "failed"
+                  ? false
+                  : (push.priority ?? 3) <= 2,
+              reply_markup:
+                live && one
+                  ? this.keyboard(
+                      live.id,
+                      one.options,
+                      one.multiple,
+                      one.custom,
+                      new Set(),
+                    )
+                  : undefined,
             },
             undefined,
             undefined,
             push.stats,
           )
           const ref = String(m.message_id)
-          const p = multi && this.prompts.get(multi.id)
+          const p = live && this.prompts.get(live.id)
           if (p) p.ref = ref
           return ref
         } catch (err) {
@@ -236,7 +334,7 @@ export class TelegramConnector implements Connector {
         }
       }
     } catch (err) {
-      if (multi) this.prompts.delete(multi.id)
+      if (push.prompt) this.prompts.delete(push.prompt.id)
       this.fail(err)
       return undefined
     }
@@ -264,10 +362,12 @@ export class TelegramConnector implements Connector {
     this.topics ??= await this.loadTopics()
     const key = this.topicKey(session.id)
     const known = this.topics.get(key)
-    if (known !== undefined) return known
+    if (known !== undefined) return known.thread
+    // After a failure the main chat is used, and creation is tried again later.
+    if (this.now() < this.topicRetryAt) return undefined
     let job = this.topicJobs.get(key)
     if (!job) {
-      job = this.createTopic(key, session.name).finally(() =>
+      job = this.createTopic(key, session).finally(() =>
         this.topicJobs.delete(key),
       )
       this.topicJobs.set(key, job)
@@ -277,42 +377,118 @@ export class TelegramConnector implements Connector {
 
   private async createTopic(
     key: string,
-    name: string,
+    session: NonNullable<Push["session"]>,
   ): Promise<number | undefined> {
     try {
+      const name = truncate(filterSecrets(session.name), 128)
+      const icon = await this.pickIcon(session)
       const t = await this.call<{ message_thread_id: number }>(
         "createForumTopic",
         {
           chat_id: this.chatId,
-          name: truncate(filterSecrets(name), 128),
+          name,
+          icon_color:
+            COLORS[hash(session.project ?? session.id) % COLORS.length],
+          icon_custom_emoji_id: icon?.custom_emoji_id,
         },
       )
-      this.topics!.set(key, t.message_thread_id)
+      this.topicWarning = undefined
+      this.topics!.set(key, {
+        thread: t.message_thread_id,
+        name,
+        iconId: icon?.custom_emoji_id,
+        icon: icon?.emoji,
+      })
       await this.saveTopics()
       return t.message_thread_id
     } catch (err) {
-      // Needs the bot to be an admin who may manage topics; the main chat still works.
+      // The main chat still works. Another session must not retry at once.
+      this.topicRetryAt = this.now() + TOPIC_RETRY_MS
       this.fail(err)
+      if (RIGHTS.test((err as Error).message)) await this.rightsMissing()
       return undefined
     }
   }
 
-  private async loadTopics(): Promise<Map<string, number>> {
-    const file = this.opts.topicsFile
-    if (file) {
-      try {
-        const v = JSON.parse(await readFile(file, "utf8")) as Record<
-          string,
-          unknown
-        >
-        return new Map(
-          Object.entries(v).filter(
-            (e): e is [string, number] => typeof e[1] === "number",
-          ),
-        )
-      } catch {}
+  /** The icons a bot may use, fetched once; a failed call is retried after a while and meanwhile only the color is set. */
+  private async icons(): Promise<Sticker[]> {
+    if (this.stickers?.length || this.now() - this.stickersAt < TOPIC_RETRY_MS)
+      return this.stickers ?? []
+    this.stickersAt = this.now()
+    try {
+      this.stickers = await this.call<Sticker[]>(
+        "getForumTopicIconStickers",
+        {},
+      )
+    } catch (err) {
+      this.stickers = []
+      this.fail(err)
     }
-    return new Map()
+    return this.stickers
+  }
+
+  /**
+   * The icon of a session's topic, the same every time: the configured emoji
+   * for its agent or project, else one of a few neighbours picked by the
+   * project, chosen between by the session.
+   */
+  private async pickIcon(
+    session: NonNullable<Push["session"]>,
+  ): Promise<Sticker | undefined> {
+    const list = (await this.icons()).filter((i) => i.custom_emoji_id)
+    if (list.length === 0) return undefined
+    for (const [pattern, emoji] of Object.entries(this.opts.icons ?? {})) {
+      let hit = false
+      try {
+        hit =
+          new RegExp(pattern).test(session.agent ?? "") ||
+          globToRegExp(pattern).test(session.project ?? "")
+      } catch {}
+      const sticker = hit && list.find((i) => i.emoji === emoji)
+      if (sticker) return sticker
+    }
+    const base = hash(session.project ?? session.id)
+    return list[(base + (hash(session.id) % FAMILY)) % list.length]
+  }
+
+  /** Missing "Manage Topics": a standing warning, and one notice an hour in the chat. */
+  private async rightsMissing(): Promise<void> {
+    this.topicWarning =
+      "topics: the bot needs the Manage Topics admin right; posting in General"
+    const now = this.now()
+    if (now - this.topicNoticeAt < TOPIC_NOTICE_MS) return
+    this.topicNoticeAt = now
+    try {
+      await this.call("sendMessage", {
+        chat_id: this.chatId,
+        text: RIGHTS_NOTICE,
+        link_preview_options: { is_disabled: true },
+      })
+    } catch (err) {
+      this.fail(err)
+    }
+  }
+
+  private async loadTopics(): Promise<Map<string, Topic>> {
+    const file = this.opts.topicsFile
+    const out = new Map<string, Topic>()
+    if (!file) return out
+    try {
+      const v = JSON.parse(await readFile(file, "utf8")) as Record<
+        string,
+        unknown
+      >
+      for (const [k, t] of Object.entries(v)) {
+        if (typeof t === "number") out.set(k, { thread: t })
+        else if (
+          typeof t === "object" &&
+          t !== null &&
+          typeof (t as Topic).thread === "number"
+        )
+          out.set(k, t as Topic)
+      }
+    } catch {}
+    return out
   }
 
   private async saveTopics(): Promise<void> {
@@ -320,23 +496,155 @@ export class TelegramConnector implements Connector {
     if (!file || !this.topics) return
     try {
       await mkdir(dirname(file), { recursive: true })
-      await writeFile(file, JSON.stringify(Object.fromEntries(this.topics)))
+      await writeFile(
+        file,
+        JSON.stringify(
+          Object.fromEntries(
+            [...this.topics].map(([k, { cardText: _, ...t }]) => [k, t]),
+          ),
+        ),
+      )
     } catch (err) {
       log("telegram_topics_error", { message: (err as Error).message })
+    }
+  }
+
+  /**
+   * Shows a session's state: renames its topic when the title changed (at most
+   * once a minute) and keeps one pinned status card current (at most one edit
+   * every ten seconds). A change that comes too soon is applied later.
+   */
+  async track(state: SessionState): Promise<void> {
+    try {
+      const session = {
+        id: state.id,
+        name: state.name,
+        project: state.project,
+        agent: state.agent,
+      }
+      if ((await this.thread(session)) === undefined) return
+      const key = this.topicKey(state.id)
+      const live = this.live.get(key) ?? {
+        want: state,
+        renamedAt: -Infinity,
+        editedAt: -Infinity,
+      }
+      live.want = state
+      this.live.set(key, live)
+      await this.flush(key)
+    } catch (err) {
+      this.fail(err)
+    }
+  }
+
+  private async flush(key: string): Promise<void> {
+    const live = this.live.get(key)
+    const topic = this.topics?.get(key)
+    if (!live || !topic || !this.chatId) return
+    clearTimeout(live.timer)
+    const s = live.want
+    const name = truncate(filterSecrets(s.name), 128)
+    const now = this.now()
+    let wait = Infinity
+    const due = (last: number, gap: number) => {
+      if (last + gap <= now) return true
+      wait = Math.min(wait, last + gap - now)
+      return false
+    }
+
+    const icon = await this.pickIcon(s)
+    const newIcon =
+      icon && icon.custom_emoji_id !== topic.iconId ? icon : undefined
+    if (
+      (topic.name !== name || newIcon) &&
+      due(live.renamedAt, RENAME_GAP_MS)
+    ) {
+      live.renamedAt = now
+      try {
+        await this.call("editForumTopic", {
+          chat_id: this.chatId,
+          message_thread_id: topic.thread,
+          name: topic.name !== name ? name : undefined,
+          icon_custom_emoji_id: newIcon?.custom_emoji_id,
+        })
+        topic.name = name
+        if (newIcon) {
+          topic.iconId = newIcon.custom_emoji_id
+          topic.icon = newIcon.emoji
+        }
+        await this.saveTopics()
+      } catch (err) {
+        this.fail(err)
+      }
+    }
+
+    if (this.opts.statusCard !== false) {
+      const text = renderStatus(s, topic.icon)
+      if (topic.cardText !== text && due(live.editedAt, CARD_GAP_MS)) {
+        live.editedAt = now
+        await this.card(topic, text)
+      }
+    }
+    if (wait < Infinity) {
+      live.timer = setTimeout(() => void this.flush(key), wait)
+      live.timer.unref?.()
+    }
+  }
+
+  /** Creates, pins or edits the status card of a topic. */
+  private async card(topic: Topic, text: string): Promise<void> {
+    try {
+      if (topic.card === undefined) {
+        const m = await this.call<{ message_id: number }>("sendMessage", {
+          chat_id: this.chatId,
+          message_thread_id: topic.thread,
+          text,
+          parse_mode: "HTML",
+          disable_notification: true,
+        })
+        topic.card = m.message_id
+        await this.saveTopics()
+        // A card that cannot be pinned is still a card.
+        await this.call("pinChatMessage", {
+          chat_id: this.chatId,
+          message_id: m.message_id,
+          disable_notification: true,
+        }).catch((err) => this.fail(err))
+      } else {
+        await this.call("editMessageText", {
+          chat_id: this.chatId,
+          message_id: topic.card,
+          text,
+          parse_mode: "HTML",
+        })
+      }
+      topic.cardText = text
+    } catch (err) {
+      const m = (err as Error).message
+      if (/not modified/i.test(m)) topic.cardText = text
+      // Deleted in Telegram: the next change makes a new one.
+      else if (/not found/i.test(m)) {
+        topic.card = undefined
+        await this.saveTopics()
+      }
+      this.fail(err)
     }
   }
 
   async update(ref: string, push: Push): Promise<boolean> {
     if (!this.chatId) return false
     for (const [id, p] of this.prompts)
-      if (p.ref === ref) this.prompts.delete(id)
+      if (p.ref === ref) {
+        this.prompts.delete(id)
+        for (const [m, to] of this.typing) if (to === id) this.typing.delete(m)
+      }
     try {
       await this.call(
         "editMessageText",
         {
           chat_id: this.chatId,
           message_id: Number(ref),
-          text: render(push),
+          text: renderPush(push),
           parse_mode: "HTML",
           reply_markup: { inline_keyboard: [] },
         },
@@ -388,6 +696,15 @@ export class TelegramConnector implements Connector {
     return {
       code,
       link: username ? `https://t.me/${username}?start=${code}` : undefined,
+      links: username
+        ? [
+            {
+              label:
+                "Or add it to a group (a group with Topics gives each session its own)",
+              url: `https://t.me/${username}?startgroup=${code}`,
+            },
+          ]
+        : undefined,
       expiresAt: Date.now() + ttl,
       hint: username
         ? `Open @${username} in Telegram and press Start.`
@@ -421,17 +738,20 @@ export class TelegramConnector implements Connector {
     id: string,
     options: string[],
     multiple: boolean,
+    custom: boolean,
     selected: Set<number>,
   ): Markup {
     const rows = options.map((label, i) => [
       {
         text: truncate(
-          multiple && selected.has(i + 1) ? `✓ ${label}` : label,
+          `${multiple && selected.has(i + 1) ? "✓ " : ""}${keycap(i + 1)} ${starred(label)}`,
           LABEL_MAX,
         ),
         callback_data: `${id}:${multiple ? "t" : ""}${i + 1}`,
       },
     ])
+    if (custom)
+      rows.push([{ text: "✏️ Type an answer", callback_data: `${id}:x` }])
     if (multiple) rows.push([{ text: "Done", callback_data: `${id}:d` }])
     return { inline_keyboard: rows }
   }
@@ -560,7 +880,7 @@ export class TelegramConnector implements Connector {
     const m = u.message
     const text = m?.text?.trim()
     if (!m || !text) return
-    if (await this.tryPair(String(m.chat.id), text)) return
+    if (await this.tryPair(m.chat, text)) return
     if (String(m.chat.id) !== this.chatId) {
       this.rejected("message")
       return log("telegram_ignored", { kind: "message" })
@@ -575,6 +895,17 @@ export class TelegramConnector implements Connector {
           : String(m.message_thread_id),
       from: { connector: this.id, chat: String(m.chat.id) },
     } as const
+    // A reply to a "Type your answer" prompt is a free-text answer for its prompt.
+    const asked = m.reply_to_message
+      ? this.typing.get(String(m.reply_to_message.message_id))
+      : undefined
+    if (asked)
+      return void (await this.onInbound?.({
+        ...base,
+        pendingId: asked,
+        text,
+        literal: true,
+      }))
     // An explicit "#id answer" wins over the message replied to.
     const reply = parseReply(text)
     if (reply)
@@ -595,18 +926,30 @@ export class TelegramConnector implements Connector {
       })
   }
 
-  private async tryPair(chat: string, text: string): Promise<boolean> {
+  /**
+   * The one-time code, typed or sent as `/start <code>` (`/start@bot <code>` in
+   * a group), from a private chat or a group.
+   */
+  private async tryPair(
+    chat: NonNullable<Update["message"]>["chat"],
+    text: string,
+  ): Promise<boolean> {
     const pr = this.pairing
     const code = /^(?:\/start(?:@\w+)?\s+)?([A-Za-z0-9]{6})$/.exec(text)?.[1]
     if (!pr || code?.toUpperCase() !== pr.code) return false
-    this.chatId = chat
-    this.forum = undefined
-    this.opts.onPaired?.(chat)
-    pr.finish(chat)
+    const id = String(chat.id)
+    this.chatId = id
+    this.forum = chat.is_forum === true ? true : undefined
+    this.opts.onPaired?.(id)
+    pr.finish(id)
+    const what = chat.title
+      ? `Paired with ${esc(chat.title)}.${chat.is_forum ? " One topic per session." : ""}`
+      : "Paired. Questions and notices of your OpenCode sessions arrive here."
     try {
       await this.call("sendMessage", {
-        chat_id: chat,
-        text: "Paired. Questions and notices of your OpenCode sessions arrive here.",
+        chat_id: id,
+        text: what,
+        parse_mode: "HTML",
       })
     } catch (err) {
       this.fail(err)
@@ -621,7 +964,7 @@ export class TelegramConnector implements Connector {
       this.rejected("callback")
       return log("telegram_ignored", { kind: "callback" })
     }
-    const m = /^([A-Za-z0-9]+):(t?\d+|d)$/.exec(cb.data ?? "")
+    const m = /^([A-Za-z0-9]+):(t?\d+|d|x)$/.exec(cb.data ?? "")
     if (!m) return this.toast(cb.id, "Unknown button.")
     const [, id, act] = m
     const message_id = cb.message.message_id
@@ -638,6 +981,7 @@ export class TelegramConnector implements Connector {
       })
 
     if (/^\d+$/.test(act)) return reply({ choice: Number(act), text: act })
+    if (act === "x") return this.askTyped(cb.id, id, cb.message)
 
     const p = this.prompts.get(id)
     if (!p)
@@ -661,8 +1005,31 @@ export class TelegramConnector implements Connector {
       await this.call("editMessageReplyMarkup", {
         chat_id: this.chatId,
         message_id,
-        reply_markup: this.keyboard(id, p.options, true, p.selected),
+        reply_markup: this.keyboard(id, p.options, true, p.custom, p.selected),
       })
+    } catch (err) {
+      this.fail(err)
+    }
+  }
+
+  /** "✏️ Type an answer": the bot asks for it, and a reply to that message is the answer. */
+  private async askTyped(
+    callbackID: string,
+    id: string,
+    at: NonNullable<NonNullable<Update["callback_query"]>["message"]>,
+  ): Promise<void> {
+    await this.toast(callbackID)
+    try {
+      const m = await this.call<{ message_id: number }>("sendMessage", {
+        chat_id: this.chatId,
+        message_thread_id: at.message_thread_id,
+        text: `Type your answer for #${id}`,
+        reply_markup: {
+          force_reply: true,
+          input_field_placeholder: "Your answer",
+        },
+      })
+      this.typing.set(String(m.message_id), id)
     } catch (err) {
       this.fail(err)
     }
@@ -699,6 +1066,9 @@ export type TelegramConfig = {
   chatId?: string
   /** Bot API base URL; the public API unless a local Bot API server is used. */
   apiBase: string
+  statusCard: boolean
+  notify: { finished?: boolean; failed?: boolean }
+  icons: Record<string, string>
 }
 
 export const telegramType: ConnectorType<TelegramConfig> = {
@@ -720,7 +1090,41 @@ export const telegramType: ConnectorType<TelegramConfig> = {
     if (typeof apiBase !== "string" || !URL_RE.test(apiBase))
       return { error: `${at}apiBase must be an http(s) URL` }
 
-    return { token, chatId, apiBase: apiBase.replace(/\/+$/, "") }
+    const statusCard = raw.statusCard ?? true
+    if (typeof statusCard !== "boolean")
+      return { error: `${at}statusCard must be true or false` }
+
+    const notify: TelegramConfig["notify"] = {}
+    if (raw.notify !== undefined) {
+      if (!isObject(raw.notify))
+        return { error: `${at}notify must be an object` }
+      for (const k of ["finished", "failed"] as const) {
+        const v = raw.notify[k]
+        if (v !== undefined && typeof v !== "boolean")
+          return { error: `${at}notify.${k} must be true or false` }
+        notify[k] = v
+      }
+    }
+
+    const icons: Record<string, string> = {}
+    if (raw.icons !== undefined) {
+      if (!isObject(raw.icons))
+        return { error: `${at}icons must map patterns to emoji` }
+      for (const [k, v] of Object.entries(raw.icons)) {
+        if (typeof v !== "string" || !v)
+          return { error: `${at}icons.${k} must be an emoji` }
+        icons[k] = v
+      }
+    }
+
+    return {
+      token,
+      chatId,
+      apiBase: apiBase.replace(/\/+$/, ""),
+      statusCard,
+      notify,
+      icons,
+    }
   },
 
   create(env, o) {
@@ -732,6 +1136,9 @@ export const telegramType: ConnectorType<TelegramConfig> = {
       // A chat paired in the TUI wins over the file.
       chatId: typeof stored === "string" ? stored : o.chatId,
       apiBase: o.apiBase,
+      statusCard: o.statusCard,
+      notify: o.notify,
+      icons: o.icons,
       offsetFile: join(env.dir, `${env.name}-offset.json`),
       topicsFile: join(env.dir, `${env.name}-topics.json`),
       onPaired: (chatId) => env.settings.set({ chatId }),

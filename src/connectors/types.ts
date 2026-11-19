@@ -15,12 +15,78 @@ export type Capabilities = {
   edit: boolean
   /** Toggle-and-confirm buttons for a multiple-choice question. */
   multiselect: boolean
+  /** Can render a structured `card` itself (the push's plain text is then a fallback). */
+  rich: boolean
   /** Messages are grouped per session (threads, topics, rooms). */
   threads: boolean
   /** The connector can bind itself to a chat through `pair()`. */
   pairing: boolean
   /** Messages typed in a session's thread may be sent to the session. Not implemented by any connector yet. */
   inboundPrompt: boolean
+}
+
+export type CardQuestion = {
+  header?: string
+  text: string
+  /** Empty when the question's details are hidden by `redact`. */
+  options: Array<{ label: string; detail?: string }>
+  multiple: boolean
+  custom: boolean
+}
+
+/**
+ * Structured content of a push, for connectors with `rich`. Already redacted;
+ * the connector chooses the markup. Absent when the user overrode that kind's
+ * text in `messages` or `profiles`: the configured title and message win.
+ */
+export type Card =
+  | {
+      kind: "question"
+      agent: string
+      project: string
+      session?: string
+      questions: CardQuestion[]
+    }
+  | {
+      kind: "permission"
+      agent: string
+      project: string
+      session?: string
+      detail: string
+    }
+  | {
+      kind: "finished" | "failed"
+      project: string
+      session?: string
+      /** e.g. "3m 12s" */
+      duration?: string
+    }
+  | {
+      kind: "closed"
+      outcome: "answered" | "cancelled"
+      /** Unknown when the prompt was answered in the TUI. */
+      answer?: string
+      /** Where it was answered: a connector name, or "TUI". */
+      via: string
+      /** hh:mm, local time. */
+      time: string
+      /** What was asked, to keep on the message. */
+      quote?: string
+    }
+  | { kind: "notice"; text: string }
+
+/** What a connector may show about a top-level session. */
+export type SessionState = {
+  id: string
+  /** `<project> · <title>`, or the project alone when titles are redacted. */
+  name: string
+  project: string
+  title?: string
+  agent?: string
+  model?: string
+  state: "working" | "idle" | "failed"
+  /** Epoch ms of the last change. */
+  at: number
 }
 
 /** Filled in by the connector during `send`/`update`, for the trace. */
@@ -32,9 +98,11 @@ export type Push = {
   tags?: string[]
   priority?: 1 | 2 | 3 | 4 | 5
   /** The top-level session this push is about. Only set for connectors with `threads`. */
-  session?: { id: string; name: string }
+  session?: { id: string; name: string; project?: string; agent?: string }
   /** A question to offer answer buttons for. Only set for connectors with `buttons`. */
   prompt?: { id: string; questions: Question[] }
+  /** Set only for connectors with `rich`. */
+  card?: Card
   /** The connector may record transport facts here; it is never shown to anyone. */
   stats?: SendStats
 }
@@ -60,6 +128,8 @@ export type Inbound = {
   from: { connector: string; chat: string }
   /** The connector shows the outcome itself (a button toast): no notice message. */
   inline?: boolean
+  /** `text` is a free-text answer: a number is not an option selector. */
+  literal?: boolean
 }
 
 export type Outcome = { ok: boolean; text: string }
@@ -67,13 +137,20 @@ export type Outcome = { ok: boolean; text: string }
 /** Resolves undefined for input that is silently ignored. */
 export type OnInbound = (m: Inbound) => Promise<Outcome | undefined>
 
-export type ConnectorStatus = { connected?: boolean; lastError?: string }
+export type ConnectorStatus = {
+  connected?: boolean
+  lastError?: string
+  /** A standing condition worth showing, such as a missing permission. */
+  warning?: string
+}
 
 export type Pairing = {
   /** One-time code the person gives the connector. */
   code: string
   /** Opens the connector with the code applied; the TUI renders it as a QR code. */
   link?: string
+  /** Other ways in, shown as links beside `link` (for example "add to a group"). */
+  links?: Array<{ label: string; url: string }>
   /** Epoch ms. */
   expiresAt: number
   /** Short instruction for the dialog. */
@@ -92,6 +169,10 @@ export interface Connector {
   start(onInbound: OnInbound, signal: AbortSignal, openSince?: number): void
   /** How to answer this question here, for the `{{hint}}` placeholder. */
   hint(id: string, questions: Question[]): string
+  /** Which of the session-end pushes this connector wants. Both when unset. */
+  readonly notify?: { finished: boolean; failed: boolean }
+  /** Keeps a live view of a session (a status card, a topic title). Never throws. */
+  track?(state: SessionState): Promise<void>
   /** Returns a reference to the sent message; never throws. */
   send(push: Push): Promise<string | undefined>
   /** Rewrites an earlier message; true when it did. Never throws. Required when `capabilities.edit`. */

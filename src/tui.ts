@@ -26,8 +26,12 @@ const EVENTS: BridgeEvent["type"][] = [
   "permission.asked",
   "permission.replied",
   "session.inbox.enqueued",
+  "session.execution.started",
   "session.execution.succeeded",
   "session.execution.failed",
+  "session.execution.interrupted",
+  "session.renamed",
+  "session.model.selected",
 ]
 
 export function host(ctx: Context): Host {
@@ -47,6 +51,7 @@ export function host(ctx: Context): Host {
         agent: info.agent,
         directory: info.location?.directory,
         title: info.title,
+        model: info.model?.id,
       }
     },
     root: (id) => ctx.data.session.root(id) || id,

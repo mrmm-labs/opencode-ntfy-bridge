@@ -360,6 +360,57 @@ describe("/oob menu and channels", () => {
     await tg.close()
   })
 
+  it("the pairing dialog also offers the add-to-a-group link", async () => {
+    const tg = await fakeTelegram()
+    const { f, cmd, cleanup } = await started({
+      telegram: { token: { env: "OOBB_TG" }, apiBase: tg.url },
+    })
+    await cmd.run("pair telegram")
+    const msg = f.dialogs.at(-1)!.message!
+    const code = /send this code: ([A-Z2-9]{6})/.exec(msg)![1]
+    assert.match(
+      msg,
+      new RegExp(
+        `add it to a group[^\\n]*:\\nhttps://t.me/oob_test_bot\\?startgroup=${code}`,
+      ),
+    )
+    await cleanup()
+    await tg.close()
+  })
+
+  it("Status shows that topics cannot be created for lack of the admin right", async () => {
+    const tg = await fakeTelegram()
+    tg.forum = true
+    tg.fail("createForumTopic", 400, {
+      description: "Bad Request: not enough rights to create a topic",
+    })
+    const dir = await mkdtemp(join(tmpdir(), "oobb-menu-"))
+    await writeFile(
+      join(dir, "settings.json"),
+      JSON.stringify({ sessions: { root: { on: true } } }),
+    )
+    const { f, cmd, cleanup } = await started(
+      { telegram: { token: { env: "OOBB_TG" }, chatId: 7, apiBase: tg.url } },
+      {},
+      undefined,
+      dir,
+    )
+    f.handlers.get("session.execution.started")!({
+      type: "session.execution.started",
+      data: { sessionID: "root" },
+    })
+    await tg.waitFor(() =>
+      tg.of("sendMessage").find((c) => /Manage Topics/.test(c.body.text)),
+    )
+    await cmd.run("status")
+    assert.match(
+      f.dialogs.at(-1)!.message!,
+      /^telegram: on[^\n]*\n {2}⚠ topics: the bot needs the Manage Topics admin right/m,
+    )
+    await cleanup()
+    await tg.close()
+  })
+
   it("pairs Telegram from a one-time code and stores the chat in the settings", async () => {
     const tg = await fakeTelegram()
     const { f, dir, cmd, cleanup } = await started({
@@ -542,10 +593,11 @@ describe("/oob menu and channels", () => {
         ["ntfy: on", "telegram: off"],
       ],
     )
+    // The file is written after the menu moves on: wait for the last switch.
+    await cleanup()
     const saved = await readJson(join(dir, "settings.json"))
     assert.equal(saved.channels.ntfy.enabled, true)
     assert.equal(saved.channels.telegram.enabled, false)
-    await cleanup()
     await n.close()
     await tg.close()
   })

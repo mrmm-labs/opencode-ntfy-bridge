@@ -112,12 +112,15 @@ say who answered ("Answered from telegram: Yes", "Answered in the TUI").
 | `actionAuth`                | `true`     | Put the token in each button so buttons work on an auth-protected server.             |
 | `enabled`                   | `true`     | Set `false` to configure it without using it.                                         |
 
-| Key (under `channels.telegram`) | Default                    | Meaning                                                                                     |
-| ------------------------------- | -------------------------- | ------------------------------------------------------------------------------------------- |
-| `token`                         | (required)                 | The bot token, as `{ "env": NAME }` or `{ "command": [argv] }`. A literal token is refused. |
-| `chatId`                        | none                       | The chat to talk to. Leave it out and run `/oob pair telegram` instead.                     |
-| `enabled`                       | `true`                     | Set `false` to configure it without using it.                                               |
-| `apiBase`                       | `https://api.telegram.org` | Bot API URL, for a local Bot API server.                                                    |
+| Key (under `channels.telegram`) | Default                             | Meaning                                                                                     |
+| ------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------- |
+| `token`                         | (required)                          | The bot token, as `{ "env": NAME }` or `{ "command": [argv] }`. A literal token is refused. |
+| `chatId`                        | none                                | The chat to talk to. Leave it out and run `/oob pair telegram` instead.                     |
+| `enabled`                       | `true`                              | Set `false` to configure it without using it.                                               |
+| `apiBase`                       | `https://api.telegram.org`          | Bot API URL, for a local Bot API server.                                                    |
+| `statusCard`                    | `true`                              | In a forum, one pinned status card per session topic (working, idle, failed).               |
+| `notify`                        | `{ finished: false, failed: true }` | Which session-end pushes arrive. `finished` is `true` when `statusCard` is `false`.         |
+| `icons`                         | none                                | `{ "<agent regex or project glob>": "<emoji>" }`: the topic icon for matching sessions.     |
 
 Which channels are on is also a TUI setting (`/oob`, "Channels"). The choice is stored in
 `settings.json` in the state directory and layered over the config file, which the plugin never
@@ -161,27 +164,68 @@ outgoing requests, and exposes no port or webhook.
    stores that chat. Typing the six-character code to the bot works too. The code works once and
    expires after 10 minutes. The chat id is saved in `settings.json`, not in your config file.
    If the terminal is too small for the QR code, the dialog shows the link and the code only.
+4. To use a group instead of a private chat, open the second link in the dialog
+   (`https://t.me/<bot>?startgroup=<code>`) and pick the group, or send `/start@<bot> <code>` (or
+   just the code) in a group the bot is in. For one topic per session the group needs **Topics**
+   switched on, and the bot must be an admin with the **Manage topics** right.
 
 What you get in Telegram:
 
-- A **question** is a message with one button per option (up to 10). Tap one: the phone shows a
-  toast with the outcome at once, and the message becomes "Answered: X" with the buttons removed.
+- A **question** is a message with one button per option (up to 10), numbered with keycap emoji,
+  a star in place of "(Recommended)", and a ✏️ button when a typed answer is allowed:
+
+  ```
+  ❓ build asks · shop
+  📌 Fix checkout
+
+  Go?
+
+  1️⃣ Ship it ⭐
+        Deploy to prod
+  2️⃣ Wait
+
+  Tap a button, ✏️ to type, or reply.
+  ```
+
+  Tap a button: the phone shows a toast with the outcome at once, and the message itself becomes
+  `✅ Answered · Ship it` with a muted "via telegram · 14:02" line, the question quoted, and the
+  buttons removed. The same happens when you answer in the TUI ("via TUI"). If Telegram refuses the
+  edit, a follow-up message says it instead, and the log notes it.
+  **✏️ Type an answer** makes the bot ask "Type your answer for #id" in the same topic; reply to
+  that message and your text is the answer (a number is text there, not an option).
   **Multiple choice** shows toggle buttons (a tick marks the chosen ones) and a Done button.
-  You can always answer by replying to the question message with a number or text, or with
+  You can also answer by replying to the question message with a number or text, or with
   `#id answer` as on ntfy.
+
 - **Several questions in one prompt**, or a question with more than 10 options, get no buttons:
   reply to the message with one answer per question, separated by `|` (for example
   `1 | yes | 2,3`). This is the same grammar as ntfy.
 - A **permission** prompt is a message without buttons that says to answer in the TUI. It can
   never be answered from Telegram.
-- **Finished / failed** pushes and answered-in-the-TUI updates use the same formats as ntfy
-  (`messages`, `profiles`). Low priority pushes arrive without a sound.
+- Messages are HTML, with everything escaped, and at most 4096 characters: long text is cut in
+  the text, never in a tag. If you set your own `messages` or `profiles` text for a kind of push,
+  that text is used for it instead of this layout (as plain bold title and text).
+- **Failed** pushes keep their format and make a sound. **Finished** pushes are replaced by the
+  status card (see below). Low priority pushes arrive without a sound.
 - The plugin acts only on messages and taps from the paired chat. Anything else is ignored and
   logged without its content. The bot token is never logged.
 - In a **forum** supergroup (topics enabled; the bot must be an admin who can manage topics), each
   top-level session gets its own topic, named `<project> · <session title>` (just the project when
   `redact` is `title`), and its messages go there. Elsewhere everything goes to the chat, with the
-  project and session in each message.
+  project and session in each message. The topic is renamed when the session is (at most once a
+  minute).
+  - Its first message is a **status card**, pinned without a sound: `🟢 Working`,
+    `💤 Idle since 14:05` or `❌ Failed 14:05`, then the session title, agent and model, project,
+    short session id and last activity. It is edited in place, at most once every 10 seconds.
+    Set `statusCard: false` to turn it off; `notify.finished: true` brings back one message per
+    finished turn.
+  - Each topic gets an **icon** and a color. The color follows the project, the icon comes from a
+    small family per project and the session picks within it, the same every time. `icons` pins
+    an emoji for an agent or a project (for example `{ "^coordinator$": "🎯", "api*": "🛠" }`).
+    The card starts with the same emoji. If the icon list is unavailable, only the color is set.
+  - Without the **Manage topics** admin right the bot cannot make topics. It then says so in the
+    chat (at most once an hour), posts in the main chat meanwhile, tries again every 5 minutes, and
+    `/oob` Status shows the condition. Granting the right needs no restart.
 
 **Privacy.** Telegram bot chats are not end-to-end encrypted: Telegram can read what the bot
 sends. Before pointing a sensitive project at it, use `redact: "title"` (no question text), a

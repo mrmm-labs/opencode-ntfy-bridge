@@ -118,9 +118,10 @@ async function menu(ctx: Context, app: App): Promise<void> {
     if (!choice) return
     if (choice === "routing") await routing(ctx, app)
     else if (choice === "channels") await channelList(ctx, app)
-    else if (choice.startsWith("pair:"))
-      await await pair(ctx, app, find(app, choice.slice(5)))
-    else if (choice === "test") await test(ctx, app)
+    else if (choice.startsWith("pair:")) {
+      const closed = await pair(ctx, app, find(app, choice.slice(5)))
+      if (closed) await closed
+    } else if (choice === "test") await test(ctx, app)
     else if (choice === "status") await status(ctx, app)
   }
 }
@@ -225,7 +226,10 @@ async function status(ctx: Context, app: App): Promise<void> {
         : c.connected
           ? "on, connected"
           : "on, not connected"
-    return `${c.id}: ${state}${c.lastError ? ` (last error: ${c.lastError})` : ""}`
+    return [
+      `${c.id}: ${state}${c.lastError ? ` (last error: ${c.lastError})` : ""}`,
+      ...(c.warning ? [`  ⚠ ${c.warning}`] : []),
+    ].join("\n")
   })
   lines.push(`Open prompts: ${st.pending}`)
   if (root) lines.push(`This session: ${describe(app, root)}`)
@@ -240,9 +244,9 @@ async function pair(
   ctx: Context,
   app: App,
   c: Connector | undefined,
-): Promise<Promise<void> | void> {
+): Promise<Promise<void> | undefined> {
   if (!c?.capabilities.pairing || !c.pair)
-    return toast(
+    return void toast(
       ctx,
       c
         ? `${c.id} has no pairing`
@@ -254,7 +258,8 @@ async function pair(
     app.settings.set(c.id, { enabled: true })
   }
   const p = await app.bridge.pair(c)
-  if (!p) return toast(ctx, `${c.id}: pairing failed, see the log`, "error")
+  if (!p)
+    return void toast(ctx, `${c.id}: pairing failed, see the log`, "error")
   const lines = [`Pair ${c.id} with OpenCode.`]
   if (p.hint) lines.push(p.hint)
   if (p.link) {
@@ -265,6 +270,7 @@ async function pair(
       lines.push("", "Scan with your phone camera:", ...qr.lines)
     lines.push("", "Or open this link:", p.link)
   }
+  for (const l of p.links ?? []) lines.push("", `${l.label}:`, l.url)
   const minutes = Math.max(1, Math.round((p.expiresAt - Date.now()) / 60_000))
   lines.push(
     "",

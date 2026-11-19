@@ -8,6 +8,8 @@
 import { basename } from "node:path"
 
 import type {
+  Card,
+  CardQuestion,
   Connector,
   ConnectorStatus,
   Inbound,
@@ -15,6 +17,7 @@ import type {
   Pairing,
   Push,
   SendStats,
+  SessionState,
 } from "./connectors/types.ts"
 import type { Config } from "./config.ts"
 import { redact } from "./filter.ts"
@@ -25,11 +28,11 @@ import {
   type Reply,
 } from "./inbound.ts"
 import { log } from "./logger.ts"
-import { format, type Kind, type Vars } from "./messages.ts"
+import { format, isCustomized, type Kind, type Vars } from "./messages.ts"
 import { noTelemetry, type Telemetry } from "./otel.ts"
 import type { Pending, PendingStore } from "./pending.ts"
 import type { Router, SessionFacts } from "./routing.ts"
-import { truncate } from "./util.ts"
+import { clock, formatDuration, truncate } from "./util.ts"
 
 export type SessionInfo = {
   id: string
@@ -37,6 +40,7 @@ export type SessionInfo = {
   agent?: string
   directory?: string
   title?: string
+  model?: string
 }
 
 /** What the bridge needs from OpenCode. */
@@ -107,8 +111,17 @@ export type BridgeEvent =
       data: { sessionID: string; item?: { type?: string } }
     }
   | {
-      type: "session.execution.succeeded" | "session.execution.failed"
+      type:
+        | "session.execution.started"
+        | "session.execution.succeeded"
+        | "session.execution.failed"
+        | "session.execution.interrupted"
       data: { sessionID: string }
+    }
+  | { type: "session.renamed"; data: { sessionID: string; title: string } }
+  | {
+      type: "session.model.selected"
+      data: { sessionID: string; model: { id: string } }
     }
 
 const DETAIL_MAX = 60
@@ -174,6 +187,9 @@ export function questionBody(qs: Question[]): string {
   return qs.map((q, i) => `${i + 1}) ${q.header}\n${block(q)}`).join("\n\n")
 }
 
+/** A title already in brackets is left as it is. */
+const bracketed = (t: string) => (t.startsWith("[") ? t : `[${t}]`)
+
 const no = (text: string): Outcome => ({ ok: false, text })
 
 export type BridgeStatus = {
@@ -191,6 +207,11 @@ export class Bridge {
   private readonly router: Router
   private readonly now: () => number
   private readonly tel: Telemetry
+  /** The last state shown per top-level session, and when its run started. */
+  private readonly states = new Map<
+    string,
+    { state: SessionState["state"]; at: number; started?: number }
+  >()
 
   constructor(
     cfg: Config,
@@ -258,9 +279,18 @@ export class Bridge {
 
   /** A notice to every enabled channel; which of them took it. */
   async test(): Promise<Array<{ id: string; ok: boolean }>> {
-    const f = this.fmt("notice", { text: "Test push: this channel works." })
+    const text = "Test push: this channel works."
+    const f = this.fmt("notice", { text })
     const to = this.active()
-    const { ok } = await this.dispatch("notice", to, () => f, {})
+    const { ok } = await this.dispatch(
+      "notice",
+      to,
+      (ch) => ({
+        ...f,
+        ...this.card(ch, "notice", undefined, () => ({ kind: "notice", text })),
+      }),
+      {},
+    )
     return to.map((c) => ({ id: c.id, ok: ok[c.id] === true }))
   }
 
@@ -305,12 +335,24 @@ export class Bridge {
         case "session.inbox.enqueued":
           if (e.data.item?.type === "user") this.router.touch()
           return
+        case "session.execution.started":
+          return await this.onState(e.data.sessionID, "working")
+        case "session.execution.interrupted":
+          return await this.onState(e.data.sessionID, "idle")
         case "session.execution.succeeded":
         case "session.execution.failed":
           return await this.onFinished(
             e.data.sessionID,
             e.type === "session.execution.failed",
           )
+        case "session.renamed":
+          return await this.onState(e.data.sessionID, undefined, {
+            title: e.data.title,
+          })
+        case "session.model.selected":
+          return await this.onState(e.data.sessionID, undefined, {
+            model: e.data.model.id,
+          })
       }
     } catch (err) {
       log("event_error", { type: e.type, message: (err as Error).message })
@@ -369,12 +411,18 @@ export class Bridge {
     }
     const session = {
       id: rootID,
+      project,
+      agent: root?.agent,
       name:
         this.cfg.redact.mode === "title"
           ? project
           : `${project} · ${vars.session}`,
     }
-    return { rootID, root, facts, vars, session, to }
+    const title =
+      this.cfg.redact.mode === "title"
+        ? undefined
+        : redact(root?.title ?? "", this.cfg.redact)
+    return { rootID, root, facts, vars, session, to, project, title }
   }
 
   /** Enabled channels a session's pushes go to: its own choice, else the default. */
@@ -409,7 +457,13 @@ export class Bridge {
     kind: Kind,
     to: Connector[],
     build: (ch: Connector) => Push,
-    o: { root?: string; pending?: string; refs?: Record<string, string> },
+    o: {
+      root?: string
+      pending?: string
+      refs?: Record<string, string>
+      /** Where a follow-up goes when an edit fails. */
+      session?: { id: string; name: string }
+    },
   ): Promise<{ refs: Record<string, string>; ok: Record<string, boolean> }> {
     const span = this.tel.begin("oob.push", {
       session: o.root,
@@ -431,9 +485,19 @@ export class Bridge {
           attrs: { ...attrs, "pending.id": o.pending },
         })
         const push = { ...build(ch), stats }
-        const res = await this.safely(ch, async () =>
+        let res = await this.safely(ch, async () =>
           edit ? ch.update!(old, push) : ch.send(push),
         )
+        if (edit && res === false) {
+          // The message could not be rewritten: say it in a new one.
+          log("edit_failed", { channel: ch.id, pending: o.pending })
+          res = await this.safely(ch, () =>
+            ch.send({
+              ...push,
+              session: ch.capabilities.threads ? o.session : undefined,
+            }),
+          )
+        }
         const sent = res !== undefined && res !== false
         ok[ch.id] = sent
         if (typeof res === "string") refs[ch.id] = res
@@ -464,6 +528,40 @@ export class Bridge {
     )
   }
 
+  /** Structured content for a connector that can render it itself, unless the user wrote that kind's text. */
+  private card(
+    ch: Connector,
+    kind: Kind,
+    facts: SessionFacts | undefined,
+    build: () => Card,
+  ): Pick<Push, "card"> {
+    if (
+      !ch.capabilities.rich ||
+      isCustomized(kind, this.cfg.messages, this.cfg.profiles, facts)
+    )
+      return {}
+    return { card: build() }
+  }
+
+  private cardQuestions(qs: Question[]): CardQuestion[] {
+    const hidden = this.cfg.redact.mode === "title"
+    const r = (t: string) => redact(t, this.cfg.redact)
+    return qs.map((q) => ({
+      header: q.header ? r(q.header) : undefined,
+      text: r(q.text),
+      options: hidden
+        ? []
+        : q.options.map((label, i) => ({
+            label,
+            detail: q.details?.[i]
+              ? truncate(r(q.details[i]), DETAIL_MAX)
+              : undefined,
+          })),
+      multiple: q.multiple,
+      custom: q.custom,
+    }))
+  }
+
   private async onForm(
     form: Extract<BridgeEvent, { type: "form.created" }>["data"]["form"],
   ) {
@@ -476,7 +574,7 @@ export class Bridge {
     const qvars = (hint: string): Vars => ({
       ...r.vars,
       id,
-      thread: r.root?.title ? `[${truncate(r.root.title, THREAD_MAX)}]\n` : "",
+      thread: r.title ? `${bracketed(truncate(r.title, THREAD_MAX))}\n` : "",
       body: redact(questionBody(questions), this.cfg.redact),
       hint,
     })
@@ -498,10 +596,24 @@ export class Bridge {
       (ch) => ({
         ...this.fmt("question", qvars(ch.hint(id, questions)), r.facts),
         ...this.shape(ch, r.session, { id, questions }),
+        ...this.card(ch, "question", r.facts, () => ({
+          kind: "question",
+          agent: r.vars.agent ?? "agent",
+          project: r.project,
+          session: r.title,
+          questions: this.cardQuestions(questions),
+        })),
       }),
       { root: r.rootID, pending: id },
     )
     this.remember(p, sent.refs)
+    // Answered in the TUI while the message was still being sent.
+    const now = this.store.get(id)
+    if (now && now.state !== "pending" && now.answeredBy === "tui")
+      await this.markAnswered(now, {
+        outcome: now.state === "cancelled" ? "cancelled" : "answered",
+        via: "TUI",
+      })
   }
 
   private async onPermission(
@@ -538,21 +650,94 @@ export class Bridge {
     const sent = await this.dispatch(
       "permission",
       r.to,
-      (ch) => ({ ...f, ...this.shape(ch, r.session) }),
+      (ch) => ({
+        ...f,
+        ...this.shape(ch, r.session),
+        ...this.card(ch, "permission", r.facts, () => ({
+          kind: "permission",
+          agent: r.vars.agent ?? "agent",
+          project: r.project,
+          session: r.title,
+          detail: redact(detail, this.cfg.redact),
+        })),
+      }),
       { root: r.rootID, pending: id },
     )
     this.remember(p, sent.refs)
+  }
+
+  /** Shows a session's state on the connectors that keep a live view of it. */
+  private async track(
+    r: NonNullable<Awaited<ReturnType<Bridge["routed"]>>>,
+    state: SessionState["state"] | undefined,
+    patch: { title?: string; model?: string } = {},
+  ) {
+    const prev = this.states.get(r.rootID)
+    const now = this.now()
+    const next = {
+      state: state ?? prev?.state ?? "idle",
+      at: state ? now : (prev?.at ?? now),
+      started: state === "working" ? now : prev?.started,
+    }
+    this.states.set(r.rootID, next)
+    const title =
+      patch.title === undefined
+        ? r.title
+        : this.cfg.redact.mode === "title"
+          ? undefined
+          : redact(patch.title, this.cfg.redact)
+    const s: SessionState = {
+      id: r.rootID,
+      name: title ? `${r.project} · ${title}` : r.session.name,
+      project: r.project,
+      title,
+      agent: r.root?.agent,
+      model: patch.model ?? r.root?.model,
+      state: next.state,
+      at: next.at,
+    }
+    await Promise.all(
+      r.to.map((c) =>
+        c.track ? this.safely(c, () => c.track!(s)) : undefined,
+      ),
+    )
+    return next
+  }
+
+  private async onState(
+    sessionID: string,
+    state?: SessionState["state"],
+    patch?: { title?: string; model?: string },
+  ) {
+    if (this.host.root(sessionID) !== sessionID) return
+    const r = await this.routed(sessionID)
+    if (r) await this.track(r, state, patch)
   }
 
   private async onFinished(sessionID: string, failed: boolean) {
     if (this.host.root(sessionID) !== sessionID) return
     const r = await this.routed(sessionID)
     if (!r) return
-    const f = this.fmt(failed ? "failed" : "finished", r.vars, r.facts)
+    const kind = failed ? "failed" : "finished"
+    const st = await this.track(r, failed ? "failed" : "idle")
+    const duration =
+      st.started === undefined
+        ? undefined
+        : formatDuration(this.now() - st.started)
+    const f = this.fmt(kind, r.vars, r.facts)
     await this.dispatch(
-      failed ? "failed" : "finished",
-      r.to,
-      (c) => ({ ...f, ...this.shape(c, r.session) }),
+      kind,
+      r.to.filter((c) => c.notify?.[kind] ?? true),
+      (c) => ({
+        ...f,
+        ...this.shape(c, r.session),
+        ...this.card(c, kind, r.facts, () => ({
+          kind,
+          project: r.project,
+          session: r.title,
+          duration,
+        })),
+      }),
       { root: r.rootID },
     )
   }
@@ -571,7 +756,10 @@ export class Bridge {
     })
     this.pendingGauge()
     if (!cancelled) this.answered(p, "tui")
-    await this.markAnswered(p, note)
+    await this.markAnswered(p, {
+      outcome: cancelled ? "cancelled" : "answered",
+      via: "TUI",
+    })
   }
 
   /** Counts an answer and how long the prompt waited for it. */
@@ -582,13 +770,43 @@ export class Bridge {
   }
 
   /** Marks the prompt's message on every connector that carries it. */
-  private async markAnswered(p: Pending, note: string) {
+  private async markAnswered(
+    p: Pending,
+    o: { outcome: "answered" | "cancelled"; via: string; answer?: string },
+  ) {
+    const note =
+      o.outcome === "cancelled"
+        ? "Cancelled"
+        : o.via === "TUI"
+          ? "Answered in the TUI"
+          : `Answered from ${o.via}: ${o.answer}`
     const f = this.fmt("closed", { id: p.id, title: p.title, note })
-    await this.dispatch("closed", this.active(), () => f, {
-      root: p.rootSessionID,
-      pending: p.id,
-      refs: p.refs ?? {},
-    })
+    const time = clock(this.now())
+    const quote = redact(
+      (p.questions ?? []).map((q) => q.text).join(" / ") || p.title,
+      this.cfg.redact,
+    )
+    await this.dispatch(
+      "closed",
+      this.active(),
+      (ch) => ({
+        ...f,
+        ...this.card(ch, "closed", undefined, () => ({
+          kind: "closed",
+          outcome: o.outcome,
+          answer: o.answer,
+          via: o.via,
+          time,
+          quote,
+        })),
+      }),
+      {
+        root: p.rootSessionID,
+        pending: p.id,
+        refs: p.refs ?? {},
+        session: { id: p.rootSessionID, name: p.title },
+      },
+    )
   }
 
   private fmt(kind: Kind, vars: Vars, facts?: SessionFacts) {
@@ -607,10 +825,21 @@ export class Bridge {
       const out = await this.apply(ch, m, info)
       if (out && !out.ok && !m.inline) {
         const f = this.fmt("notice", { text: out.text })
-        await this.dispatch("notice", [ch], () => f, {
-          root: info.pending?.rootSessionID,
-          pending: info.pending?.id,
-        })
+        await this.dispatch(
+          "notice",
+          [ch],
+          () => ({
+            ...f,
+            ...this.card(ch, "notice", undefined, () => ({
+              kind: "notice",
+              text: out.text,
+            })),
+          }),
+          {
+            root: info.pending?.rootSessionID,
+            pending: info.pending?.id,
+          },
+        )
       }
       if (info.outcome !== "applied" && info.outcome !== "ignored")
         this.tel.count("oob.inbound.rejected", {
@@ -645,7 +874,9 @@ export class Bridge {
     if (m.pendingId) {
       id = m.pendingId
       reply =
-        m.choice !== undefined ? { id, choice: m.choice } : { id, text: m.text }
+        m.choice !== undefined
+          ? { id, choice: m.choice }
+          : { id, text: m.text, literal: m.literal }
     } else if (m.replyTo) {
       // A reply to the message itself; one that answers nothing we track is not ours.
       const target = this.store.byRef(ch.id, m.replyTo)
@@ -707,7 +938,11 @@ export class Bridge {
     )
     info.outcome = "applied"
     this.answered(p, "phone", ch)
-    await this.markAnswered(p, `Answered from ${ch.id}: ${given}`)
+    await this.markAnswered(p, {
+      outcome: "answered",
+      via: ch.id,
+      answer: given,
+    })
     return { ok: true, text: `Answered: ${given}` }
   }
 }
