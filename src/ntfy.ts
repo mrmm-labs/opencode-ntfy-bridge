@@ -94,6 +94,9 @@ export class Ntfy {
         method: "POST",
         headers,
         body: JSON.stringify(body),
+        // A pooled socket the proxy has already dropped hangs until the
+        // timeout; pushes are rare, so each one opens a fresh connection.
+        keepalive: false,
         signal: AbortSignal.timeout(this.opts.timeoutMs ?? 10_000),
       })
       if (!res.ok) {
