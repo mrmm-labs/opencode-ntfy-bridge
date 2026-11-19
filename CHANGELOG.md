@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/mrmm-labs/opencode-ntfy-bridge/compare/v0.2.1...v0.2.2) (2026-11-19)
+
+
+### Bug Fixes
+
+* register /ntfy in the global keymap mode ([#9](https://github.com/mrmm-labs/opencode-ntfy-bridge/issues/9)) ([10db9b2](https://github.com/mrmm-labs/opencode-ntfy-bridge/commit/10db9b2f7917cdf16c4f8e6159deba49abe62314))
+
 ## [0.2.1](https://github.com/mrmm-labs/opencode-ntfy-bridge/compare/v0.2.0...v0.2.1) (2026-11-19)
 
 
