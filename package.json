@@ -1,6 +1,6 @@
 {
   "name": "opencode-ntfy-bridge",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "OpenCode plugin that mirrors questions and permission prompts of selected sessions to ntfy and lets you answer questions from your phone.",
   "keywords": [
     "notifications",
