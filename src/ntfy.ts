@@ -8,6 +8,7 @@ export type HttpAction = {
   url: string
   method: "POST"
   body: string
+  headers?: Record<string, string>
   clear?: boolean
 }
 
@@ -27,6 +28,8 @@ export type NtfyOptions = {
   server: string
   topics: { out: string; in: string }
   token?: () => Promise<string | undefined>
+  /** Puts the token in each http action, so buttons work on a server that denies anonymous writes. */
+  actionAuth?: boolean
   fetch?: typeof fetch
   /** Reconnect delays in ms: first and cap. */
   backoff?: { min: number; max: number }
@@ -70,17 +73,26 @@ export class Ntfy {
 
   /** Publishes to the out topic. Returns the message id; never throws. */
   async publish(p: Publish): Promise<string | undefined> {
+    const headers = await this.headers(true)
+    const auth =
+      this.opts.actionAuth && headers.Authorization
+        ? { headers: { Authorization: headers.Authorization } }
+        : {}
     const body = {
       ...p,
       topic: this.opts.topics.out,
       title: p.title === undefined ? undefined : filterSecrets(p.title),
       message: filterSecrets(p.message),
-      actions: p.actions?.map((a) => ({ ...a, label: filterSecrets(a.label) })),
+      actions: p.actions?.map((a) => ({
+        ...a,
+        label: filterSecrets(a.label),
+        ...auth,
+      })),
     }
     try {
       const res = await this.fetch(`${this.opts.server}/`, {
         method: "POST",
-        headers: await this.headers(true),
+        headers,
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(this.opts.timeoutMs ?? 10_000),
       })

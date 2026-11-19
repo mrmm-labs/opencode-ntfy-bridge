@@ -34,12 +34,27 @@ export interface Host {
   replyForm(sessionID: string, formID: string, answer: Answer): Promise<void>
 }
 
+type FormOption =
+  | string
+  | {
+      value?: unknown
+      label?: unknown
+      title?: unknown
+      name?: unknown
+      description?: unknown
+      detail?: unknown
+    }
+
+/** OpenCode 2.3 sends options as { value, label, description }; older or other shapes are read too. */
 type FormField = {
   key?: string
   type?: string
   title?: string
   description?: string
-  options?: Array<{ value?: string; label?: string }>
+  options?: FormOption[]
+  choices?: FormOption[]
+  enum?: FormOption[]
+  multiple?: boolean
   custom?: boolean
 }
 
@@ -85,37 +100,109 @@ export type BridgeEvent =
     }
 
 const MAX_BUTTONS = 3
+const LABEL_MAX = 24
+const DETAIL_MAX = 60
+const THREAD_MAX = 40
 const EXPIRY_MS = 24 * 60 * 60 * 1000
 
+const str = (v: unknown) => (typeof v === "string" ? v : undefined)
+
+export const truncate = (s: string, n: number) =>
+  s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s
+
+function option(o: FormOption): { label: string; detail?: string } {
+  if (typeof o === "string") return { label: o }
+  return {
+    label: str(o.label) ?? str(o.title) ?? str(o.name) ?? String(o.value ?? ""),
+    detail: str(o.description) ?? str(o.detail),
+  }
+}
+
+let shapeLogged = false
+
 export function toQuestions(fields: FormField[] = []): Question[] {
+  if (!shapeLogged && fields.length) {
+    shapeLogged = true
+    const first = fields.map((f) => f.options ?? f.choices ?? f.enum)[0]?.[0]
+    log("form_shape", {
+      fields: fields.map((f) => Object.keys(f ?? {})),
+      option:
+        first && typeof first === "object" ? Object.keys(first) : typeof first,
+    })
+  }
   return fields
-    .filter((f) => f.key && (f.type === "string" || f.type === "multiselect"))
-    .map((f) => ({
-      key: f.key!,
-      header: f.title ?? "",
-      text: f.description ?? f.title ?? "",
-      options: (f.options ?? []).map((o) => o.label ?? o.value ?? ""),
-      multiple: f.type === "multiselect",
-      custom: f.custom !== false,
-    }))
+    .filter((f) => {
+      const list = f.options ?? f.choices ?? f.enum
+      return (
+        f.key &&
+        (f.type === "string" ||
+          f.type === "multiselect" ||
+          (Array.isArray(list) && list.length > 0))
+      )
+    })
+    .map((f) => {
+      const opts = (f.options ?? f.choices ?? f.enum ?? []).map(option)
+      return {
+        key: f.key!,
+        header: f.title ?? "",
+        text: f.description ?? f.title ?? "",
+        options: opts.map((o) => o.label),
+        details: opts.map((o) => o.detail ?? ""),
+        multiple: f.type === "multiselect" || f.multiple === true,
+        custom: f.custom !== false,
+      }
+    })
 }
 
 export function questionBody(qs: Question[]): string {
-  const block = (q: Question, numbered: boolean) => {
+  const block = (q: Question) => {
     const lines = [q.text]
-    if (numbered || q.options.length > MAX_BUTTONS || q.multiple)
-      q.options.forEach((o, i) => lines.push(`  ${i + 1}. ${o}`))
+    q.options.forEach((o, i) => {
+      const d = q.details?.[i]
+      lines.push(`${i + 1}. ${o}${d ? ` — ${truncate(d, DETAIL_MAX)}` : ""}`)
+    })
     return lines.join("\n")
   }
-  if (qs.length === 1) return block(qs[0], false)
-  return qs
-    .map((q, i) => `${i + 1}) ${q.header}\n${block(q, true)}`)
-    .join("\n\n")
+  if (qs.length === 1) return block(qs[0])
+  return qs.map((q, i) => `${i + 1}) ${q.header}\n${block(q)}`).join("\n\n")
 }
 
-export function replyHint(id: string, qs: Question[]): string {
-  if (qs.length > 1) return `Reply: #${id} <answer 1> | <answer 2> …`
-  return qs[0].multiple ? `Reply: #${id} 1,3` : `Reply: #${id} <number or text>`
+const buttons = (qs: Question[]) =>
+  qs.length === 1 &&
+  !qs[0].multiple &&
+  qs[0].options.length > 0 &&
+  qs[0].options.length <= MAX_BUTTONS
+
+export function replyHint(id: string, qs: Question[], inTopic: string): string {
+  const to = `to topic ${inTopic}`
+  if (qs.length !== 1) return `Post \`#${id} <answer 1> | <answer 2> …\` ${to}`
+  if (qs[0].multiple) return `Post \`#${id} 1,3\` (numbers) ${to}`
+  if (buttons(qs)) return `Tap a button, or post \`#${id} <n or text>\` ${to}`
+  return `Reply by number: post \`#${id} <n or text>\` ${to}`
+}
+
+/** The question push: body and buttons. */
+export function renderQuestion(
+  cfg: Pick<Config, "server" | "topics" | "redact">,
+  id: string,
+  questions: Question[],
+  threadTitle?: string,
+): { message: string; actions?: HttpAction[] } {
+  const thread = threadTitle ? `[${truncate(threadTitle, THREAD_MAX)}]\n` : ""
+  const actions: HttpAction[] | undefined = buttons(questions)
+    ? questions[0].options.map((label, i) => ({
+        action: "http",
+        label: truncate(label, LABEL_MAX),
+        url: `${cfg.server}/${cfg.topics.in}`,
+        method: "POST",
+        body: JSON.stringify({ id, choice: i + 1 }),
+        clear: true,
+      }))
+    : undefined
+  return {
+    message: `${thread}${redact(questionBody(questions), cfg.redact)}\n\n${replyHint(id, questions, cfg.topics.in)}`,
+    actions,
+  }
 }
 
 export class Bridge {
@@ -228,25 +315,15 @@ export class Bridge {
       askedAt: this.now(),
       state: "pending",
     })
-    const q = questions[0]
-    const actions: HttpAction[] | undefined =
-      questions.length === 1 &&
-      !q.multiple &&
-      q.options.length > 0 &&
-      q.options.length <= MAX_BUTTONS
-        ? q.options.map((label, i) => ({
-            action: "http",
-            label,
-            url: `${this.cfg.server}/${this.cfg.topics.in}`,
-            method: "POST",
-            body: JSON.stringify({ id, choice: i + 1 }),
-            clear: true,
-          }))
-        : undefined
-    const thread = r.root?.title ? `[${r.root.title}]\n` : ""
+    const { message, actions } = renderQuestion(
+      this.cfg,
+      id,
+      questions,
+      r.root?.title,
+    )
     const msgID = await this.ntfy.publish({
       title,
-      message: `${thread}${redact(questionBody(questions), this.cfg.redact)}\n\n${replyHint(id, questions)}`,
+      message,
       tags: tags("question", form.sessionID !== r.rootID ? agent : undefined),
       priority: 4,
       actions,
@@ -358,7 +435,7 @@ export class Bridge {
       const answer = resolveAnswer(p.questions ?? [], reply)
       if (!answer)
         return void (await this.notice(
-          `#${p.id}: could not read that answer. ${replyHint(p.id, p.questions ?? [])}`,
+          `#${p.id}: could not read that answer. ${replyHint(p.id, p.questions ?? [], this.cfg.topics.in)}`,
         ))
       // Claimed before the await: the first answer wins, from either side.
       this.store.update(p.id, {

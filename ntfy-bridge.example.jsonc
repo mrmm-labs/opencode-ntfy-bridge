@@ -12,6 +12,11 @@
   // Pushes go to "out"; replies come back on "in". Use long random names.
   "topics": { "out": "oc-3k9f2x7q-out", "in": "oc-3k9f2x7q-in" },
 
+  // Buttons carry the token so they work on a server that denies anonymous
+  // writes. The token is then readable by anyone who can read "out".
+  // false: buttons carry nothing; grant anonymous write-only on "in" instead.
+  "actionAuth": true,
+
   // Mirror sessions after this many minutes without input in the TUI.
   "away": { "minutes": 10 },
 

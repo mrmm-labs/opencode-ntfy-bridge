@@ -33,6 +33,8 @@ export type Question = {
   header: string
   text: string
   options: string[]
+  /** Per-option description, same order as options. */
+  details?: string[]
   multiple: boolean
   custom: boolean
 }

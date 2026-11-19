@@ -66,6 +66,7 @@ export async function setup(
   const ntfy = new Ntfy({
     server: cfg.server,
     topics: cfg.topics,
+    actionAuth: cfg.actionAuth,
     // Resolved once; a failed command is retried on the next request.
     token: () =>
       (token ??= resolveToken(cfg.token).catch((err) => {

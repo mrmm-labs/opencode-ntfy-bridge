@@ -47,6 +47,7 @@ nothing and opens no connection.**
 | `token`        | none       | `{ "env": NAME }` or `{ "command": [argv] }`. A literal token in the file is refused. |
 | `topics.out`   | (required) | Topic the plugin publishes to. Subscribe to it in the ntfy app.                       |
 | `topics.in`    | (required) | Topic the plugin reads replies from.                                                  |
+| `actionAuth`   | `true`     | Put the token in each button so buttons work on an auth-protected server. See below.  |
 | `away.minutes` | `10`       | Minutes without input in the TUI before matching sessions are mirrored.               |
 | `rules`        | `[]`       | Which sessions are mirrored while you are away. Empty: all.                           |
 | `redact`       | `full`     | `full`, `head:<n>` (first n characters) or `title` (no body at all).                  |
@@ -79,10 +80,11 @@ file, default `bridge.log` in the state directory).
 
 ### What you receive
 
-- **Question**: title `<project> · <agent> asks`, the question (redacted per `redact`), and a
-  short id. Up to three options become buttons. More options, multiple choice or several questions
-  become a numbered list. A subagent's question carries its agent name as a tag and the top-level
-  session's title.
+- **Question**: title `<project> · <agent> asks`, the top-level session's title, the question
+  (redacted per `redact`), a numbered option list with short descriptions, and one line telling
+  you how to answer with the prompt's short id. Up to three options also become buttons; with
+  more options, multiple choice or several questions you reply by number. A subagent's question
+  carries its agent name as a tag.
 - **Permission**: title `<project> · <agent> needs permission`, the action and its resources.
 - **Session finished / failed**: one low-priority push each time a mirrored top-level session
   stops working. A session woken up again (for example by a background subagent reporting back)
@@ -111,8 +113,14 @@ itself.
 
 - ntfy `http` buttons are sent by the app with no identity: **anyone who can publish to
   `topics.in` can answer a question.** Use long random topic names, and on your own server give
-  `topics.in` write access only to the clients you trust. Buttons carry no credentials, so with a
-  write-protected `topics.in` you reply by text from an authenticated client instead.
+  `topics.in` write access only to the clients you trust.
+- Buttons are `http` actions the app sends itself. With `actionAuth: true` (the default) each
+  button carries `Authorization: Bearer <token>`, so it works when the server denies anonymous
+  writes. **The token is then stored in the notification**: anyone who can read `topics.out` can
+  read it. Give that token the least access it needs (write `topics.in`, write `topics.out`, read
+  `topics.in`). The alternative is `actionAuth: false` plus an ACL that lets anonymous users only
+  write to `topics.in` (`ntfy access everyone <in-topic> write-only`); then the buttons carry no
+  credentials, and anyone who knows the topic name can answer.
 - This is why permissions stay tier 3: a permission is never granted or denied from ntfy.
 - Never route production approvals through this plugin.
 

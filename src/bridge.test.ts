@@ -3,6 +3,8 @@ import { describe, it } from "node:test"
 
 import {
   Bridge,
+  renderQuestion,
+  toQuestions,
   type BridgeEvent,
   type Host,
   type SessionInfo,
@@ -230,7 +232,85 @@ describe("Bridge outbound", () => {
     assert.equal(p.actions, undefined)
     assert.doesNotMatch(p.message, /hunter22/)
     assert.match(p.message, /…/)
-    assert.match(p.message, /Reply: #\w{4}/)
+    assert.match(
+      p.message,
+      /Reply by number: post `#\w{4} <n or text>` to topic oc-in/,
+    )
+  })
+
+  it("reads the OpenCode 2.3 option shape (value, label, description) and other shapes", () => {
+    const real = toQuestions([
+      {
+        key: "q0",
+        title: "ntfy test",
+        description: "Which fix first?",
+        type: "string",
+        options: [
+          { value: "Read cap", label: "Read cap", description: "Cap reads" },
+          { value: "Nothing", label: "Nothing" },
+        ],
+        custom: true,
+      },
+    ])
+    assert.deepEqual(real[0].options, ["Read cap", "Nothing"])
+    assert.deepEqual(real[0].details, ["Cap reads", ""])
+    const other = toQuestions([
+      { key: "a", type: "select", choices: ["x", { title: "y", detail: "d" }] },
+      { key: "b", enum: [{ name: "n" }, { value: "v" }], multiple: true },
+    ])
+    assert.deepEqual(
+      other.map((q) => q.options),
+      [
+        ["x", "y"],
+        ["n", "v"],
+      ],
+    )
+    assert.equal(other[0].details![1], "d")
+    assert.equal(other[1].multiple, true)
+  })
+
+  it("renders a numbered option list, short buttons and a one-line hint", () => {
+    const qs = toQuestions([
+      {
+        key: "q0",
+        type: "string",
+        title: "Fixes",
+        description: "Which context fixes should I apply first?",
+        options: [
+          {
+            value: "Read cap + prefix trim (Recommended)",
+            label: "Read cap + prefix trim (Recommended)",
+            description:
+              "Cap file reads at 2000 lines and trim the repeated prefix of every tool result",
+          },
+          { value: "Also compaction tuning", label: "Also compaction tuning" },
+          { value: "Nothing yet", label: "Nothing yet", description: "Wait" },
+        ],
+      },
+    ])
+    const r = renderQuestion(
+      cfg(),
+      "ab12",
+      qs,
+      "A very long session title that keeps going and going",
+    )
+    assert.equal(
+      r.message,
+      [
+        "[A very long session title that keeps go…]",
+        "Which context fixes should I apply first?",
+        "1. Read cap + prefix trim (Recommended) — Cap file reads at 2000 lines and trim the repeated prefix o…",
+        "2. Also compaction tuning",
+        "3. Nothing yet — Wait",
+        "",
+        "Tap a button, or post `#ab12 <n or text>` to topic oc-in",
+      ].join("\n"),
+    )
+    assert.deepEqual(
+      r.actions!.map((a) => a.label),
+      ["Read cap + prefix trim…", "Also compaction tuning", "Nothing yet"],
+    )
+    assert.ok(r.actions!.every((a) => a.label.length <= 24))
   })
 
   it("AC-5: title redaction hides the question", async () => {
