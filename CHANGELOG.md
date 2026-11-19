@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/mrmm-labs/opencode-ntfy-bridge/compare/v0.3.0...v0.4.0) (2026-11-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* rename to opencode-oob-bridge ([#13](https://github.com/mrmm-labs/opencode-ntfy-bridge/issues/13))
+
+### Features
+
+* rename to opencode-oob-bridge ([#13](https://github.com/mrmm-labs/opencode-ntfy-bridge/issues/13)) ([235acea](https://github.com/mrmm-labs/opencode-ntfy-bridge/commit/235acea8bd11b823aeb4134e703e6f9d9a3bc246))
+
 ## [0.3.0](https://github.com/mrmm-labs/opencode-ntfy-bridge/compare/v0.2.2...v0.3.0) (2026-11-19)
 
 
