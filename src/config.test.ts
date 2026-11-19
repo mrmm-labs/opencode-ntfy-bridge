@@ -12,6 +12,10 @@ import {
   type Config,
 } from "./config.ts"
 
+/** The options a connector type parsed for one channel. */
+const opts = (c: Config, name: string) =>
+  c.channels[name].options as Record<string, unknown>
+
 const base = {
   server: "https://ntfy.example/",
   topics: { out: "oc-x-out", in: "oc-x-in" },
@@ -20,17 +24,20 @@ const base = {
 describe("parseConfig", () => {
   it("fills defaults", () => {
     const c = parseConfig(base) as Config
-    assert.equal(c.server, "https://ntfy.example")
+    assert.equal(opts(c, "ntfy").server, "https://ntfy.example")
     assert.equal(c.away.minutes, 10)
     assert.deepEqual(c.redact, { mode: "full" })
     assert.deepEqual(c.rules, [])
-    assert.equal(c.token, undefined)
-    assert.equal(c.actionAuth, true)
+    assert.equal(opts(c, "ntfy").token, undefined)
+    assert.equal(opts(c, "ntfy").actionAuth, true)
+    assert.equal(c.channels.ntfy.enabled, true)
+    assert.equal(c.channels.telegram, undefined)
   })
 
   it("actionAuth is a boolean", () => {
     assert.equal(
-      (parseConfig({ ...base, actionAuth: false }) as Config).actionAuth,
+      opts(parseConfig({ ...base, actionAuth: false }) as Config, "ntfy")
+        .actionAuth,
       false,
     )
     assert.ok("error" in parseConfig({ ...base, actionAuth: "yes" }))
@@ -48,11 +55,14 @@ describe("parseConfig", () => {
       redact: "head:300",
       permissions: { tier: 3 },
     }) as Config
-    assert.deepEqual(c.token, { command: ["pass", "show", "ntfy"] })
+    assert.deepEqual(opts(c, "ntfy").token, {
+      command: ["pass", "show", "ntfy"],
+    })
     assert.equal(c.rules.length, 3)
     assert.ok(c.rules[0].agent?.test("coordinator"))
     assert.deepEqual(
-      (parseConfig({ ...base, token: { env: "T" } }) as Config).token,
+      opts(parseConfig({ ...base, token: { env: "T" } }) as Config, "ntfy")
+        .token,
       {
         env: "T",
       },
@@ -75,6 +85,120 @@ describe("parseConfig", () => {
   })
 })
 
+describe("parseConfig channels", () => {
+  const ntfy = { server: "https://ntfy.example", topics: { out: "a", in: "b" } }
+
+  it("reads channels.ntfy like the top-level form", () => {
+    const legacy = parseConfig(ntfy) as Config
+    const nested = parseConfig({
+      channels: { ntfy: { ...ntfy, enabled: false } },
+    }) as Config
+    assert.deepEqual(opts(nested, "ntfy"), opts(legacy, "ntfy"))
+    assert.equal(nested.channels.ntfy.enabled, false)
+  })
+
+  it("accepts telegram alone, with a token source and optional chat id", () => {
+    const c = parseConfig({
+      channels: {
+        telegram: { token: { env: "TG" }, chatId: -100123 },
+      },
+    }) as Config
+    assert.equal(c.channels.ntfy, undefined)
+    assert.equal(c.channels.telegram.enabled, true)
+    assert.deepEqual(opts(c, "telegram"), {
+      token: { env: "TG" },
+      chatId: "-100123",
+      apiBase: "https://api.telegram.org",
+    })
+    const d = parseConfig({
+      channels: {
+        telegram: { token: { command: ["pass", "tg"] }, chatId: "42" },
+      },
+    }) as Config
+    assert.equal(opts(d, "telegram").chatId, "42")
+  })
+
+  it("runs both channels together", () => {
+    const c = parseConfig({
+      channels: { ntfy, telegram: { token: { env: "TG" } } },
+    }) as Config
+    assert.ok(c.channels.ntfy && c.channels.telegram)
+    assert.equal(opts(c, "telegram").chatId, undefined)
+  })
+
+  it("defaultChannel is all unless set, and must name a configured channel", () => {
+    const both = { channels: { ntfy, telegram: { token: { env: "TG" } } } }
+    assert.equal((parseConfig(both) as Config).defaultChannel, "all")
+    assert.equal(
+      (parseConfig({ ...both, defaultChannel: "telegram" }) as Config)
+        .defaultChannel,
+      "telegram",
+    )
+    const err = (raw: unknown) => "error" in (parseConfig(raw) as object)
+    assert.ok(err({ ...both, defaultChannel: "signal" }))
+    assert.ok(err({ ...ntfy, defaultChannel: "telegram" }))
+    assert.equal(
+      (parseConfig({ ...ntfy, defaultChannel: "ntfy" }) as Config)
+        .defaultChannel,
+      "ntfy",
+    )
+  })
+
+  it("type defaults to the name, so one type can have several instances", () => {
+    const c = parseConfig({
+      channels: {
+        ntfy,
+        phone: { type: "telegram", token: { env: "A" } },
+        tablet: { type: "telegram", token: { env: "B" }, enabled: false },
+      },
+    }) as Config
+    assert.deepEqual(
+      Object.entries(c.channels).map(([n, v]) => [n, v.type, v.enabled]),
+      [
+        ["ntfy", "ntfy", true],
+        ["phone", "telegram", true],
+        ["tablet", "telegram", false],
+      ],
+    )
+    assert.equal(
+      (parseConfig({ channels: { ntfy }, defaultChannel: "ntfy" }) as Config)
+        .defaultChannel,
+      "ntfy",
+    )
+    assert.ok(
+      "error" in
+        (parseConfig({ channels: { x: { type: "signal" } } }) as object),
+    )
+    assert.ok(
+      "error" in
+        (parseConfig({ channels: { "a b": { type: "telegram" } } }) as object),
+    )
+    // A channel can be named "error" without confusing the result.
+    assert.ok(
+      "channels" in
+        (parseConfig({
+          channels: { error: { type: "telegram", token: { env: "A" } } },
+        }) as object),
+    )
+  })
+
+  it("refuses a literal telegram token, a bad chat id, mixed forms and no channel", () => {
+    const err = (raw: unknown) => "error" in (parseConfig(raw) as object)
+    assert.ok(err({ channels: { telegram: { token: "123:abc" } } }))
+    assert.ok(err({ channels: { telegram: {} } }))
+    assert.ok(
+      err({ channels: { telegram: { token: { env: "T" }, chatId: "me" } } }),
+    )
+    assert.ok(
+      err({ channels: { telegram: { token: { env: "T" }, apiBase: "x" } } }),
+    )
+    assert.ok(err({ ...ntfy, channels: { ntfy } }))
+    assert.ok(err({ channels: { signal: {} } }))
+    assert.ok(err({}))
+    assert.ok(err({ channels: { ntfy: { ...ntfy, token: "tk_x" } } }))
+  })
+})
+
 describe("loadConfig", () => {
   it("returns undefined when the file is missing (inert)", async () => {
     assert.equal(await loadConfig("/nonexistent/oob-bridge.jsonc"), undefined)
@@ -84,7 +208,11 @@ describe("loadConfig", () => {
     const dir = await mkdtemp(join(tmpdir(), "ntfyb-cfg-"))
     const p = join(dir, "c.jsonc")
     await writeFile(p, `// c\n${JSON.stringify(base)}`)
-    assert.equal(((await loadConfig(p)) as Config).topics.in, "oc-x-in")
+    assert.equal(
+      (opts((await loadConfig(p)) as Config, "ntfy").topics as { in: string })
+        .in,
+      "oc-x-in",
+    )
     await writeFile(p, "{ nope")
     assert.ok("error" in ((await loadConfig(p)) as object))
   })
@@ -92,7 +220,10 @@ describe("loadConfig", () => {
   it("accepts the shipped example", async () => {
     const example = join(import.meta.dirname, "..", "oob-bridge.example.jsonc")
     const c = (await loadConfig(example)) as Config
-    assert.equal(c.topics.out, "oc-3k9f2x7q-out")
+    assert.equal(
+      (opts(c, "ntfy").topics as { out: string }).out,
+      "oc-3k9f2x7q-out",
+    )
     assert.equal(c.rules.length, 2)
   })
 
@@ -115,10 +246,10 @@ describe("loadConfig", () => {
       "/o.jsonc",
     )
     assert.equal(dataDir({ OPENCODE_NTFY_BRIDGE_DATA: "/o" }), "/o")
-    const base = await mkdtemp(join(tmpdir(), "oobb-legacy-"))
-    await mkdir(join(base, "opencode"))
+    const root = await mkdtemp(join(tmpdir(), "oobb-legacy-"))
+    await mkdir(join(root, "opencode"))
     await writeFile(
-      join(base, "opencode", "ntfy-bridge.jsonc"),
+      join(root, "opencode", "ntfy-bridge.jsonc"),
       JSON.stringify({
         server: "https://n.example",
         topics: { out: "a", in: "b" },
@@ -126,11 +257,14 @@ describe("loadConfig", () => {
     )
     const keys = ["XDG_CONFIG_HOME", "OPENCODE_OOB_BRIDGE_CONFIG"] as const
     const prev = keys.map((k) => process.env[k])
-    process.env.XDG_CONFIG_HOME = base
+    process.env.XDG_CONFIG_HOME = root
     delete process.env.OPENCODE_OOB_BRIDGE_CONFIG
     try {
-      assert.equal(((await loadConfig()) as Config).server, "https://n.example")
-      assert.equal(await loadConfig(join(base, "other.jsonc")), undefined)
+      assert.equal(
+        opts((await loadConfig()) as Config, "ntfy").server,
+        "https://n.example",
+      )
+      assert.equal(await loadConfig(join(root, "other.jsonc")), undefined)
     } finally {
       keys.forEach((k, i) =>
         prev[i] === undefined

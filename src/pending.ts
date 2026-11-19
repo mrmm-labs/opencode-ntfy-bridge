@@ -1,4 +1,4 @@
-/** Prompts pushed to ntfy, in memory and in an append-only JSONL file for restarts. */
+/** Prompts pushed to the channels, in memory and in an append-only JSONL file for restarts. */
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises"
 import { dirname } from "node:path"
 
@@ -17,12 +17,15 @@ export type Pending = {
   rootSessionID: string
   title: string
   questions?: Question[]
-  ntfyMessageID?: string
+  /** Message reference per channel id, to update the message later. */
+  refs?: Record<string, string>
   askedAt: number
   state: PendingState
   answeredBy?: "tui" | "phone"
+  /** Channel id that carried the phone answer. */
+  answeredVia?: string
   answeredAt?: number
-  /** ntfy id of the reply that answered it, to ignore its replay after a restart. */
+  /** Transport id of the reply that answered it, to ignore its replay after a restart. */
   replyID?: string
 }
 
@@ -50,9 +53,13 @@ export class PendingStore {
     for (const line of text.split("\n")) {
       if (!line.trim()) continue
       try {
-        const p = JSON.parse(line) as Pending
-        if (typeof p.id === "string" && now - p.askedAt < TTL_MS)
+        const p = JSON.parse(line) as Pending & { ntfyMessageID?: string }
+        if (typeof p.id === "string" && now - p.askedAt < TTL_MS) {
+          // Written before channels existed.
+          if (p.ntfyMessageID) p.refs ??= { ntfy: p.ntfyMessageID }
+          delete p.ntfyMessageID
           this.items.set(p.id, p)
+        }
       } catch {}
     }
     const body = [...this.items.values()]
@@ -67,6 +74,11 @@ export class PendingStore {
 
   byRequest(requestID: string): Pending | undefined {
     for (const p of this.items.values()) if (p.requestID === requestID) return p
+    return undefined
+  }
+
+  byRef(channel: string, ref: string): Pending | undefined {
+    for (const p of this.items.values()) if (p.refs?.[channel] === ref) return p
     return undefined
   }
 

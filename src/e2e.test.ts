@@ -8,7 +8,7 @@ import { promisify } from "node:util"
 import { Bridge, type Host } from "./bridge.ts"
 import { parseConfig, type Config } from "./config.ts"
 import type { Answer } from "./inbound.ts"
-import { Ntfy } from "./ntfy.ts"
+import { Ntfy, NtfyConnector, type NtfyConfig } from "./connectors/ntfy.ts"
 import { PendingStore } from "./pending.ts"
 import { Router } from "./routing.ts"
 
@@ -113,12 +113,19 @@ describe("e2e against a real ntfy", () => {
     }
     const router = new Router(cfg, async () => true)
     router.set("root", true)
+    const nc = cfg.channels.ntfy.options as NtfyConfig
     const ntfy = new Ntfy({
-      server: cfg.server,
-      topics: cfg.topics,
+      server: nc.server,
+      topics: nc.topics,
       backoff: { min: 200, max: 1000 },
     })
-    const bridge = new Bridge(cfg, host, ntfy, new PendingStore(), router)
+    const bridge = new Bridge(
+      cfg,
+      host,
+      [new NtfyConnector("ntfy", ntfy, nc)],
+      new PendingStore(),
+      router,
+    )
     bridge.start()
     try {
       await new Promise((r) => setTimeout(r, 500))
@@ -144,7 +151,7 @@ describe("e2e against a real ntfy", () => {
         },
       })
       const q = await waitFor(async () =>
-        (await poll(cfg.topics.out)).find((m) => m.actions?.length),
+        (await poll(nc.topics.out)).find((m) => m.actions?.length),
       )
       assert.ok(Date.now() - asked < 2000, "published within 2 s")
       assert.equal(q.title, "shop · coordinator asks")
@@ -158,7 +165,7 @@ describe("e2e against a real ntfy", () => {
         answer: { q0: "Yes" },
       })
       await waitFor(async () =>
-        (await poll(cfg.topics.out)).find(
+        (await poll(nc.topics.out)).find(
           (m) => m.sequence_id === q.id && /Answered from ntfy/.test(m.message),
         ),
       )
@@ -175,12 +182,12 @@ describe("e2e against a real ntfy", () => {
         },
       })
       const q2 = await waitFor(async () =>
-        (await poll(cfg.topics.out)).find(
+        (await poll(nc.topics.out)).find(
           (m) => m.id !== q.id && m.actions?.length,
         ),
       )
       const id = /#(\w{4})/.exec(q2.message)![1]
-      await fetch(`${url}/${cfg.topics.in}`, {
+      await fetch(`${url}/${nc.topics.in}`, {
         method: "POST",
         body: `#${id} not yet`,
       })
@@ -191,12 +198,12 @@ describe("e2e against a real ntfy", () => {
       })
 
       // A second answer to the same prompt is refused with a push.
-      await fetch(`${url}/${cfg.topics.in}`, {
+      await fetch(`${url}/${nc.topics.in}`, {
         method: "POST",
         body: `#${id} 2`,
       })
       await waitFor(async () =>
-        (await poll(cfg.topics.out)).find((m) =>
+        (await poll(nc.topics.out)).find((m) =>
           /already answered/.test(m.message),
         ),
       )

@@ -1,4 +1,4 @@
-/** Decides which sessions are mirrored to ntfy. */
+/** Decides which sessions are mirrored, and optionally through which channel. */
 import { execFile } from "node:child_process"
 
 import type { Rule } from "./config.ts"
@@ -53,9 +53,15 @@ export const runClassifier: Classify = ([cmd, ...args], s) =>
     )
   })
 
+const auto = (routes: boolean, reason: string) => ({
+  routes,
+  mode: "auto" as const,
+  reason,
+})
+
 export class Router {
   private lastInput: number
-  private readonly manual = new Map<string, boolean>()
+  private readonly manual = new Map<string, { on: boolean; channel?: string }>()
   private readonly classified = new Map<string, Promise<boolean>>()
 
   private readonly cfg: { away: { minutes: number }; rules: Rule[] }
@@ -83,25 +89,45 @@ export class Router {
     return this.now() - this.lastInput >= this.cfg.away.minutes * 60_000
   }
 
-  /** `true` / `false` force routing for a top-level session; `undefined` returns it to auto. */
-  set(rootSessionID: string, on: boolean | undefined): void {
+  /**
+   * `true` / `false` force routing for a top-level session; `undefined` returns
+   * it to auto. `channel` ("all" or a channel id) overrides the default one.
+   */
+  set(rootSessionID: string, on: boolean | undefined, channel?: string): void {
     if (on === undefined) this.manual.delete(rootSessionID)
-    else this.manual.set(rootSessionID, on)
+    else this.manual.set(rootSessionID, { on, channel })
   }
 
   mode(rootSessionID: string): "on" | "off" | "auto" {
     const m = this.manual.get(rootSessionID)
-    return m === undefined ? "auto" : m ? "on" : "off"
+    return m === undefined ? "auto" : m.on ? "on" : "off"
+  }
+
+  /** The channel a session chose, if any. */
+  channel(rootSessionID: string): string | undefined {
+    return this.manual.get(rootSessionID)?.channel
   }
 
   async routes(root: SessionFacts): Promise<boolean> {
+    return (await this.decide(root)).routes
+  }
+
+  /** The routing decision and why: for telemetry and the menu. */
+  async decide(
+    root: SessionFacts,
+  ): Promise<{ routes: boolean; mode: "on" | "off" | "auto"; reason: string }> {
     const m = this.manual.get(root.id)
-    if (m !== undefined) return m
-    if (!this.away()) return false
-    if (this.cfg.rules.length === 0) return true
+    if (m !== undefined)
+      return {
+        routes: m.on,
+        mode: m.on ? "on" : "off",
+        reason: m.on ? "manual-on" : "manual-off",
+      }
+    if (!this.away()) return auto(false, "present")
+    if (this.cfg.rules.length === 0) return auto(true, "away-no-rules")
     for (const rule of this.cfg.rules)
-      if (await this.matches(rule, root)) return true
-    return false
+      if (await this.matches(rule, root)) return auto(true, "rule-match")
+    return auto(false, "no-rule-match")
   }
 
   private async matches(rule: Rule, s: SessionFacts): Promise<boolean> {

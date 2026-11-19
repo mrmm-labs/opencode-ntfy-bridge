@@ -1,12 +1,13 @@
 {
   "name": "opencode-oob-bridge",
   "version": "0.4.0",
-  "description": "OpenCode plugin that mirrors questions and permission prompts of selected sessions to ntfy and lets you answer questions from your phone.",
+  "description": "OpenCode plugin that mirrors questions and permission prompts of selected sessions to ntfy and/or Telegram and lets you answer questions from your phone.",
   "keywords": [
     "notifications",
     "ntfy",
     "opencode",
-    "plugin"
+    "plugin",
+    "telegram"
   ],
   "homepage": "https://github.com/mrmm-labs/opencode-oob-bridge#readme",
   "bugs": {
@@ -48,6 +49,9 @@
     "lint:fix": "oxlint --fix . && oxfmt --write .",
     "format": "oxfmt --write .",
     "prepublishOnly": "pnpm run build && pnpm test"
+  },
+  "dependencies": {
+    "qrcode-generator": "^2.0.4"
   },
   "devDependencies": {
     "@opencode/client": "2.3.2",

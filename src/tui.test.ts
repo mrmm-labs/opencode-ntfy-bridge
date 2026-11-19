@@ -1,22 +1,33 @@
 import assert from "node:assert/strict"
-import { mkdtemp, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { describe, it } from "node:test"
+import { after, before, describe, it } from "node:test"
 
-import { fakeNtfy } from "./fake-ntfy.test-util.ts"
+import { fakeNtfy } from "./connectors/fake-ntfy.test-util.ts"
+import { fakeTelegram } from "./connectors/fake-telegram.test-util.ts"
 import plugin, { setup } from "./tui.ts"
 
 type Handler = (e: unknown) => void
 
-function fakeCtx() {
+function fakeCtx(size?: { width: number; height: number }) {
   const handlers = new Map<string, Handler>()
   const replies: unknown[] = []
   const toasts: string[] = []
   const commands: Array<{
-    slash?: { name: string }
+    palette?: boolean
+    slash?: { name: string; aliases?: string[] }
     run: (i?: string) => unknown
   }> = []
+  const dialogs: Array<{
+    title: string
+    message?: string
+    options?: Array<{ title: string; value: unknown; description?: string }>
+    current?: unknown
+  }> = []
+  // What the operator picks, in order; undefined dismisses.
+  const picks: unknown[] = []
+  let cleared = 0
   const modes: Array<string | undefined> = []
   const sessions: Record<string, Record<string, unknown>> = {
     root: {
@@ -42,6 +53,7 @@ function fakeCtx() {
         },
       },
     },
+    renderer: size,
     client: { session: { get: async () => undefined } },
     keymap: {
       layer: (f: () => { mode?: string; commands: typeof commands }) => {
@@ -53,9 +65,30 @@ function fakeCtx() {
     ui: {
       router: { current: () => ({ type: "session", sessionID: "root" }) },
       toast: { show: (o: { message: string }) => toasts.push(o.message) },
+      dialog: {
+        select: async (o: (typeof dialogs)[number]) => {
+          dialogs.push(o)
+          return picks.shift()
+        },
+        alert: async (o: (typeof dialogs)[number]) => {
+          dialogs.push(o)
+          await new Promise((r) => setTimeout(r, 30))
+        },
+        clear: () => cleared++,
+      },
     },
   }
-  return { ctx: ctx as never, handlers, replies, toasts, commands, modes }
+  return {
+    ctx: ctx as never,
+    handlers,
+    replies,
+    toasts,
+    commands,
+    modes,
+    dialogs,
+    picks,
+    cleared: () => cleared,
+  }
 }
 
 async function withEnv<T>(
@@ -183,6 +216,288 @@ describe("TUI entry", () => {
 
     await cleanup()
     assert.equal(f.handlers.size, 0)
+    await n.close()
+  })
+})
+
+async function readJson(file: string, ms = 3000) {
+  const end = Date.now() + ms
+  for (;;) {
+    try {
+      return JSON.parse(await readFile(file, "utf8"))
+    } catch (err) {
+      if (Date.now() > end) throw err
+      await new Promise((r) => setTimeout(r, 10))
+    }
+  }
+}
+
+describe("/oob menu and channels", () => {
+  // Tokens resolve lazily, after setup has returned.
+  before(() => void (process.env.OOBB_TG = "123456:TESTTOKEN"))
+  after(() => void delete process.env.OOBB_TG)
+
+  async function started(
+    channels: Record<string, unknown>,
+    extra: Record<string, unknown> = {},
+    size?: { width: number; height: number },
+    dir?: string,
+  ) {
+    dir ??= await mkdtemp(join(tmpdir(), "oobb-menu-"))
+    const cfg = join(dir, "c.jsonc")
+    await writeFile(cfg, JSON.stringify({ channels, ...extra }))
+    const f = fakeCtx(size)
+    const cleanup = await withEnv(
+      {
+        OPENCODE_OOB_BRIDGE_CONFIG: cfg,
+        OPENCODE_OOB_BRIDGE_DATA: dir,
+      },
+      () => setup(f.ctx),
+    )
+    assert.ok(cleanup)
+    const cmd = f.commands.find((c) => c.slash?.name === "oob")!
+    return { f, dir, cmd, cleanup }
+  }
+
+  it("is a palette command with the ntfy alias, registered synchronously", async () => {
+    const f = fakeCtx()
+    void setup(f.ctx)
+    assert.equal(f.commands.length, 1)
+    assert.equal(f.commands[0].palette, true)
+    assert.deepEqual(f.commands[0].slash?.aliases, ["ntfy"])
+    assert.deepEqual(f.modes, ["global"])
+  })
+
+  it("opens a menu with routing, channels, pairing, test and status", async () => {
+    const n = await fakeNtfy()
+    const { f, cmd, cleanup } = await started({
+      ntfy: { server: n.url, topics: { out: "o", in: "i" } },
+      telegram: { token: { env: "OOBB_TG" } },
+    })
+    await cmd.run()
+    const m = f.dialogs[0]
+    assert.deepEqual(
+      m.options!.map((o) => o.value),
+      ["routing", "channels", "pair:telegram", "test", "status"],
+    )
+    assert.equal(m.options![0].description, "now: auto")
+    assert.equal(m.options![1].description, "ntfy on, telegram on")
+
+    f.picks.push("routing", "off")
+    await cmd.run()
+    assert.equal(f.dialogs.at(-1)!.current, "auto")
+    assert.equal(f.toasts.at(-1), "oob routing: off")
+    await cmd.run("auto")
+    assert.equal(f.toasts.at(-1), "oob routing: auto")
+    await cleanup()
+    await n.close()
+  })
+
+  it("switches a channel off, persists it, and stops its subscription", async () => {
+    const n = await fakeNtfy()
+    const { f, dir, cmd, cleanup } = await started({
+      ntfy: { server: n.url, topics: { out: "o", in: "i" } },
+    })
+    await n.waitFor(() => n.subscribes.length > 0)
+    f.picks.push("channels", "ntfy")
+    await cmd.run()
+    assert.equal(f.toasts.at(-1), "ntfy: off")
+    const saved = await readJson(join(dir, "settings.json"))
+    assert.equal(saved.channels.ntfy.enabled, false)
+    await cleanup()
+    await n.close()
+
+    // The next start honours it: no subscription, nothing sent.
+    const n2 = await fakeNtfy()
+    await writeFile(
+      join(dir, "c.jsonc"),
+      JSON.stringify({
+        channels: { ntfy: { server: n2.url, topics: { out: "o", in: "i" } } },
+      }),
+    )
+    const f2 = fakeCtx()
+    const cleanup2 = await withEnv(
+      {
+        OPENCODE_OOB_BRIDGE_CONFIG: join(dir, "c.jsonc"),
+        OPENCODE_OOB_BRIDGE_DATA: dir,
+      },
+      () => setup(f2.ctx),
+    )
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(n2.subscribes.length, 0)
+    await f2.commands[0].run("test")
+    assert.equal(f2.toasts.at(-1), "No channel is enabled")
+    await cleanup2!()
+    await n2.close()
+  })
+
+  it("sends a test push to every enabled channel and shows status", async () => {
+    const n = await fakeNtfy()
+    const tg = await fakeTelegram()
+    const { f, cmd, cleanup } = await started({
+      ntfy: { server: n.url, topics: { out: "o", in: "i" } },
+      telegram: {
+        token: { env: "OOBB_TG" },
+        chatId: 7,
+        apiBase: tg.url,
+      },
+    })
+    await cmd.run("test")
+    assert.equal(f.toasts.at(-1), "Test push: ntfy sent, telegram sent")
+    assert.equal(n.published.length, 1)
+    assert.match(tg.of("sendMessage")[0].body.text, /Test push/)
+
+    await cmd.run("status")
+    const msg = f.dialogs.at(-1)!.message!
+    assert.match(msg, /^ntfy: on/m)
+    assert.match(msg, /^telegram: on/m)
+    assert.match(msg, /Open prompts: 0/)
+    await cleanup()
+    await n.close()
+    await tg.close()
+  })
+
+  it("pairs Telegram from a one-time code and stores the chat in the settings", async () => {
+    const tg = await fakeTelegram()
+    const { f, dir, cmd, cleanup } = await started({
+      telegram: { token: { env: "OOBB_TG" }, apiBase: tg.url },
+    })
+    await cmd.run("pair telegram")
+    const dlg = f.dialogs.at(-1)!
+    const code = /send this code: ([A-Z2-9]{6})/.exec(dlg.message!)![1]
+    assert.match(
+      dlg.message!,
+      new RegExp(`https://t.me/oob_test_bot\\?start=${code}`),
+    )
+    // The QR of that link is in the dialog, and it fits.
+    assert.match(dlg.message!, /Scan with your phone camera/)
+    assert.match(dlg.message!, /█/)
+    tg.message(555, code)
+    await tg.waitFor(() => f.toasts.includes("telegram paired") || undefined)
+    const saved = await readJson(join(dir, "settings.json"))
+    assert.equal(saved.channels.telegram.chatId, "555")
+    // Never written to the user's config file.
+    assert.doesNotMatch(await readFile(join(dir, "c.jsonc"), "utf8"), /555/)
+
+    await cmd.run("test")
+    assert.equal(tg.of("sendMessage").at(-1)!.body.chat_id, "555")
+    await cleanup()
+    await tg.close()
+  })
+
+  it("pairs through the deep link: /start <code> is the pairing message", async () => {
+    const tg = await fakeTelegram()
+    const { f, dir, cmd, cleanup } = await started({
+      telegram: { token: { env: "OOBB_TG" }, apiBase: tg.url },
+    })
+    await cmd.run("pair telegram")
+    const code = /this code: ([A-Z2-9]{6})/.exec(f.dialogs.at(-1)!.message!)![1]
+    tg.message(556, `/start ${code}`)
+    await tg.waitFor(() => f.toasts.includes("telegram paired") || undefined)
+    assert.equal(
+      (await readJson(join(dir, "settings.json"))).channels.telegram.chatId,
+      "556",
+    )
+    await cleanup()
+    await tg.close()
+  })
+
+  it("falls back to link and code when the terminal is too small for the QR", async () => {
+    const tg = await fakeTelegram()
+    const small = await started(
+      { telegram: { token: { env: "OOBB_TG" }, apiBase: tg.url } },
+      {},
+      { width: 50, height: 20 },
+    )
+    await small.cmd.run("pair telegram")
+    const msg = small.f.dialogs.at(-1)!.message!
+    assert.doesNotMatch(msg, /Scan with your phone camera|█/)
+    assert.match(msg, /https:\/\/t\.me\/oob_test_bot\?start=/)
+    assert.match(msg, /this code: [A-Z2-9]{6}/)
+    await small.cleanup()
+
+    const big = await started(
+      { telegram: { token: { env: "OOBB_TG" }, apiBase: tg.url } },
+      {},
+      { width: 120, height: 50 },
+    )
+    await big.cmd.run("pair telegram")
+    assert.match(big.f.dialogs.at(-1)!.message!, /Scan with your phone camera/)
+    await big.cleanup()
+    await tg.close()
+  })
+
+  it("chooses a channel per session, persists it and restores it after a restart", async () => {
+    const n = await fakeNtfy()
+    const tg = await fakeTelegram()
+    const channels = {
+      ntfy: { server: n.url, topics: { out: "o", in: "i" } },
+      telegram: { token: { env: "OOBB_TG" }, chatId: 7, apiBase: tg.url },
+    }
+    const { f, dir, cmd, cleanup } = await started(channels)
+    await cmd.run("on telegram")
+    assert.equal(f.toasts.at(-1), "oob routing: on via telegram")
+    await cmd.run("on bogus")
+    assert.match(f.toasts.at(-1)!, /No channel "bogus"/)
+    await cmd.run("on telegram extra")
+    assert.match(f.toasts.at(-1)!, /Usage/)
+
+    // The session now asks: only Telegram hears it.
+    f.handlers.get("form.created")!({
+      type: "form.created",
+      data: {
+        form: {
+          id: "frm_1",
+          sessionID: "root",
+          metadata: { kind: "question" },
+          fields: [
+            {
+              key: "q0",
+              type: "string",
+              options: [{ label: "A" }, { label: "B" }],
+            },
+          ],
+        },
+      },
+    })
+    await tg.waitFor(() => tg.of("sendMessage")[0])
+    assert.equal(n.published.length, 0)
+
+    const saved = await readJson(join(dir, "settings.json"))
+    assert.deepEqual(saved.sessions, {
+      root: { on: true, channel: "telegram" },
+    })
+    await cleanup()
+
+    const again = await started(channels, {}, undefined, dir)
+    await again.cmd.run()
+    const m = again.f.dialogs.at(-1)!
+    assert.equal(m.options![0].description, "now: on via telegram")
+    again.f.picks.push("routing", "auto")
+    await again.cmd.run()
+    const r = again.f.dialogs.at(-1)!
+    assert.equal(r.current, "on:telegram")
+    assert.deepEqual(
+      r.options!.map((o) => o.value),
+      ["on", "on:ntfy", "on:telegram", "on:all", "off", "auto"],
+    )
+    assert.equal(again.f.toasts.at(-1), "oob routing: auto")
+    await again.cleanup()
+    assert.deepEqual((await readJson(join(dir, "settings.json"))).sessions, {})
+    await n.close()
+    await tg.close()
+  })
+
+  it("explains itself when Telegram is not configured", async () => {
+    const n = await fakeNtfy()
+    const { f, cmd, cleanup } = await started({
+      ntfy: { server: n.url, topics: { out: "o", in: "i" } },
+    })
+    await cmd.run("pair telegram")
+    assert.match(f.toasts.at(-1)!, /No channel can be paired/)
+    await cmd.run("bogus")
+    assert.match(f.toasts.at(-1)!, /Usage/)
+    await cleanup()
     await n.close()
   })
 })

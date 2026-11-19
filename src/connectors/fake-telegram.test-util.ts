@@ -1,0 +1,143 @@
+// A tiny in-process stand-in for the Telegram Bot API, for unit tests.
+import {
+  createServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http"
+import type { AddressInfo } from "node:net"
+
+export type Call = { method: string; token: string; body: any }
+
+export async function fakeTelegram(token = "123456:TESTTOKEN") {
+  const calls: Call[] = []
+  const updates: Array<Record<string, unknown> & { update_id: number }> = []
+  const failures: Array<{
+    method: string
+    status: number
+    body: Record<string, unknown>
+  }> = []
+  let updateSeq = 100
+  let messageSeq = 500
+  let threadSeq = 9000
+  let forum = false
+  let pollLimit = Infinity
+  const polls = new Set<() => void>()
+
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    let data = ""
+    req.on("data", (c) => (data += c))
+    req.on("end", async () => {
+      const m = /^\/bot([^/]+)\/(\w+)$/.exec(req.url ?? "")
+      if (req.method !== "POST" || !m) return void res.writeHead(404).end()
+      const body = data ? JSON.parse(data) : {}
+      const call = { method: m[2], token: m[1], body }
+      const send = (status: number, json: unknown) => {
+        res.writeHead(status, { "Content-Type": "application/json" })
+        res.end(JSON.stringify(json))
+      }
+      if (m[1] !== token)
+        return send(401, { ok: false, description: "Unauthorized" })
+      const fi = failures.findIndex((f) => f.method === m[2])
+      if (fi >= 0) {
+        const [f] = failures.splice(fi, 1)
+        calls.push(call)
+        return send(f.status, { ok: false, description: "injected", ...f.body })
+      }
+      if (m[2] === "getUpdates") {
+        const offset: number = body.offset ?? 0
+        const due = () => updates.filter((u) => u.update_id >= offset)
+        if (due().length === 0) {
+          await new Promise<void>((r) => {
+            const t = setTimeout(done, 150)
+            polls.add(done)
+            function done() {
+              clearTimeout(t)
+              polls.delete(done)
+              r()
+            }
+          })
+        }
+        const out = due().slice(0, pollLimit)
+        // The offset confirms everything before it.
+        for (let i = updates.length - 1; i >= 0; i--)
+          if (updates[i].update_id < offset) updates.splice(i, 1)
+        calls.push(call)
+        return send(200, { ok: true, result: out })
+      }
+      calls.push(call)
+      if (m[2] === "sendMessage")
+        return send(200, { ok: true, result: { message_id: ++messageSeq } })
+      if (m[2] === "getChat")
+        return send(200, {
+          ok: true,
+          result: { id: body.chat_id, is_forum: forum },
+        })
+      if (m[2] === "createForumTopic")
+        return send(200, {
+          ok: true,
+          result: { message_thread_id: ++threadSeq, name: body.name },
+        })
+      if (m[2] === "getMe")
+        return send(200, { ok: true, result: { username: "oob_test_bot" } })
+      send(200, { ok: true, result: true })
+    })
+  })
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r))
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+
+  const wake = () => [...polls].forEach((f) => f())
+
+  return {
+    url,
+    token,
+    calls,
+    of: (method: string) => calls.filter((c) => c.method === method),
+    set forum(v: boolean) {
+      forum = v
+    },
+    /** Makes the next call of `method` fail with this status and body. */
+    fail(method: string, status: number, body: Record<string, unknown> = {}) {
+      failures.push({ method, status, body })
+    },
+    message(chat: number, text: string, replyTo?: number, thread?: number) {
+      updates.push({
+        update_id: ++updateSeq,
+        message: {
+          message_id: ++messageSeq,
+          date: Math.floor(Date.now() / 1000),
+          text,
+          chat: { id: chat },
+          message_thread_id: thread,
+          reply_to_message: replyTo ? { message_id: replyTo } : undefined,
+        },
+      })
+      wake()
+    },
+    callback(chat: number, messageID: number, data: string) {
+      updates.push({
+        update_id: ++updateSeq,
+        callback_query: {
+          id: `cbq${updateSeq}`,
+          data,
+          message: { message_id: messageID, chat: { id: chat } },
+        },
+      })
+      wake()
+    },
+    async waitFor<T>(fn: () => T | undefined, ms = 3000): Promise<T> {
+      const end = Date.now() + ms
+      for (;;) {
+        const v = fn()
+        if (v) return v
+        if (Date.now() > end) throw new Error("timed out")
+        await new Promise((r) => setTimeout(r, 10))
+      }
+    },
+    close: () =>
+      new Promise<void>((r) => {
+        wake()
+        server.closeAllConnections()
+        server.close(() => r())
+      }),
+  }
+}
