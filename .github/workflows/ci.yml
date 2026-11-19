@@ -30,7 +30,7 @@ jobs:
       - uses: jdx/mise-action@v2
       - run: mise run build
       # The built plugin must load: a server entry and a TUI entry.
-      - run: node -e "Promise.all([import('./index.js'), import('./dist/tui.js')]).then(([s, t]) => { if (s.default.id !== 'ntfy-bridge' || t.default.id !== 'ntfy-bridge.tui' || typeof t.default.setup !== 'function') process.exit(1) })"
+      - run: node -e "Promise.all([import('./index.js'), import('./dist/tui.js')]).then(([s, t]) => { if (s.default.id !== 'oob-bridge' || t.default.id !== 'oob-bridge.tui' || typeof t.default.setup !== 'function') process.exit(1) })"
       # Lists what npm would ship, in the job log.
       - run: npm pack --dry-run
 

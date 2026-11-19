@@ -31,8 +31,8 @@ describe("resolveToken", () => {
   it("AC-13: the token never reaches the log", async () => {
     const dir = await mkdtemp(join(tmpdir(), "ntfyb-log-"))
     const file = join(dir, "bridge.log")
-    const prev = process.env.OPENCODE_NTFY_BRIDGE_LOG
-    process.env.OPENCODE_NTFY_BRIDGE_LOG = file
+    const prev = process.env.OPENCODE_OOB_BRIDGE_LOG
+    process.env.OPENCODE_OOB_BRIDGE_LOG = file
     try {
       const v = await resolveToken(
         { env: "T" },
@@ -44,7 +44,7 @@ describe("resolveToken", () => {
       assert.match(text, /probe/)
       assert.doesNotMatch(text, /env-token-should-not-leak/)
     } finally {
-      process.env.OPENCODE_NTFY_BRIDGE_LOG = prev
+      process.env.OPENCODE_OOB_BRIDGE_LOG = prev
     }
   })
 })

@@ -4,7 +4,7 @@
 import type { Plugin } from "@opencode/plugin"
 
 const plugin: Plugin.Plugin = {
-  id: "ntfy-bridge",
+  id: "oob-bridge",
   setup() {},
 }
 

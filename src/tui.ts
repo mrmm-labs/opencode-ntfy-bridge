@@ -1,6 +1,6 @@
 /**
  * TUI entry: wires OpenCode 2 TUI events and the form reply API to the bridge,
- * and adds the `/ntfy on|off|auto` command. Without a config file it returns
+ * and adds the `/oob on|off|auto` command. Without a config file it returns
  * before touching the network.
  */
 import type { Plugin } from "@opencode/plugin/tui"
@@ -59,15 +59,15 @@ export async function setup(
   // registered after setup has yielded, so /ntfy never appeared.
   let router: Router | undefined
   // A layer defaults to the "base" input mode, which is inactive while the
-  // prompt has focus, so slash completion never saw /ntfy.
+  // prompt has focus, so slash completion never saw the command.
   ctx.keymap.layer(() => ({
     mode: "global",
-    bindings: ["ntfy-bridge.route"],
+    bindings: ["oob-bridge.route"],
     commands: [
       {
-        id: "ntfy-bridge.route",
+        id: "oob-bridge.route",
         title: "ntfy: route this session (on, off, auto)",
-        slash: { name: "ntfy", arguments: true },
+        slash: { name: "oob", aliases: ["ntfy"], arguments: true },
         run: (input) => {
           if (!router)
             return ctx.ui.toast.show({
@@ -87,11 +87,11 @@ export async function setup(
             router.set(root, arg === "auto" ? undefined : arg === "on")
           else if (arg)
             return ctx.ui.toast.show({
-              message: "Usage: /ntfy on|off|auto",
+              message: "Usage: /oob on|off|auto",
               variant: "warning",
             })
           ctx.ui.toast.show({
-            message: `ntfy routing: ${router.mode(root)}`,
+            message: `oob routing: ${router.mode(root)}`,
             variant: "info",
           })
         },
@@ -138,6 +138,6 @@ export async function setup(
   }
 }
 
-const plugin: Plugin.Definition = { id: "ntfy-bridge.tui", setup }
+const plugin: Plugin.Definition = { id: "oob-bridge.tui", setup }
 
 export default plugin
