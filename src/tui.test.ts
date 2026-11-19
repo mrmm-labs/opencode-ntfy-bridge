@@ -77,7 +77,7 @@ describe("TUI entry", () => {
     assert.equal(typeof plugin.setup, "function")
   })
 
-  it("AC-14: without config it registers nothing and makes no request", async () => {
+  it("AC-14: without config it only registers /ntfy and makes no request", async () => {
     const f = fakeCtx()
     const realFetch = globalThis.fetch
     let calls = 0
@@ -97,7 +97,9 @@ describe("TUI entry", () => {
     }
     assert.equal(calls, 0)
     assert.equal(f.handlers.size, 0)
-    assert.equal(f.commands.length, 0)
+    // /ntfy is registered before any await (OpenCode 2.3.2 drops later layers);
+    // without config it only explains itself.
+    assert.equal(f.commands.length, 1)
   })
 
   it("stays inert on an invalid config", async () => {

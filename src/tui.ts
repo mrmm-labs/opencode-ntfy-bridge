@@ -55,37 +55,9 @@ export function host(ctx: Context): Host {
 export async function setup(
   ctx: Context,
 ): Promise<(() => Promise<void>) | undefined> {
-  const cfg = await loadConfig()
-  if (!cfg) return undefined
-  if ("error" in cfg) {
-    log("config_error", { message: cfg.error })
-    return undefined
-  }
-
-  let token: Promise<string | undefined> | undefined
-  const ntfy = new Ntfy({
-    server: cfg.server,
-    topics: cfg.topics,
-    actionAuth: cfg.actionAuth,
-    // Resolved once; a failed command is retried on the next request.
-    token: () =>
-      (token ??= resolveToken(cfg.token).catch((err) => {
-        token = undefined
-        throw err
-      })),
-  })
-  const store = new PendingStore(join(dataDir(), "pending.jsonl"))
-  await store.load()
-  const router = new Router(cfg)
-  const bridge = new Bridge(cfg, host(ctx), ntfy, store, router)
-
-  const off = EVENTS.map((type) =>
-    ctx.data.on(
-      type,
-      (event) => void bridge.onEvent(event as unknown as BridgeEvent),
-    ),
-  )
-
+  // Registered before any await: OpenCode 2.3.2 ignores keymap layers
+  // registered after setup has yielded, so /ntfy never appeared.
+  let router: Router | undefined
   ctx.keymap.layer(() => ({
     commands: [
       {
@@ -93,6 +65,11 @@ export async function setup(
         title: "ntfy: route this session (on, off, auto)",
         slash: { name: "ntfy", arguments: true },
         run: (input) => {
+          if (!router)
+            return ctx.ui.toast.show({
+              message: "ntfy bridge is not configured or still starting",
+              variant: "warning",
+            })
           router.touch()
           const route = ctx.ui.router.current()
           if (route.type !== "session")
@@ -117,6 +94,37 @@ export async function setup(
       },
     ],
   }))
+
+  const cfg = await loadConfig()
+  if (!cfg) return undefined
+  if ("error" in cfg) {
+    log("config_error", { message: cfg.error })
+    return undefined
+  }
+
+  let token: Promise<string | undefined> | undefined
+  const ntfy = new Ntfy({
+    server: cfg.server,
+    topics: cfg.topics,
+    actionAuth: cfg.actionAuth,
+    // Resolved once; a failed command is retried on the next request.
+    token: () =>
+      (token ??= resolveToken(cfg.token).catch((err) => {
+        token = undefined
+        throw err
+      })),
+  })
+  const store = new PendingStore(join(dataDir(), "pending.jsonl"))
+  await store.load()
+  router = new Router(cfg)
+  const bridge = new Bridge(cfg, host(ctx), ntfy, store, router)
+
+  const off = EVENTS.map((type) =>
+    ctx.data.on(
+      type,
+      (event) => void bridge.onEvent(event as unknown as BridgeEvent),
+    ),
+  )
 
   bridge.start()
   log("started", { server: cfg.server, rules: cfg.rules.length })
