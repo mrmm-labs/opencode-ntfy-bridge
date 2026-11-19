@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.4.0...v0.5.0) (2026-11-19)
+
+
+### Features
+
+* connectors, Telegram, TUI settings menu and OpenTelemetry ([#15](https://github.com/mrmm-labs/opencode-oob-bridge/issues/15)) ([13d762c](https://github.com/mrmm-labs/opencode-oob-bridge/commit/13d762c818a8ea087955500b777f223bf741b69e))
+
 ## [0.4.0](https://github.com/mrmm-labs/opencode-ntfy-bridge/compare/v0.3.0...v0.4.0) (2026-11-19)
 
 
