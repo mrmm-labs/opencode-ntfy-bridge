@@ -58,7 +58,11 @@ export async function setup(
   // Registered before any await: OpenCode 2.3.2 ignores keymap layers
   // registered after setup has yielded, so /ntfy never appeared.
   let router: Router | undefined
+  // A layer defaults to the "base" input mode, which is inactive while the
+  // prompt has focus, so slash completion never saw /ntfy.
   ctx.keymap.layer(() => ({
+    mode: "global",
+    bindings: ["ntfy-bridge.route"],
     commands: [
       {
         id: "ntfy-bridge.route",
