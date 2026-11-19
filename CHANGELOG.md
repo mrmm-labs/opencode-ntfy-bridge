@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/mrmm-labs/opencode-ntfy-bridge/compare/v0.2.2...v0.3.0) (2026-11-19)
+
+
+### Features
+
+* configurable push formats with per-use-case profiles ([#11](https://github.com/mrmm-labs/opencode-ntfy-bridge/issues/11)) ([583b5bf](https://github.com/mrmm-labs/opencode-ntfy-bridge/commit/583b5bf4ccd06ef84547b4b020d4a80b0031e8c5))
+
 ## [0.2.2](https://github.com/mrmm-labs/opencode-ntfy-bridge/compare/v0.2.1...v0.2.2) (2026-11-19)
 
 
