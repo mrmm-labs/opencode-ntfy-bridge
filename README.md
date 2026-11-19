@@ -52,12 +52,30 @@ nothing and opens no connection.**
 | `rules`        | `[]`       | Which sessions are mirrored while you are away. Empty: all.                           |
 | `redact`       | `full`     | `full`, `head:<n>` (first n characters) or `title` (no body at all).                  |
 | `permissions`  | tier 3     | Only tier 3 (push only) exists.                                                       |
+| `messages`     | built in   | Push formats per kind, overriding the defaults field by field. See below.             |
+| `profiles`     | `[]`       | Per-use-case formats: the first profile matching `agent`/`directory` wins.            |
 
 A rule has any of `agent` (regular expression on the session's agent), `directory` (glob on the
 session's directory: `**` any depth, `*` one segment) and `command` (argv; exit code 0 routes; it
 gets `NTFY_BRIDGE_SESSION`, `NTFY_BRIDGE_AGENT` and `NTFY_BRIDGE_DIRECTORY`). Fields in one rule
 must all match; any matching rule routes the session. Rules look at the top-level session, so a
 subagent follows its parent.
+
+### Push formats
+
+Each push kind (`question`, `permission`, `finished`, `failed`, `closed`, `notice`) has a default
+`title`, `message`, `tags` and `priority`, defined in `src/messages.ts`. Override any field in
+`messages`; a `profiles` entry (`agent` regular expression and/or `directory` glob, plus
+`messages`) overrides it again for matching sessions. `{{name}}` placeholders are filled per push
+and an unknown name renders empty; the placeholder list is in `ntfy-bridge.example.jsonc`. Text
+from the session is redacted before it is placed, so `redact` still applies.
+
+```jsonc
+"messages": { "finished": { "title": "✅ {{project}}", "priority": 3 } },
+"profiles": [
+  { "agent": "^coordinator$", "messages": { "question": { "priority": 5, "tags": ["rotating_light"] } } }
+]
+```
 
 Environment overrides: `OPENCODE_NTFY_BRIDGE_CONFIG` (config file), `OPENCODE_NTFY_BRIDGE_DATA`
 (state directory, default `~/.local/share/opencode/ntfy-bridge`), `OPENCODE_NTFY_BRIDGE_LOG` (log

@@ -34,6 +34,23 @@
   // Known secret shapes are masked in every case.
   "redact": "head:300",
 
+  // Push formats. Every kind has a built-in default; set only what you change.
+  // Kinds: question, permission, finished, failed, closed (the answered/
+  // cancelled update), notice. Fields: title, message, tags, priority (1-5).
+  // Placeholders: {{project}} {{agent}} {{subagent}} {{session}} {{sessionID}}
+  // {{directory}} {{id}}; question: {{thread}} {{body}} {{hint}};
+  // permission: {{action}} {{resources}} {{detail}}; closed: {{title}}
+  // {{note}}; notice: {{text}}.
+  "messages": {
+    // "finished": { "title": "{{project}} done", "priority": 3 },
+  },
+
+  // Per use case: the first profile whose agent/directory matches the
+  // session's root overrides "messages" (question, permission, finished, failed).
+  "profiles": [
+    // { "agent": "^coordinator$", "messages": { "question": { "priority": 5 } } },
+  ],
+
   // Only 3 (push only) is supported.
   "permissions": { "tier": 3 },
 }

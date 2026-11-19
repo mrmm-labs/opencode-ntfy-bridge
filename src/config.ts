@@ -4,6 +4,12 @@ import { join } from "node:path"
 
 import { parseRedact, type Redact } from "./filter.ts"
 import { parseJsonc } from "./jsonc.ts"
+import {
+  parseFormats,
+  parseProfiles,
+  type Formats,
+  type Profile,
+} from "./messages.ts"
 
 export type TokenSource = { env: string } | { command: string[] }
 
@@ -21,6 +27,8 @@ export type Config = {
   away: { minutes: number }
   rules: Rule[]
   redact: Redact
+  messages: Formats
+  profiles: Profile[]
 }
 
 type Env = NodeJS.ProcessEnv
@@ -113,6 +121,11 @@ export function parseConfig(raw: unknown): Config | { error: string } {
   if (tier !== undefined && tier !== 3)
     return { error: "permissions.tier: only 3 (push only) is supported" }
 
+  const messages = parseFormats(raw.messages, "messages")
+  if (typeof messages === "string") return { error: messages }
+  const profiles = parseProfiles(raw.profiles)
+  if (typeof profiles === "string") return { error: profiles }
+
   return {
     server: server.replace(/\/+$/, ""),
     token,
@@ -121,6 +134,8 @@ export function parseConfig(raw: unknown): Config | { error: string } {
     away: { minutes },
     rules,
     redact,
+    messages,
+    profiles,
   }
 }
 

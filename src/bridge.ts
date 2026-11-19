@@ -15,9 +15,10 @@ import {
   type Question,
 } from "./inbound.ts"
 import { log } from "./logger.ts"
+import { format, type Kind, type Vars } from "./messages.ts"
 import type { HttpAction, Incoming, Ntfy } from "./ntfy.ts"
 import type { Pending, PendingStore } from "./pending.ts"
-import type { Router } from "./routing.ts"
+import type { Router, SessionFacts } from "./routing.ts"
 
 export type SessionInfo = {
   id: string
@@ -183,12 +184,17 @@ export function replyHint(id: string, qs: Question[], inTopic: string): string {
 
 /** The question push: body and buttons. */
 export function renderQuestion(
-  cfg: Pick<Config, "server" | "topics" | "redact">,
+  cfg: Pick<Config, "server" | "topics" | "redact" | "messages">,
   id: string,
   questions: Question[],
   threadTitle?: string,
-): { message: string; actions?: HttpAction[] } {
-  const thread = threadTitle ? `[${truncate(threadTitle, THREAD_MAX)}]\n` : ""
+): { message: string; actions?: HttpAction[]; vars: Vars } {
+  const vars: Vars = {
+    id,
+    thread: threadTitle ? `[${truncate(threadTitle, THREAD_MAX)}]\n` : "",
+    body: redact(questionBody(questions), cfg.redact),
+    hint: replyHint(id, questions, cfg.topics.in),
+  }
   const actions: HttpAction[] | undefined = buttons(questions)
     ? questions[0].options.map((label, i) => ({
         action: "http",
@@ -196,12 +202,14 @@ export function renderQuestion(
         url: `${cfg.server}/${cfg.topics.in}`,
         method: "POST",
         body: JSON.stringify({ id, choice: i + 1 }),
-        clear: true,
+        // Kept on screen: the answer replaces it through sequence_id.
+        clear: false,
       }))
     : undefined
   return {
-    message: `${thread}${redact(questionBody(questions), cfg.redact)}\n\n${replyHint(id, questions, cfg.topics.in)}`,
+    message: format("question", vars, cfg.messages).message,
     actions,
+    vars,
   }
 }
 
@@ -290,7 +298,16 @@ export class Bridge {
     const facts = { id: rootID, agent: root?.agent, directory: root?.directory }
     if (!(await this.router.routes(facts))) return undefined
     const project = root?.directory ? basename(root.directory) : "opencode"
-    return { rootID, root, asking: asking ?? root, project }
+    const who = asking ?? root
+    const vars: Vars = {
+      project,
+      agent: who?.agent ?? "agent",
+      subagent: rootID === sessionID ? "" : (who?.agent ?? "agent"),
+      session: redact(root?.title ?? rootID, this.cfg.redact),
+      sessionID: rootID,
+      directory: root?.directory ?? "",
+    }
+    return { rootID, root, facts, vars }
   }
 
   private async onForm(
@@ -301,9 +318,10 @@ export class Bridge {
     if (questions.length === 0) return
     const r = await this.routed(form.sessionID)
     if (!r) return
-    const agent = r.asking?.agent ?? "agent"
     const id = this.store.newId()
-    const title = `${r.project} · ${agent} asks`
+    const q = renderQuestion(this.cfg, id, questions, r.root?.title)
+    const f = this.fmt("question", { ...r.vars, ...q.vars }, r.facts)
+    const title = f.title
     const p = this.store.put({
       id,
       kind: "question",
@@ -315,19 +333,7 @@ export class Bridge {
       askedAt: this.now(),
       state: "pending",
     })
-    const { message, actions } = renderQuestion(
-      this.cfg,
-      id,
-      questions,
-      r.root?.title,
-    )
-    const msgID = await this.ntfy.publish({
-      title,
-      message,
-      tags: tags("question", form.sessionID !== r.rootID ? agent : undefined),
-      priority: 4,
-      actions,
-    })
+    const msgID = await this.ntfy.publish({ ...f, actions: q.actions })
     if (msgID) this.store.update(p.id, { ntfyMessageID: msgID })
   }
 
@@ -336,9 +342,22 @@ export class Bridge {
   ) {
     const r = await this.routed(d.sessionID)
     if (!r) return
-    const agent = r.asking?.agent ?? "agent"
     const id = this.store.newId()
-    const title = `${r.project} · ${agent} needs permission`
+    const detail = [`${d.action}: ${(d.resources ?? []).join(", ")}`, d.message]
+      .filter(Boolean)
+      .join("\n")
+    const f = this.fmt(
+      "permission",
+      {
+        ...r.vars,
+        id,
+        action: d.action,
+        resources: (d.resources ?? []).join(", "),
+        detail: redact(detail, this.cfg.redact),
+      },
+      r.facts,
+    )
+    const title = f.title
     const p = this.store.put({
       id,
       kind: "permission",
@@ -349,15 +368,7 @@ export class Bridge {
       askedAt: this.now(),
       state: "pending",
     })
-    const detail = [`${d.action}: ${(d.resources ?? []).join(", ")}`, d.message]
-      .filter(Boolean)
-      .join("\n")
-    const msgID = await this.ntfy.publish({
-      title,
-      message: `${redact(detail, this.cfg.redact)}\n\nAnswer in the OpenCode TUI. Permissions are never applied from ntfy.`,
-      tags: tags("lock", d.sessionID !== r.rootID ? agent : undefined),
-      priority: 4,
-    })
+    const msgID = await this.ntfy.publish(f)
     if (msgID) this.store.update(p.id, { ntfyMessageID: msgID })
   }
 
@@ -365,12 +376,9 @@ export class Bridge {
     if (this.host.root(sessionID) !== sessionID) return
     const r = await this.routed(sessionID)
     if (!r) return
-    await this.ntfy.publish({
-      title: `${r.project} · ${failed ? "session failed" : "session finished"}`,
-      message: redact(r.root?.title ?? sessionID, this.cfg.redact),
-      tags: [failed ? "x" : "white_check_mark"],
-      priority: 2,
-    })
+    await this.ntfy.publish(
+      this.fmt(failed ? "failed" : "finished", r.vars, r.facts),
+    )
   }
 
   /** A prompt was answered or cancelled in OpenCode. */
@@ -388,23 +396,19 @@ export class Bridge {
     if (p.ntfyMessageID) await this.update(p, note)
   }
 
-  private update(p: Pending, message: string) {
+  private update(p: Pending, note: string) {
     return this.ntfy.publish({
-      title: p.title,
-      message,
-      tags: ["white_check_mark"],
-      priority: 1,
+      ...this.fmt("closed", { id: p.id, title: p.title, note }),
       sequence_id: p.ntfyMessageID,
     })
   }
 
+  private fmt(kind: Kind, vars: Vars, facts?: SessionFacts) {
+    return format(kind, vars, this.cfg.messages, this.cfg.profiles, facts)
+  }
+
   private notice(message: string) {
-    return this.ntfy.publish({
-      title: "ntfy bridge",
-      message,
-      priority: 2,
-      tags: ["warning"],
-    })
+    return this.ntfy.publish(this.fmt("notice", { text: message }))
   }
 
   async onInbound(m: Incoming): Promise<void> {
@@ -461,8 +465,4 @@ export class Bridge {
       log("inbound_error", { message: (err as Error).message })
     }
   }
-}
-
-function tags(kind: string, agent?: string): string[] {
-  return agent ? [kind, agent] : [kind]
 }
