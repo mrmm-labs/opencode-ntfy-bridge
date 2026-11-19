@@ -42,6 +42,38 @@ describe("Ntfy.publish", () => {
     await f.close()
   })
 
+  it("actionAuth puts the token in each http action, and only then", async () => {
+    const f = await fakeNtfy()
+    const action = {
+      action: "http" as const,
+      label: "Yes",
+      url: `${f.url}/oc-in`,
+      method: "POST" as const,
+      body: "{}",
+    }
+    for (const actionAuth of [true, false]) {
+      await new Ntfy({
+        server: f.url,
+        topics,
+        actionAuth,
+        token: async () => "tk_action_token",
+      }).publish({ message: "m", actions: [action] })
+    }
+    await new Ntfy({ server: f.url, topics, actionAuth: true }).publish({
+      message: "m",
+      actions: [action],
+    })
+    const h = f.published.map(
+      (p) => (p.body.actions as Array<{ headers?: unknown }>)[0].headers,
+    )
+    assert.deepEqual(h, [
+      { Authorization: "Bearer tk_action_token" },
+      undefined,
+      undefined,
+    ])
+    await f.close()
+  })
+
   it("returns undefined, never throws, when the server fails or is unreachable", async () => {
     const f = await fakeNtfy()
     f.failPublish = true

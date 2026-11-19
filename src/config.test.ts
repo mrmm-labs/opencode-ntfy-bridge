@@ -25,6 +25,15 @@ describe("parseConfig", () => {
     assert.deepEqual(c.redact, { mode: "full" })
     assert.deepEqual(c.rules, [])
     assert.equal(c.token, undefined)
+    assert.equal(c.actionAuth, true)
+  })
+
+  it("actionAuth is a boolean", () => {
+    assert.equal(
+      (parseConfig({ ...base, actionAuth: false }) as Config).actionAuth,
+      false,
+    )
+    assert.ok("error" in parseConfig({ ...base, actionAuth: "yes" }))
   })
 
   it("accepts token from env or command and rules", () => {

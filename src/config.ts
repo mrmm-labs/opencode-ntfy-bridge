@@ -17,6 +17,7 @@ export type Config = {
   server: string
   token?: TokenSource
   topics: { out: string; in: string }
+  actionAuth: boolean
   away: { minutes: number }
   rules: Rule[]
   redact: Redact
@@ -79,6 +80,10 @@ export function parseConfig(raw: unknown): Config | { error: string } {
       error: "topics.out and topics.in must be two different topic names",
     }
 
+  const actionAuth = raw.actionAuth ?? true
+  if (typeof actionAuth !== "boolean")
+    return { error: "actionAuth must be true or false" }
+
   const away = isObject(raw.away) ? raw.away : {}
   const minutes = away.minutes === undefined ? 10 : away.minutes
   if (typeof minutes !== "number" || !(minutes > 0))
@@ -112,6 +117,7 @@ export function parseConfig(raw: unknown): Config | { error: string } {
     server: server.replace(/\/+$/, ""),
     token,
     topics: { out: topics.out, in: topics.in },
+    actionAuth,
     away: { minutes },
     rules,
     redact,
