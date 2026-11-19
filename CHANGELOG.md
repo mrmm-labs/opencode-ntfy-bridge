@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/mrmm-labs/opencode-ntfy-bridge/compare/v0.2.0...v0.2.1) (2026-11-19)
+
+
+### Bug Fixes
+
+* register /ntfy before setup awaits ([#7](https://github.com/mrmm-labs/opencode-ntfy-bridge/issues/7)) ([ddf3a7a](https://github.com/mrmm-labs/opencode-ntfy-bridge/commit/ddf3a7a4331f8cbc27b2c9a10a410c31436d58c1))
+
 ## [0.2.0](https://github.com/mrmm-labs/opencode-ntfy-bridge/compare/v0.1.0...v0.2.0) (2026-11-19)
 
 
