@@ -159,7 +159,13 @@ describe("parseConfig channels", () => {
   it("reads chat.deny, chat.mirror and chat.stream, and refuses bad ones", () => {
     const base = { channels: { telegram: { token: { env: "TG" } } } }
     const d = parseConfig(base) as Config
-    assert.deepEqual(d.chat, { deny: [], mirror: "replies", stream: true })
+    assert.deepEqual(d.chat, {
+      deny: [],
+      mirror: "replies",
+      stream: true,
+      projects: {},
+      models: [],
+    })
     const c = parseConfig({
       ...base,
       chat: {
@@ -180,6 +186,42 @@ describe("parseConfig channels", () => {
       { deny: [{}] },
       { deny: [{ agent: "(" }] },
       { deny: ["x"] },
+    ])
+      assert.ok(
+        "error" in (parseConfig({ ...base, chat: bad }) as object),
+        JSON.stringify(bad),
+      )
+  })
+
+  it("reads chat.projects and chat.models, and refuses unsafe ones", () => {
+    const base = { channels: { telegram: { token: { env: "TG" } } } }
+    const c = parseConfig({
+      ...base,
+      chat: {
+        projects: {
+          shop: { directory: "/w/shop", agent: "build", model: "a/b-1" },
+          docs: { directory: "/w/docs" },
+        },
+        models: ["a/b-1", "c/d:free"],
+      },
+    }) as Config
+    assert.deepEqual(c.chat.projects.shop, {
+      directory: "/w/shop",
+      agent: "build",
+      model: "a/b-1",
+    })
+    assert.deepEqual(c.chat.models, ["a/b-1", "c/d:free"])
+    for (const bad of [
+      { projects: [] },
+      { projects: { "bad name": { directory: "/w" } } },
+      { projects: { x: {} } },
+      { projects: { x: { directory: "relative/dir" } } },
+      { projects: { x: { directory: "/w/../etc" } } },
+      { projects: { x: { directory: "/w", model: "nomodel" } } },
+      { projects: { x: { directory: "/w", agent: "" } } },
+      { models: "a/b" },
+      { models: ["nomodel"] },
+      { models: [1] },
     ])
       assert.ok(
         "error" in (parseConfig({ ...base, chat: bad }) as object),

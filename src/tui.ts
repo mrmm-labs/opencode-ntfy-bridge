@@ -32,6 +32,7 @@ const EVENTS: BridgeEvent["type"][] = [
   "session.execution.interrupted",
   "session.renamed",
   "session.model.selected",
+  "session.agent.selected",
   "session.text.delta",
   "session.text.ended",
 ]
@@ -54,6 +55,13 @@ export function host(ctx: Context): Host {
         directory: info.location?.directory,
         title: info.title,
         model: info.model?.id,
+        modelRef: info.model
+          ? {
+              providerID: info.model.providerID,
+              id: info.model.id,
+              variant: info.model.variant,
+            }
+          : undefined,
       }
     },
     root: (id) => ctx.data.session.root(id) || id,
@@ -64,6 +72,54 @@ export function host(ctx: Context): Host {
       await ctx.client.session.prompt({ sessionID, text, delivery: "queue" })
     },
     busy: (id) => ctx.data.session.status(id) === "running",
+    createSession: async ({ directory, agent, model }) => {
+      const info = await ctx.client.session.create({
+        location: { directory },
+        agent,
+        model,
+      })
+      return { id: info.id }
+    },
+    switchModel: (sessionID, model) =>
+      ctx.client.session.switchModel({ sessionID, model }),
+    switchAgent: (sessionID, agent) =>
+      ctx.client.session.switchAgent({ sessionID, agent }),
+    interrupt: async (sessionID) =>
+      (await ctx.client.session.interrupt({ sessionID })).interrupted,
+    compact: async (sessionID) => {
+      await ctx.client.session.compact({ sessionID })
+    },
+    rename: (sessionID, title) =>
+      ctx.client.session.update({ sessionID, title }),
+    agents: async () => {
+      let list = ctx.data.location.agent.list()
+      if (!list) {
+        await ctx.data.location.agent.sync()
+        list = ctx.data.location.agent.list()
+      }
+      return (list ?? [])
+        .filter((a) => a.mode !== "subagent" && !a.hidden)
+        .map((a) => a.name)
+    },
+    models: async () => {
+      let list = ctx.data.location.model.list()
+      if (!list) {
+        await ctx.data.location.model.sync()
+        list = ctx.data.location.model.list()
+      }
+      return (list ?? [])
+        .filter(
+          (m) =>
+            m.enabled &&
+            m.status !== "deprecated" &&
+            (m.type === undefined || m.type === "chat"),
+        )
+        .map((m) => ({
+          ref: `${m.providerID}/${m.modelID}`,
+          name: m.name,
+          variants: m.variants.map((v) => v.id),
+        }))
+    },
   }
 }
 
