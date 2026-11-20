@@ -6,6 +6,7 @@ import { after, before, describe, it } from "node:test"
 
 import { fakeNtfy } from "./connectors/fake-ntfy.test-util.ts"
 import { fakeTelegram } from "./connectors/fake-telegram.test-util.ts"
+import type { SidebarView } from "./sidebar.ts"
 import plugin, { setup } from "./tui.ts"
 
 type Handler = (e: unknown) => void
@@ -29,6 +30,11 @@ function fakeCtx(size?: { width: number; height: number }) {
   const picks: unknown[] = []
   let cleared = 0
   const modes: Array<string | undefined> = []
+  const claims: Array<{
+    append?: string
+    render: (i: { sessionID: string }) => unknown
+  }> = []
+  let released = 0
   const sessions: Record<string, Record<string, unknown>> = {
     root: {
       id: "root",
@@ -63,6 +69,10 @@ function fakeCtx(size?: { width: number; height: number }) {
       },
     },
     ui: {
+      slot: (c: (typeof claims)[number]) => {
+        claims.push(c)
+        return () => void released++
+      },
       router: { current: () => ({ type: "session", sessionID: "root" }) },
       toast: { show: (o: { message: string }) => toasts.push(o.message) },
       dialog: {
@@ -87,6 +97,8 @@ function fakeCtx(size?: { width: number; height: number }) {
     modes,
     dialogs,
     picks,
+    claims,
+    released: () => released,
     cleared: () => cleared,
   }
 }
@@ -242,6 +254,7 @@ describe("/oob menu and channels", () => {
     extra: Record<string, unknown> = {},
     size?: { width: number; height: number },
     dir?: string,
+    loadView?: () => Promise<SidebarView>,
   ) {
     dir ??= await mkdtemp(join(tmpdir(), "oobb-menu-"))
     const cfg = join(dir, "c.jsonc")
@@ -252,7 +265,7 @@ describe("/oob menu and channels", () => {
         OPENCODE_OOB_BRIDGE_CONFIG: cfg,
         OPENCODE_OOB_BRIDGE_DATA: dir,
       },
-      () => setup(f.ctx),
+      () => setup(f.ctx, loadView),
     )
     assert.ok(cleanup)
     const cmd = f.commands.find((c) => c.slash?.name === "oob")!
@@ -442,6 +455,103 @@ describe("/oob menu and channels", () => {
     await again.cleanup()
     const off = await readJson(join(dir, "settings.json"))
     assert.equal(off.sessions.root.chat, undefined)
+    await tg.close()
+  })
+
+  it("claims the sidebar once the view loads, shows the session's state, and releases it on cleanup", async () => {
+    const tg = await fakeTelegram()
+    const seen: Array<Parameters<SidebarView>[0]> = []
+    const { f, cmd, cleanup } = await started(
+      { telegram: { token: { env: "OOBB_TG" }, chatId: 7, apiBase: tg.url } },
+      {},
+      undefined,
+      undefined,
+      async () => (p) => {
+        seen.push(p)
+        return "block"
+      },
+    )
+    await new Promise((r) => setTimeout(r, 30))
+    assert.equal(f.claims.length, 1)
+    assert.equal(f.claims[0].append, "sidebar.content")
+    assert.equal(f.claims[0].render({ sessionID: "root" }), "block")
+    assert.deepEqual(
+      seen[0].lines().map((l) => l.parts.map((p) => p.text).join("")),
+      ["📡 all · auto", "💬 chat: off · queue"],
+    )
+    // A change made from the command shows without a new render.
+    let changes = 0
+    seen[0].subscribe(() => changes++)
+    await cmd.run("chat on")
+    assert.ok(changes >= 1)
+    assert.equal(seen[0].lines()[1].parts[0].text, "💬 chat: on")
+    // And a click does what the command does.
+    seen[0].activate("delivery")
+    await new Promise((r) => setTimeout(r, 30))
+    assert.match(f.toasts.at(-1)!, /Delivery: steer/)
+    await cleanup()
+    assert.equal(f.released(), 1)
+    await tg.close()
+  })
+
+  it("runs without a sidebar block when the view cannot be loaded", async () => {
+    const { f, cmd, cleanup } = await started(
+      { telegram: { token: { env: "OOBB_TG" } } },
+      {},
+      undefined,
+      undefined,
+      async () => {
+        throw new Error("cannot resolve solid-js")
+      },
+    )
+    await new Promise((r) => setTimeout(r, 30))
+    assert.equal(f.claims.length, 0)
+    await cmd.run("off")
+    assert.match(f.toasts.at(-1)!, /oob routing: off/)
+    await cleanup()
+    assert.equal(f.released(), 0)
+  })
+
+  it("makes no sidebar claim without a view loader, nor without a config", async () => {
+    const a = await started({ telegram: { token: { env: "OOBB_TG" } } })
+    await new Promise((r) => setTimeout(r, 30))
+    assert.equal(a.f.claims.length, 0)
+    await a.cleanup()
+    const f = fakeCtx()
+    let loaded = 0
+    await withEnv(
+      { OPENCODE_OOB_BRIDGE_CONFIG: "/nonexistent/oob-bridge.jsonc" },
+      () =>
+        setup(f.ctx, async () => {
+          loaded++
+          return () => 0
+        }),
+    )
+    assert.equal(loaded, 0)
+    assert.equal(f.claims.length, 0)
+  })
+
+  it("/oob delivery sets the session's delivery, keeps it across a restart, and default clears it", async () => {
+    const tg = await fakeTelegram()
+    const ch = {
+      telegram: { token: { env: "OOBB_TG" }, chatId: 7, apiBase: tg.url },
+    }
+    const { f, dir, cmd, cleanup } = await started(ch)
+    await cmd.run("delivery steer")
+    assert.match(f.toasts.at(-1)!, /Delivery for this session: steer/)
+    await cleanup()
+    assert.equal(
+      (await readJson(join(dir, "settings.json"))).sessions.root.delivery,
+      "steer",
+    )
+    const again = await started(ch, {}, undefined, dir, async () => (p) => p)
+    await again.cmd.run("delivery default")
+    assert.match(again.f.toasts.at(-1)!, /Delivery for this session: queue/)
+    await again.cleanup()
+    assert.equal(
+      (await readJson(join(dir, "settings.json"))).sessions.root,
+      undefined,
+    )
     await tg.close()
   })
 

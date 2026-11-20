@@ -67,6 +67,11 @@ nothing and opens no connection.**
 | `profiles`          | `[]`     | Per-use-case formats: the first profile matching `agent`/`directory` wins.    |
 | `otel`              | off      | OpenTelemetry export. See [Telemetry](#telemetry).                            |
 
+**A token command that fails** (a locked secret store, say) is not run again in a loop. It is
+retried after 30 s, 1 min, 2 min, and then every 5 min; each step is logged once, and the channel
+shows `waiting for token (retry hh:mm)` in `/oob` Status. A channel that cannot get its token does
+not poll or subscribe in between.
+
 The old single-channel form still works: `server`, `token`, `topics` and `actionAuth` at the top
 level mean `channels.ntfy`. Use one form or the other.
 
@@ -241,17 +246,25 @@ is a mirror of the conversation. This needs the Telegram channel in a forum grou
 ```
 /oob chat on      turn it on for the session you are looking at
 /oob chat off     turn it off (the 🛑 Stop chat button on the status card does the same)
+/oob delivery queue|steer|default   how prompts reach this session (see below)
 ```
 
 How it behaves:
 
 - **A prompt** is any plain message in the session's topic, or a reply to one of that session's
   bot messages. The bot puts 👀 on it and says `→ sent to <agent> · <project>`, or `→ queued` when
-  the session is busy. A prompt sent to a busy session waits its turn: it never interrupts a step.
+  the session is busy.
+- **Delivery.** By default (`chat.delivery: "queue"`) a prompt sent to a busy session waits for the
+  turn to end: it never interrupts a step. A message that starts with `!` (the `!` is dropped), or
+  `/steer <text>`, is always sent with `steer`: it is injected into the running turn, and the bot
+  says `⚡ steered in`. With `chat.delivery: "steer"`, every message to a busy session is steered;
+  an idle session just gets the message either way. The sidebar block (below) and
+  `/oob delivery` set it for one session.
 - **Answers come first.** A reply to a question, or a tap on a button, still answers that question.
   Only a message that answers nothing is a prompt.
 - **While the session works**, the topic shows "typing…". The assistant text appears in one message
-  that is edited as it grows (about every 1.5 s), moves to a new message past about 3,800
+  that is edited as it grows (the first text at once, then every second, `chat.streamMs`, 800 at
+  least), moves to a new message past about 3,800
   characters, and gets its final formatting when the turn ends. At most three messages: anything
   longer is also attached as `reply.md` ("📄 Full reply"). Only the assistant's text is posted,
   never tool calls or reasoning. Markdown becomes Telegram HTML (code blocks, inline code, bold,
@@ -335,6 +348,30 @@ and is subject to `chat.deny`. At most five are started an hour. Each one is log
 }
 ```
 
+## Sidebar
+
+The session sidebar gets a small block for the session in view:
+
+```
+OOB
+📡 telegram · on
+💬 chat: on · queue
+⏳ 1 open prompt
+```
+
+- **Routing** (`📡`): the channel and `on`, `off` or `auto`. Click to cycle auto, on, off.
+- **Chat** (`💬`): on or off. Click to switch it. A session blocked by `chat.deny` shows `denied`,
+  and a click says which rule blocks it. The line is left out when no selected channel can chat.
+- **Delivery** (after the dot): `queue` or `steer`. Click to flip it for this session; a `*` marks
+  a session that differs from `chat.delivery`. Kept in the settings file across restarts.
+- **Open prompts** (`⏳`): only when a question or permission of the session waits for an answer.
+
+The block follows the TUI theme and updates when anything changes. Clicking needs a mouse; the
+same things are done from the keyboard with `/oob on|off|auto`, `/oob chat on|off` and
+`/oob delivery queue|steer|default`. The block is drawn by `sidebar.tsx`, which needs `solid-js`
+and `@opentui/solid` (the OpenCode TUI provides them). If they cannot be loaded, the bridge works
+without the block.
+
 ## Telemetry
 
 The plugin can export OpenTelemetry traces and metrics over OTLP/HTTP JSON, using only `fetch`
@@ -361,19 +398,19 @@ telemetry, so these spans join the session's trace.
 | `oob.reply`          | A reply posted to a chat: parts, characters, documents (never the text).                                                                                           |
 | `oob.reconnect`      | A connector's poll or subscription reconnecting.                                                                                                                   |
 
-| Metrics                 | Kind      | Labels                                                                    |
-| ----------------------- | --------- | ------------------------------------------------------------------------- |
-| `oob.pushes`            | counter   | `connector.type`, `push.kind`                                             |
-| `oob.push.errors`       | counter   | `connector.type`, `push.kind`                                             |
-| `oob.answers`           | counter   | `connector.type`, `answered_by` (`phone`, `tui`)                          |
-| `oob.prompts`           | counter   | `connector.type`, `outcome` (`sent`, `queued`, `off`, `denied`, `failed`) |
-| `oob.replies`           | counter   | `connector.type`                                                          |
-| `oob.stream.edits`      | counter   | `connector.type`                                                          |
-| `oob.stream.throttled`  | counter   | `connector.type`                                                          |
-| `oob.inbound.rejected`  | counter   | `connector.type`, `reason`                                                |
-| `oob.reconnects`        | counter   | `connector.type`                                                          |
-| `oob.answer.latency_ms` | histogram | `connector.type`, `answered_by` (asked to answered)                       |
-| `oob.pending`           | gauge     | none (open prompts)                                                       |
+| Metrics                 | Kind      | Labels                                                                               |
+| ----------------------- | --------- | ------------------------------------------------------------------------------------ |
+| `oob.pushes`            | counter   | `connector.type`, `push.kind`                                                        |
+| `oob.push.errors`       | counter   | `connector.type`, `push.kind`                                                        |
+| `oob.answers`           | counter   | `connector.type`, `answered_by` (`phone`, `tui`)                                     |
+| `oob.prompts`           | counter   | `connector.type`, `outcome` (`sent`, `queued`, `steered`, `off`, `denied`, `failed`) |
+| `oob.replies`           | counter   | `connector.type`                                                                     |
+| `oob.stream.edits`      | counter   | `connector.type`                                                                     |
+| `oob.stream.throttled`  | counter   | `connector.type`                                                                     |
+| `oob.inbound.rejected`  | counter   | `connector.type`, `reason`                                                           |
+| `oob.reconnects`        | counter   | `connector.type`                                                                     |
+| `oob.answer.latency_ms` | histogram | `connector.type`, `answered_by` (asked to answered)                                  |
+| `oob.pending`           | gauge     | none (open prompts)                                                                  |
 
 Attributes are ids, kinds, counts and timings only. Message text, titles, answers, tokens, chat
 ids and URLs are never exported. Data is batched every few seconds in a bounded queue (the oldest
@@ -472,6 +509,10 @@ pnpm test:e2e    # e2e against a real ntfy (binwiederhier/ntfy), or NTFY_E2E_URL
 
 The e2e test starts `binwiederhier/ntfy serve` with docker, or uses `NTFY_E2E_URL`. It skips when
 docker is missing or `NTFY_E2E_SKIP` is set.
+
+A test run that did not point `OPENCODE_OOB_BRIDGE_LOG` or `OPENCODE_OOB_BRIDGE_DATA` somewhere of
+its own writes no log: the logger refuses the default path under `node --test`, so running one test
+file by hand cannot fill the real log.
 
 ## License
 

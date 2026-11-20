@@ -10,6 +10,9 @@ import {
   lazyToken,
   parseTokenSource,
   TOKEN_ERROR,
+  tokenWaitText,
+  TokenUnavailable,
+  type TokenFn,
   type TokenSource,
 } from "../token.ts"
 import { isObject, sleep, truncate, URL_RE } from "../util.ts"
@@ -49,7 +52,7 @@ export type Incoming = { id: string; time: number; message: string }
 export type NtfyOptions = {
   server: string
   topics: { out: string; in: string }
-  token?: () => Promise<string | undefined>
+  token?: TokenFn
   /** Puts the token in each http action, so buttons work on a server that denies anonymous writes. */
   actionAuth?: boolean
   fetch?: typeof fetch
@@ -78,10 +81,18 @@ export class Ntfy {
     try {
       token = await this.opts.token?.()
     } catch (err) {
-      log("token_error", { message: (err as Error).message })
+      // A failed token command is logged once per retry step by the token itself.
+      if (!(err instanceof TokenUnavailable))
+        log("token_error", { message: (err as Error).message })
     }
     if (token) h.Authorization = `Bearer ${token}`
     return h
+  }
+
+  /** The last failure, or that the token is being waited for. */
+  error(): string | undefined {
+    const at = this.opts.token?.retryAt?.()
+    return at === undefined ? this.lastError : tokenWaitText(at)
   }
 
   /** Publishes to the out topic. Returns the message id; never throws. */
@@ -143,10 +154,18 @@ export class Ntfy {
     while (!signal.aborted) {
       let why = "closed"
       try {
+        const headers = await this.headers(false)
+        const at = this.opts.token?.retryAt?.()
+        if (at !== undefined) {
+          // Not anonymously, and not again before the token is asked for again.
+          this.connected = false
+          await sleep(Math.max(0, at - Date.now()), signal)
+          continue
+        }
         const q = last ? `?since=${encodeURIComponent(last)}` : ""
         const res = await this.fetch(
           `${this.opts.server}/${this.opts.topics.in}/json${q}`,
-          { headers: await this.headers(false), signal },
+          { headers, signal },
         )
         if (!res.ok || !res.body) {
           why = `http-${res.status}`
@@ -349,7 +368,7 @@ export class NtfyConnector implements Connector {
   }
 
   status(): ConnectorStatus {
-    return { connected: this.ntfy.connected, lastError: this.ntfy.lastError }
+    return { connected: this.ntfy.connected, lastError: this.ntfy.error() }
   }
 }
 

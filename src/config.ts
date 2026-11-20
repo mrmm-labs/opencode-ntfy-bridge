@@ -28,6 +28,11 @@ export type ChannelConfig = {
   options: unknown
 }
 
+export type Delivery = "queue" | "steer"
+
+export const MIN_STREAM_MS = 800
+const DEFAULT_STREAM_MS = 1000
+
 /** Chat from a connector into a session. */
 export type ChatConfig = {
   /** Sessions where chat stays off even after `/oob chat on`. */
@@ -36,6 +41,10 @@ export type ChatConfig = {
   mirror: "replies" | "remote-only"
   /** Show a reply being written, in one message edited as it grows. */
   stream: boolean
+  /** Shortest time between two edits of a streamed reply, in ms. */
+  streamMs: number
+  /** How a prompt reaches a session that is working: `queue` waits for the turn to end, `steer` is injected into it. */
+  delivery: Delivery
   /** Applied to chat replies instead of `redact`: a reply cut at a prompt's preview length is unreadable. Default `full`. */
   redact: Redact
   /** The folders a session can be started in from a chat, by name. Empty: starting sessions from a chat is off. */
@@ -165,6 +174,8 @@ function parseChat(raw: unknown): ChatConfig | { error: string } {
       deny: [],
       mirror: "replies",
       stream: true,
+      streamMs: DEFAULT_STREAM_MS,
+      delivery: "queue",
       redact: { mode: "full" },
       projects: {},
       models: [],
@@ -176,6 +187,19 @@ function parseChat(raw: unknown): ChatConfig | { error: string } {
   const stream = raw.stream ?? true
   if (typeof stream !== "boolean")
     return { error: "chat.stream must be true or false" }
+  const streamMs = raw.streamMs ?? DEFAULT_STREAM_MS
+  if (
+    typeof streamMs !== "number" ||
+    !Number.isInteger(streamMs) ||
+    streamMs < MIN_STREAM_MS ||
+    streamMs > 60_000
+  )
+    return {
+      error: `chat.streamMs must be a whole number of ms, ${MIN_STREAM_MS} at least`,
+    }
+  const delivery = raw.delivery ?? "queue"
+  if (delivery !== "queue" && delivery !== "steer")
+    return { error: 'chat.delivery must be "queue" or "steer"' }
   const redact = parseRedact(raw.redact)
   if (!redact)
     return { error: 'chat.redact must be "full", "title" or "head:<n>"' }
@@ -203,6 +227,8 @@ function parseChat(raw: unknown): ChatConfig | { error: string } {
     deny,
     mirror,
     stream,
+    streamMs,
+    delivery,
     redact,
     projects: projects.projects,
     models,

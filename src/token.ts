@@ -2,6 +2,7 @@ import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 
 import { registerSecret } from "./filter.ts"
+import { log } from "./logger.ts"
 import { isArgv, isObject } from "./util.ts"
 
 export type TokenSource = { env: string } | { command: string[] }
@@ -42,14 +43,68 @@ export async function resolveToken(
   return value || undefined
 }
 
-/** Resolves once and caches; a failed command is retried on the next call. */
+/** Retry delays after a failed token command: then every five minutes. */
+const RETRY_MS = [30_000, 60_000, 120_000, 300_000]
+
+const clock = (at: number) => {
+  const d = new Date(at)
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`
+}
+
+/** What a status view says while the token is not available. */
+export const tokenWaitText = (retryAt: number) =>
+  `waiting for token (retry ${clock(retryAt)})`
+
+/** The token cannot be had now, and will not be asked for again before `retryAt`. */
+export class TokenUnavailable extends Error {
+  readonly retryAt: number
+  constructor(retryAt: number, why?: string) {
+    super(why ?? tokenWaitText(retryAt))
+    this.retryAt = retryAt
+  }
+}
+
+export type TokenFn = (() => Promise<string | undefined>) & {
+  /** When the next try will be made, while the token is unavailable. */
+  retryAt?: () => number | undefined
+}
+
+/**
+ * Resolves once and caches. A failed command is not run again at once: the
+ * next tries wait 30 s, 1 min, 2 min, then 5 min, and callers in between get
+ * a TokenUnavailable. Each step is logged once.
+ */
 export function lazyToken(
   source: TokenSource | undefined,
-): () => Promise<string | undefined> {
+  now: () => number = Date.now,
+): TokenFn {
   let token: Promise<string | undefined> | undefined
-  return () =>
-    (token ??= resolveToken(source).catch((err) => {
-      token = undefined
-      throw err
-    }))
+  let failures = 0
+  let retryAt = 0
+  const get: TokenFn = async () => {
+    if (token) return token
+    if (retryAt > now()) throw new TokenUnavailable(retryAt)
+    const attempt = resolveToken(source).then(
+      (v) => {
+        failures = 0
+        retryAt = 0
+        return v
+      },
+      (err: Error) => {
+        token = undefined
+        const wait = RETRY_MS[Math.min(failures++, RETRY_MS.length - 1)]
+        retryAt = now() + wait
+        log("token_unavailable", {
+          attempt: failures,
+          retry_in_s: wait / 1000,
+          message: err.message,
+        })
+        throw new TokenUnavailable(retryAt, `token failed: ${err.message}`)
+      },
+    )
+    token = attempt
+    return attempt
+  }
+  get.retryAt = () => (retryAt > now() ? retryAt : undefined)
+  return get
 }

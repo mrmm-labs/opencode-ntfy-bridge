@@ -21,6 +21,7 @@
   "files": [
     "index.js",
     "tui.tsx",
+    "sidebar.tsx",
     "dist",
     "oob-bridge.example.jsonc"
   ],
@@ -42,7 +43,7 @@
   },
   "scripts": {
     "build": "rm -rf dist && tsc",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.tui.json",
     "test": "OPENCODE_OOB_BRIDGE_CONFIG=/nonexistent/oob-bridge.jsonc OPENCODE_OOB_BRIDGE_DATA=/nonexistent/oob-bridge OPENCODE_OOB_BRIDGE_LOG=/dev/null node --test --test-timeout=60000 --experimental-strip-types 'src/**/*.test.ts'",
     "test:e2e": "OPENCODE_OOB_BRIDGE_CONFIG=/nonexistent/oob-bridge.jsonc OPENCODE_OOB_BRIDGE_DATA=/nonexistent/oob-bridge OPENCODE_OOB_BRIDGE_LOG=/dev/null node --test --test-timeout=120000 --experimental-strip-types src/e2e.test.ts",
     "lint": "oxlint && oxfmt --check .",
@@ -56,10 +57,25 @@
   "devDependencies": {
     "@opencode/client": "2.3.2",
     "@opencode/plugin": "2.3.2",
+    "@opentui/core": "0.8.4",
+    "@opentui/solid": "0.8.4",
     "@types/node": "^25.5.0",
     "oxfmt": "0.41.0",
     "oxlint": "1.56.0",
+    "solid-js": "^1.9.20",
     "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "@opentui/solid": ">=0.8.4",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
   },
   "packageManager": "pnpm@10.32.1"
 }

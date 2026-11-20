@@ -163,6 +163,8 @@ describe("parseConfig channels", () => {
       deny: [],
       mirror: "replies",
       stream: true,
+      streamMs: 1000,
+      delivery: "queue",
       redact: { mode: "full" },
       projects: {},
       models: [],
@@ -196,6 +198,29 @@ describe("parseConfig channels", () => {
       { deny: [{}] },
       { deny: [{ agent: "(" }] },
       { deny: ["x"] },
+    ])
+      assert.ok(
+        "error" in (parseConfig({ ...base, chat: bad }) as object),
+        JSON.stringify(bad),
+      )
+  })
+
+  it("reads chat.delivery and chat.streamMs (800 at least), and refuses bad ones", () => {
+    const base = { channels: { telegram: { token: { env: "TG" } } } }
+    const c = parseConfig({
+      ...base,
+      chat: { delivery: "steer", streamMs: 800 },
+    }) as Config
+    assert.equal(c.chat.delivery, "steer")
+    assert.equal(c.chat.streamMs, 800)
+    for (const bad of [
+      { delivery: "now" },
+      { delivery: true },
+      { streamMs: 799 },
+      { streamMs: 0 },
+      { streamMs: 1000.5 },
+      { streamMs: "1000" },
+      { streamMs: 61_000 },
     ])
       assert.ok(
         "error" in (parseConfig({ ...base, chat: bad }) as object),

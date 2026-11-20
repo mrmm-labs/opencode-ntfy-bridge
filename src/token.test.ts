@@ -44,7 +44,8 @@ describe("resolveToken", () => {
       assert.match(text, /probe/)
       assert.doesNotMatch(text, /env-token-should-not-leak/)
     } finally {
-      process.env.OPENCODE_OOB_BRIDGE_LOG = prev
+      if (prev === undefined) delete process.env.OPENCODE_OOB_BRIDGE_LOG
+      else process.env.OPENCODE_OOB_BRIDGE_LOG = prev
     }
   })
 })

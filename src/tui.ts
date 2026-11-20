@@ -12,6 +12,7 @@ import type { Connector } from "./connectors/types.ts"
 import { dataDir, loadConfig } from "./config.ts"
 import { log } from "./logger.ts"
 import { runCommand, saveSession, type App } from "./menu.ts"
+import { registerSidebar, type SidebarView } from "./sidebar.ts"
 import { resolveOtel, Telemetry } from "./otel.ts"
 import { PendingStore } from "./pending.ts"
 import { Router } from "./routing.ts"
@@ -65,11 +66,15 @@ export function host(ctx: Context): Host {
       }
     },
     root: (id) => ctx.data.session.root(id) || id,
+    peek: (id) => {
+      const info = ctx.data.session.get(id)
+      return info && { agent: info.agent, directory: info.location?.directory }
+    },
     replyForm: (sessionID, formID, answer) =>
       ctx.data.session.form.reply({ sessionID, formID, answer }),
     // Queued behind a running turn, so a message sent while the agent works never interrupts a step.
-    prompt: async (sessionID, text) => {
-      await ctx.client.session.prompt({ sessionID, text, delivery: "queue" })
+    prompt: async (sessionID, text, delivery) => {
+      await ctx.client.session.prompt({ sessionID, text, delivery })
     },
     busy: (id) => ctx.data.session.status(id) === "running",
     createSession: async ({ directory, agent, model }) => {
@@ -123,8 +128,16 @@ export function host(ctx: Context): Host {
   }
 }
 
+/**
+ * Loads the function that draws the sidebar block. It lives apart (`sidebar.tsx`)
+ * because it needs the host's UI toolkit: if that cannot be loaded, the bridge
+ * runs without a sidebar block.
+ */
+export type ViewLoader = () => Promise<SidebarView>
+
 export async function setup(
   ctx: Context,
+  loadView?: ViewLoader,
 ): Promise<(() => Promise<void>) | undefined> {
   // Registered before any await: OpenCode 2.3.2 ignores keymap layers
   // registered after setup has yielded, so /oob never appeared.
@@ -151,6 +164,13 @@ export async function setup(
     log("config_error", { message: cfg.error })
     return undefined
   }
+
+  const sidebar = loadView?.()
+    .then((view) => registerSidebar(ctx, view))
+    .catch((err: Error) => {
+      log("sidebar_unavailable", { message: err.message })
+      return undefined
+    })
 
   // Off unless an endpoint is configured, here or in the OTLP environment variables.
   const tel = new Telemetry(resolveOtel(cfg.otel))
@@ -194,6 +214,9 @@ export async function setup(
   app = { router, bridge, settings }
   for (const [id, v] of Object.entries(settings.sessions()))
     if (v.chat) bridge.restoreChat(id)
+  for (const [id, v] of Object.entries(settings.sessions()))
+    if (v.delivery === "queue" || v.delivery === "steer")
+      bridge.restoreDelivery(id, v.delivery)
   bridge.onChat((root) => saveSession(app!, root))
 
   const off = EVENTS.map((type) =>
@@ -203,6 +226,7 @@ export async function setup(
     ),
   )
 
+  void sidebar?.then((s) => s?.attach(app!))
   bridge.start()
   log("started", {
     otel: tel.enabled(),
@@ -211,6 +235,7 @@ export async function setup(
   })
   return async () => {
     for (const f of off) f()
+    ;(await sidebar)?.dispose()
     await bridge.stop()
     await settings.flush()
     await tel.dispose()

@@ -62,6 +62,11 @@
   // from a chat. Telegram is not end-to-end encrypted.
   // "chat": {
   //   "stream": true,
+  //   // Shortest time between two edits of a streamed reply, in ms (800 at least).
+  //   "streamMs": 1000,
+  //   // A prompt to a busy session: "queue" waits for the turn to end, "steer"
+  //   // is injected into it. A message starting with ! or /steer always steers.
+  //   "delivery": "queue",
   //   "mirror": "replies", // or "remote-only"
   //   // Replies use this instead of the top-level "redact" (default "full"):
   //   // a head:<n> preview limit would cut every reply. "title" carries over.
