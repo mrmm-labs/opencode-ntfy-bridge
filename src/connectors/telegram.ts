@@ -34,7 +34,6 @@ import {
   renderPush,
   renderStatus,
   starred,
-  topicName,
 } from "./telegram-render.ts"
 import {
   checkAnnounced,
@@ -662,7 +661,7 @@ export class TelegramConnector implements Connector {
     try {
       const session = {
         id: state.id,
-        name: truncate(filterSecrets(topicName(state)), 128),
+        name: state.name,
         project: state.project,
         agent: state.agent,
       }
@@ -681,7 +680,11 @@ export class TelegramConnector implements Connector {
         editedAt: -Infinity,
       }
       // The Stop button appears and goes away at once.
-      if (!!live.want.chat !== !!state.chat) live.editedAt = -Infinity
+      if (
+        !!live.want.chat !== !!state.chat ||
+        JSON.stringify(live.want.watch) !== JSON.stringify(state.watch)
+      )
+        live.editedAt = -Infinity
       live.want = state
       this.live.set(key, live)
       await this.flush(key)
@@ -717,7 +720,7 @@ export class TelegramConnector implements Connector {
     if (!live || !topic || !this.chatId) return
     clearTimeout(live.timer)
     const s = live.want
-    const name = truncate(filterSecrets(topicName(s)), 128)
+    const name = truncate(filterSecrets(s.name), 128)
     const now = this.now()
     let wait = Infinity
     const due = (last: number, gap: number) => {

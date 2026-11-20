@@ -152,26 +152,23 @@ export const renderPush = (push: Push, o: RenderOptions = {}) =>
   push.card ? renderCard(push.card, o) : renderPlain(push)
 
 /**
- * How a session is watched, short enough to lead a topic name:
- * `👁 on·telegram` (forced on), `⏱ auto`, `🔕 off`, then `💬` when chat is on.
+ * How a session is watched and whether chat is on, short enough to lead the
+ * card: the pinned-message bar shows only its first line.
  */
-export function watchTag(s: SessionState): string {
+export function watchHead(s: SessionState): string {
   const w = s.watch
-  if (!w) return s.chat ? "💬" : ""
-  const mode =
-    w.mode === "on"
+  const watch = !w
+    ? undefined
+    : w.mode === "on"
       ? w.channel === "all"
         ? "👁 on"
         : `👁 on·${w.channel}`
       : w.mode === "auto"
         ? "⏱ auto"
         : "🔕 off"
-  return s.chat ? `${mode} 💬` : mode
+  const chat = w || s.chat ? (s.chat ? "💬 on" : "💬 off") : undefined
+  return [watch, chat].filter(Boolean).join(" · ")
 }
-
-/** The topic name: the watch tag, then the session's name. */
-export const topicName = (s: SessionState): string =>
-  [watchTag(s), s.name].filter(Boolean).join(" · ")
 
 const watchLine = (w: NonNullable<SessionState["watch"]>): string =>
   w.mode === "on"
@@ -182,25 +179,25 @@ const watchLine = (w: NonNullable<SessionState["watch"]>): string =>
       ? `⏱ <b>Watched</b>: auto, after ${w.minutes} min away`
       : "🔕 <b>Not watched</b>"
 
-/** The pinned status card of a session topic. `icon` is the topic's emoji, so card and topic match. */
+/** The pinned status card of a session topic. `icon` is the topic's emoji, shown with the project. */
 export function renderStatus(s: SessionState, icon?: string): string {
   const at = clock(s.at)
   const state =
     s.state === "working"
       ? "🟢 <b>Working</b>"
       : s.state === "idle"
-        ? `💤 <b>Idle</b> since ${at}`
+        ? `💤 <b>Idle</b> ${at}`
         : `❌ <b>Failed</b> ${at}`
+  const head = watchHead(s)
   const model = s.model && s.variant ? `${s.model} (${s.variant})` : s.model
   const agent = [s.agent, model].filter(Boolean).join(" · ")
   return [
-    `${icon ? `${icon} ` : ""}${state}`,
+    head ? `${head} — ${state}` : state,
     ...(s.title ? [`📌 ${fit(clean(s.title), 200)}`] : []),
     ...(agent ? [`🤖 ${fit(clean(agent), 120)}`] : []),
-    `📁 ${fit(clean(s.project), 80)}`,
+    `📁 ${fit(clean(s.project), 80)}${icon ? ` ${icon}` : ""}`,
     `🆔 <code>${esc(s.id.slice(-6))}</code>`,
     ...(s.watch ? [watchLine(s.watch)] : []),
-    s.chat ? "💬 Chat on" : "💬 Chat off",
     `🕐 ${at}`,
   ].join("\n")
 }
