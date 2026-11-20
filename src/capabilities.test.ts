@@ -179,6 +179,7 @@ describe("capabilities", () => {
       buttons: true,
       edit: true,
       multiselect: false,
+      rich: false,
       threads: false,
       pairing: false,
       inboundPrompt: false,

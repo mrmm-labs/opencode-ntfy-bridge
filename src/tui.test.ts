@@ -285,7 +285,10 @@ describe("/oob menu and channels", () => {
 
     f.picks.push("routing", "off")
     await cmd.run()
-    assert.equal(f.dialogs.at(-1)!.current, "auto")
+    assert.equal(
+      f.dialogs.find((d) => d.title === "This session")!.current,
+      "auto",
+    )
     assert.equal(f.toasts.at(-1), "oob routing: off")
     await cmd.run("auto")
     assert.equal(f.toasts.at(-1), "oob routing: auto")
@@ -354,6 +357,57 @@ describe("/oob menu and channels", () => {
     assert.match(msg, /Open prompts: 0/)
     await cleanup()
     await n.close()
+    await tg.close()
+  })
+
+  it("the pairing dialog also offers the add-to-a-group link", async () => {
+    const tg = await fakeTelegram()
+    const { f, cmd, cleanup } = await started({
+      telegram: { token: { env: "OOBB_TG" }, apiBase: tg.url },
+    })
+    await cmd.run("pair telegram")
+    const msg = f.dialogs.at(-1)!.message!
+    const code = /send this code: ([A-Z2-9]{6})/.exec(msg)![1]
+    assert.match(
+      msg,
+      new RegExp(
+        `add it to a group[^\\n]*:\\nhttps://t.me/oob_test_bot\\?startgroup=${code}`,
+      ),
+    )
+    await cleanup()
+    await tg.close()
+  })
+
+  it("Status shows that topics cannot be created for lack of the admin right", async () => {
+    const tg = await fakeTelegram()
+    tg.forum = true
+    tg.fail("createForumTopic", 400, {
+      description: "Bad Request: not enough rights to create a topic",
+    })
+    const dir = await mkdtemp(join(tmpdir(), "oobb-menu-"))
+    await writeFile(
+      join(dir, "settings.json"),
+      JSON.stringify({ sessions: { root: { on: true } } }),
+    )
+    const { f, cmd, cleanup } = await started(
+      { telegram: { token: { env: "OOBB_TG" }, chatId: 7, apiBase: tg.url } },
+      {},
+      undefined,
+      dir,
+    )
+    f.handlers.get("session.execution.started")!({
+      type: "session.execution.started",
+      data: { sessionID: "root" },
+    })
+    await tg.waitFor(() =>
+      tg.of("sendMessage").find((c) => /Manage Topics/.test(c.body.text)),
+    )
+    await cmd.run("status")
+    assert.match(
+      f.dialogs.at(-1)!.message!,
+      /^telegram: on[^\n]*\n {2}⚠ topics: the bot needs the Manage Topics admin right/m,
+    )
+    await cleanup()
     await tg.close()
   })
 
@@ -475,16 +529,95 @@ describe("/oob menu and channels", () => {
     assert.equal(m.options![0].description, "now: on via telegram")
     again.f.picks.push("routing", "auto")
     await again.cmd.run()
-    const r = again.f.dialogs.at(-1)!
+    const r = again.f.dialogs.find((d) => d.title === "This session")!
     assert.equal(r.current, "on:telegram")
     assert.deepEqual(
       r.options!.map((o) => o.value),
-      ["on", "on:ntfy", "on:telegram", "on:all", "off", "auto"],
+      ["on", "on:ntfy", "on:telegram", "on:all", "off", "auto", "back"],
     )
     assert.equal(again.f.toasts.at(-1), "oob routing: auto")
     await again.cleanup()
     assert.deepEqual((await readJson(join(dir, "settings.json"))).sessions, {})
     await n.close()
+    await tg.close()
+  })
+
+  it("the main menu loops until Esc; submenus return to it with Back", async () => {
+    const n = await fakeNtfy()
+    const { f, cmd, cleanup } = await started({
+      ntfy: { server: n.url, topics: { out: "o", in: "i" } },
+    })
+    // routing -> Back, status, test, then Esc (undefined).
+    f.picks.push("routing", "back", "status", "test")
+    await cmd.run()
+    assert.deepEqual(
+      f.dialogs.map((d) => d.title),
+      [
+        "OOB bridge",
+        "This session",
+        "OOB bridge",
+        "OOB bridge status",
+        "OOB bridge",
+        "OOB bridge",
+      ],
+    )
+    assert.ok(f.dialogs[1].options!.at(-1)!.value === "back")
+    assert.equal(
+      f.toasts.some((t) => t.startsWith("oob routing")),
+      false,
+      "Back changes nothing",
+    )
+    assert.match(f.toasts.at(-1)!, /^Test push/)
+    await cleanup()
+    await n.close()
+  })
+
+  it("the channel list stays open for several switches, until Back", async () => {
+    const n = await fakeNtfy()
+    const tg = await fakeTelegram()
+    const { f, dir, cmd, cleanup } = await started({
+      ntfy: { server: n.url, topics: { out: "o", in: "i" } },
+      telegram: { token: { env: "OOBB_TG" }, chatId: 7, apiBase: tg.url },
+    })
+    f.picks.push("channels", "ntfy", "telegram", "ntfy", "back")
+    await cmd.run()
+    const lists = f.dialogs.filter((d) => d.title.startsWith("Channels"))
+    assert.equal(lists.length, 4)
+    assert.equal(lists[0].options!.at(-1)!.value, "back")
+    assert.deepEqual(
+      lists.map((l) => l.options!.slice(0, 2).map((o) => o.title)),
+      [
+        ["ntfy: on", "telegram: on"],
+        ["ntfy: off", "telegram: on"],
+        ["ntfy: off", "telegram: off"],
+        ["ntfy: on", "telegram: off"],
+      ],
+    )
+    // The file is written after the menu moves on: wait for the last switch.
+    await cleanup()
+    const saved = await readJson(join(dir, "settings.json"))
+    assert.equal(saved.channels.ntfy.enabled, true)
+    assert.equal(saved.channels.telegram.enabled, false)
+    await n.close()
+    await tg.close()
+  })
+
+  it("pairing from the menu returns to the menu when its dialog closes", async () => {
+    const tg = await fakeTelegram()
+    const { f, cmd, cleanup } = await started({
+      telegram: { token: { env: "OOBB_TG" }, apiBase: tg.url },
+    })
+    f.picks.push("pair:telegram")
+    await cmd.run()
+    assert.deepEqual(
+      f.dialogs.map((d) => d.title),
+      ["OOB bridge", "Pair telegram", "OOB bridge"],
+    )
+    // From the command line the command returns at once, without waiting for the dialog.
+    const before = f.dialogs.length
+    await cmd.run("pair telegram")
+    assert.equal(f.dialogs.length, before + 1)
+    await cleanup()
     await tg.close()
   })
 

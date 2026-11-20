@@ -69,7 +69,8 @@ export async function runCommand(
           .join(", ")}`,
         "warning",
       )
-    return pair(ctx, app, c)
+    // From the command line the dialog is not awaited: the command returns at once.
+    return void (await pair(ctx, app, c))
   }
   toast(ctx, USAGE, "warning")
 }
@@ -108,10 +109,27 @@ const describe = (app: App, root: string) => {
     : app.router.mode(root)
 }
 
+const BACK = { title: "← Back", value: "back", description: undefined }
+
+/** Stays open after each action; Esc closes it, "← Back" in a submenu returns here. */
 async function menu(ctx: Context, app: App): Promise<void> {
+  for (;;) {
+    const choice = await mainMenu(ctx, app)
+    if (!choice) return
+    if (choice === "routing") await routing(ctx, app)
+    else if (choice === "channels") await channelList(ctx, app)
+    else if (choice.startsWith("pair:")) {
+      const closed = await pair(ctx, app, find(app, choice.slice(5)))
+      if (closed) await closed
+    } else if (choice === "test") await test(ctx, app)
+    else if (choice === "status") await status(ctx, app)
+  }
+}
+
+function mainMenu(ctx: Context, app: App): Promise<string | undefined> {
   const root = sessionRoot(ctx)
   const channels = app.bridge.status().channels
-  const choice = await ctx.ui.dialog.select({
+  return ctx.ui.dialog.select({
     title: "OOB bridge",
     options: [
       {
@@ -135,12 +153,6 @@ async function menu(ctx: Context, app: App): Promise<void> {
       { title: "Status", value: "status", description: undefined },
     ],
   })
-  if (choice === "routing") return routing(ctx, app)
-  if (choice === "channels") return channelList(ctx, app)
-  if (choice?.startsWith("pair:"))
-    return pair(ctx, app, find(app, choice.slice(5)))
-  if (choice === "test") return test(ctx, app)
-  if (choice === "status") return status(ctx, app)
 }
 
 async function routing(ctx: Context, app: App): Promise<void> {
@@ -161,27 +173,35 @@ async function routing(ctx: Context, app: App): Promise<void> {
       })),
       { title: "off", value: "off", description: "never mirror" },
       { title: "auto", value: "auto", description: "when away, by the rules" },
+      BACK,
     ],
   })
-  if (!pick) return
+  if (!pick || pick === "back") return
   const [m, ch] = pick.split(":")
   setRouting(ctx, app, m as "on" | "off" | "auto", ch)
 }
 
+/** Stays open so several channels can be switched in a row. */
 async function channelList(ctx: Context, app: App): Promise<void> {
-  const channels = app.bridge.status().channels
-  const id = await ctx.ui.dialog.select({
-    title: "Channels (pick one to switch it)",
-    options: channels.map((c) => ({
-      title: `${c.id}: ${c.enabled ? "on" : "off"}`,
-      value: c.id,
-    })),
-  })
-  const c = channels.find((x) => x.id === id)
-  if (!c) return
-  app.bridge.setEnabled(c.id, !c.enabled)
-  app.settings.set(c.id, { enabled: !c.enabled })
-  toast(ctx, `${c.id}: ${c.enabled ? "off" : "on"}`)
+  for (;;) {
+    const channels = app.bridge.status().channels
+    const id = await ctx.ui.dialog.select<string>({
+      title: "Channels (pick one to switch it)",
+      options: [
+        ...channels.map((c) => ({
+          title: `${c.id}: ${c.enabled ? "on" : "off"}`,
+          value: c.id,
+          description: undefined,
+        })),
+        BACK,
+      ],
+    })
+    const c = channels.find((x) => x.id === id)
+    if (!c) return
+    app.bridge.setEnabled(c.id, !c.enabled)
+    app.settings.set(c.id, { enabled: !c.enabled })
+    toast(ctx, `${c.id}: ${c.enabled ? "off" : "on"}`)
+  }
 }
 
 async function test(ctx: Context, app: App): Promise<void> {
@@ -206,7 +226,10 @@ async function status(ctx: Context, app: App): Promise<void> {
         : c.connected
           ? "on, connected"
           : "on, not connected"
-    return `${c.id}: ${state}${c.lastError ? ` (last error: ${c.lastError})` : ""}`
+    return [
+      `${c.id}: ${state}${c.lastError ? ` (last error: ${c.lastError})` : ""}`,
+      ...(c.warning ? [`  ⚠ ${c.warning}`] : []),
+    ].join("\n")
   })
   lines.push(`Open prompts: ${st.pending}`)
   if (root) lines.push(`This session: ${describe(app, root)}`)
@@ -216,13 +239,14 @@ async function status(ctx: Context, app: App): Promise<void> {
   })
 }
 
+/** Resolves to a promise that settles when the pairing dialog closes. */
 async function pair(
   ctx: Context,
   app: App,
   c: Connector | undefined,
-): Promise<void> {
+): Promise<Promise<void> | undefined> {
   if (!c?.capabilities.pairing || !c.pair)
-    return toast(
+    return void toast(
       ctx,
       c
         ? `${c.id} has no pairing`
@@ -234,7 +258,8 @@ async function pair(
     app.settings.set(c.id, { enabled: true })
   }
   const p = await app.bridge.pair(c)
-  if (!p) return toast(ctx, `${c.id}: pairing failed, see the log`, "error")
+  if (!p)
+    return void toast(ctx, `${c.id}: pairing failed, see the log`, "error")
   const lines = [`Pair ${c.id} with OpenCode.`]
   if (p.hint) lines.push(p.hint)
   if (p.link) {
@@ -245,6 +270,7 @@ async function pair(
       lines.push("", "Scan with your phone camera:", ...qr.lines)
     lines.push("", "Or open this link:", p.link)
   }
+  for (const l of p.links ?? []) lines.push("", `${l.label}:`, l.url)
   const minutes = Math.max(1, Math.round((p.expiresAt - Date.now()) / 60_000))
   lines.push(
     "",
@@ -252,14 +278,17 @@ async function pair(
     `It works once and expires in ${minutes} minutes.`,
   )
   let open = true
-  void ctx.ui.dialog
+  const closed = ctx.ui.dialog
     .alert({ title: `Pair ${c.id}`, message: lines.join("\n") })
-    .then(() => (open = false))
+    .then(() => {
+      open = false
+    })
   void p.done.then((ok) => {
     if (open) ctx.ui.dialog.clear()
     if (ok) toast(ctx, `${c.id} paired`, "success")
     else toast(ctx, "Pairing code expired", "warning")
   })
+  return closed
 }
 
 /** Terminal size when the renderer reports it. */

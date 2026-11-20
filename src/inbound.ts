@@ -8,7 +8,12 @@
 
 export type Reply =
   | { id: string; choice: number }
-  | { id: string; text: string }
+  | {
+      id: string
+      text: string
+      /** A free-text answer: a number is not an option selector. */
+      literal?: boolean
+    }
 
 export function parseReply(message: string): Reply | undefined {
   const s = message.trim()
@@ -41,8 +46,8 @@ export type Question = {
 
 export type Answer = Record<string, string | string[]>
 
-function one(q: Question, part: string): string | undefined {
-  const n = /^\d+$/.test(part) ? Number(part) : NaN
+function one(q: Question, part: string, literal = false): string | undefined {
+  const n = !literal && /^\d+$/.test(part) ? Number(part) : NaN
   if (n >= 1 && n <= q.options.length) return q.options[n - 1]
   const exact = q.options.find((o) => o.toLowerCase() === part.toLowerCase())
   if (exact) return exact
@@ -70,12 +75,14 @@ export function resolveAnswer(
   const answer: Answer = {}
   for (const [i, q] of questions.entries()) {
     if (q.multiple) {
-      const values = parts[i].split(",").map((p) => one(q, p.trim()))
+      const values = parts[i]
+        .split(",")
+        .map((p) => one(q, p.trim(), reply.literal))
       if (values.length === 0 || values.some((v) => v === undefined))
         return undefined
       answer[q.key] = values as string[]
     } else {
-      const v = one(q, parts[i])
+      const v = one(q, parts[i], reply.literal)
       if (v === undefined) return undefined
       answer[q.key] = v
     }

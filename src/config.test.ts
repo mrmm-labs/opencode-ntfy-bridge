@@ -109,6 +109,9 @@ describe("parseConfig channels", () => {
       token: { env: "TG" },
       chatId: "-100123",
       apiBase: "https://api.telegram.org",
+      statusCard: true,
+      notify: {},
+      icons: {},
     })
     const d = parseConfig({
       channels: {
@@ -116,6 +119,41 @@ describe("parseConfig channels", () => {
       },
     }) as Config
     assert.equal(opts(d, "telegram").chatId, "42")
+  })
+
+  it("reads telegram's statusCard, notify and icons, and refuses bad ones", () => {
+    const c = parseConfig({
+      channels: {
+        telegram: {
+          token: { env: "TG" },
+          statusCard: false,
+          notify: { finished: true },
+          icons: { "^coord": "🎯" },
+        },
+      },
+    }) as Config
+    assert.deepEqual(opts(c, "telegram"), {
+      token: { env: "TG" },
+      chatId: undefined,
+      apiBase: "https://api.telegram.org",
+      statusCard: false,
+      notify: { finished: true, failed: undefined },
+      icons: { "^coord": "🎯" },
+    })
+    for (const bad of [
+      { statusCard: "yes" },
+      { notify: { failed: 1 } },
+      { notify: "no" },
+      { icons: { a: 3 } },
+      { icons: [] },
+    ])
+      assert.ok(
+        "error" in
+          (parseConfig({
+            channels: { telegram: { token: { env: "TG" }, ...bad } },
+          }) as object),
+        JSON.stringify(bad),
+      )
   })
 
   it("runs both channels together", () => {

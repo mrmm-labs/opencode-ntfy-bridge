@@ -1,0 +1,172 @@
+/**
+ * Telegram message markup. Everything is built from plain parts that are
+ * truncated first and escaped second, then wrapped in tags, so a tag is never
+ * cut and no text is ever read as markup. A message is at most 4096 characters.
+ */
+import { filterSecrets } from "../filter.ts"
+import { clock } from "../util.ts"
+import type { Card, CardQuestion, Push, SessionState } from "./types.ts"
+
+export const LIMIT = 4096
+// Margin under the limit: entity characters count once after parsing, but a count of raw HTML is the safe side.
+const BUDGET = 4000
+
+export const esc = (s: string) =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+
+/** Escaped `text` that is at most `max` characters long, ending in "…" when cut. */
+export function fit(text: string, max: number): string {
+  if (esc(text).length <= max) return esc(text)
+  // Escaping only lengthens, so more than `max` characters never fit.
+  let t = text.slice(0, max)
+  while (t.length > 0 && esc(t).length + 1 > max)
+    t = t.slice(
+      0,
+      Math.max(0, Math.min(t.length - 1, Math.floor(t.length * 0.9))),
+    )
+  return `${esc(t.trimEnd())}…`
+}
+
+const KEYCAPS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+export const keycap = (n: number) => KEYCAPS[n - 1] ?? `${n}.`
+
+/** "(Recommended)" becomes a star after the label. */
+export function starred(label: string): string {
+  const plain = label.replace(/\s*\(recommended\)\s*/i, " ").trim()
+  return plain === label.trim() ? label : `${plain} ⭐`
+}
+
+const clean = (s: string) => filterSecrets(s)
+
+type Stage = { text: number; label: number; detail: number; options: number }
+
+const STAGES: Stage[] = [
+  { text: 1500, label: 120, detail: 60, options: 30 },
+  { text: 700, label: 60, detail: 40, options: 20 },
+  { text: 300, label: 40, detail: 0, options: 12 },
+  { text: 150, label: 24, detail: 0, options: 0 },
+]
+
+function questionBlock(
+  q: CardQuestion,
+  n: number,
+  of: number,
+  st: Stage,
+): string[] {
+  const out: string[] = []
+  const head = of > 1 ? `${n}) ${q.header || q.text}` : q.text
+  out.push(`<b>${fit(clean(head), st.text)}</b>`)
+  if (of > 1 && q.header && q.text && q.text !== q.header)
+    out.push(fit(clean(q.text), st.text))
+  const shown = q.options.slice(0, st.options)
+  if (shown.length) out.push("")
+  shown.forEach((o, i) => {
+    out.push(
+      `${keycap(i + 1)} <b>${fit(clean(starred(o.label)), st.label)}</b>`,
+    )
+    if (o.detail && st.detail)
+      out.push(`      <i>${fit(clean(o.detail), st.detail)}</i>`)
+  })
+  if (q.options.length > shown.length)
+    out.push(`      <i>… and ${q.options.length - shown.length} more</i>`)
+  return out
+}
+
+export type RenderOptions = {
+  /** The message goes into the session's own topic, which already names it. */
+  inTopic?: boolean
+  /** Muted last line of a question. */
+  footer?: string
+}
+
+function lines(card: Card, o: RenderOptions, st: Stage): string[] {
+  const where = (s?: string) =>
+    s && !o.inTopic ? [`📌 ${fit(clean(s), 200)}`] : []
+  switch (card.kind) {
+    case "question": {
+      const out = [
+        `❓ <b>${fit(clean(card.agent), 60)}</b> asks · <i>${fit(clean(card.project), 60)}</i>`,
+        ...where(card.session),
+      ]
+      card.questions.forEach((q, i) => {
+        out.push("", ...questionBlock(q, i + 1, card.questions.length, st))
+      })
+      if (o.footer) out.push("", `<i>${fit(o.footer, 200)}</i>`)
+      return out
+    }
+    case "permission":
+      return [
+        `🔐 <b>${fit(clean(card.agent), 60)}</b> needs permission · <i>${fit(clean(card.project), 60)}</i>`,
+        ...where(card.session),
+        "",
+        `<pre>${fit(clean(card.detail), st.text)}</pre>`,
+        "",
+        "<i>Answer in the OpenCode TUI. Permissions are never applied remotely.</i>",
+      ]
+    case "finished":
+    case "failed":
+      return [
+        `${card.kind === "failed" ? "❌" : "✅"} <b>${card.kind === "failed" ? "Failed" : "Finished"}</b> · <i>${fit(clean(card.project), 60)}</i>`,
+        ...where(card.session),
+        ...(card.duration ? [`⏱ ${fit(card.duration, 40)}`] : []),
+      ]
+    case "closed": {
+      const head =
+        card.outcome === "cancelled"
+          ? "⚪ <b>Cancelled</b>"
+          : `✅ <b>Answered</b>${card.answer ? ` · ${fit(clean(card.answer), 300)}` : ""}`
+      return [
+        head,
+        `<i>via ${fit(card.via, 40)} · ${fit(card.time, 10)}</i>`,
+        ...(card.quote
+          ? ["", `<blockquote>${fit(clean(card.quote), st.text)}</blockquote>`]
+          : []),
+      ]
+    }
+    case "notice":
+      return [`⚠️ ${fit(clean(card.text), st.text)}`]
+  }
+}
+
+/** The card as HTML, at most 4096 characters, shrinking the body as needed. */
+export function renderCard(card: Card, o: RenderOptions = {}): string {
+  for (const st of STAGES) {
+    const html = lines(card, o, st).join("\n")
+    if (html.length <= BUDGET) return html
+  }
+  // Pathological input (hundreds of questions): the header and a pointer, never a cut tag.
+  const last = STAGES[STAGES.length - 1]
+  const head = lines(card, o, { ...last, text: 40, options: 0 }).slice(0, 3)
+  return [...head, "", "<i>Too long to show here: open OpenCode.</i>"].join(
+    "\n",
+  )
+}
+
+/** A push without a card: its title in bold, then its message. */
+export function renderPlain(push: Push): string {
+  const title = push.title ? `<b>${fit(clean(push.title), 300)}</b>\n` : ""
+  return `${title}${fit(clean(push.message), BUDGET - title.length)}`
+}
+
+export const renderPush = (push: Push, o: RenderOptions = {}) =>
+  push.card ? renderCard(push.card, o) : renderPlain(push)
+
+/** The pinned status card of a session topic. `icon` is the topic's emoji, so card and topic match. */
+export function renderStatus(s: SessionState, icon?: string): string {
+  const at = clock(s.at)
+  const state =
+    s.state === "working"
+      ? "🟢 <b>Working</b>"
+      : s.state === "idle"
+        ? `💤 <b>Idle</b> since ${at}`
+        : `❌ <b>Failed</b> ${at}`
+  const agent = [s.agent, s.model].filter(Boolean).join(" · ")
+  return [
+    `${icon ? `${icon} ` : ""}${state}`,
+    ...(s.title ? [`📌 ${fit(clean(s.title), 200)}`] : []),
+    ...(agent ? [`🤖 ${fit(clean(agent), 120)}`] : []),
+    `📁 ${fit(clean(s.project), 80)}`,
+    `🆔 <code>${esc(s.id.slice(-6))}</code>`,
+    `🕐 ${at}`,
+  ].join("\n")
+}

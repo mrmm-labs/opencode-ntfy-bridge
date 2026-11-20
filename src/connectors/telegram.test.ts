@@ -10,7 +10,7 @@ import { PendingStore } from "../pending.ts"
 import { Router } from "../routing.ts"
 import { sleep } from "../util.ts"
 import { fakeTelegram } from "./fake-telegram.test-util.ts"
-import { TelegramConnector, type TelegramOptions } from "./telegram.ts"
+import { hash, TelegramConnector, type TelegramOptions } from "./telegram.ts"
 import type { Connector, Inbound, Outcome } from "./types.ts"
 
 const CHAT = 4242
@@ -97,8 +97,9 @@ describe("TelegramConnector outbound", () => {
     assert.match(c.text, /Deploy &lt;now&gt; &amp; go\?/)
     assert.doesNotMatch(c.text, /hunter2222/)
     assert.deepEqual(c.reply_markup.inline_keyboard, [
-      [{ text: "Yes", callback_data: "ab12:1" }],
-      [{ text: "No", callback_data: "ab12:2" }],
+      [{ text: "1️⃣ Yes", callback_data: "ab12:1" }],
+      [{ text: "2️⃣ No", callback_data: "ab12:2" }],
+      [{ text: "✏️ Type an answer", callback_data: "ab12:x" }],
     ])
     assert.ok(
       c.reply_markup.inline_keyboard
@@ -227,7 +228,7 @@ describe("TelegramConnector inbound", () => {
       .inline_keyboard
     assert.deepEqual(
       kb.map((row: Array<{ text: string }>) => row[0].text),
-      ["✓ a", "b", "✓ c", "Done"],
+      ["✓ 1️⃣ a", "2️⃣ b", "✓ 3️⃣ c", "✏️ Type an answer", "Done"],
     )
     r.tg.callback(CHAT, Number(ref), "ab12:d")
     await r.tg.waitFor(() => r.got[0])
@@ -371,6 +372,7 @@ function stubChannel(id: string) {
       buttons: true,
       edit: true,
       multiselect: false,
+      rich: false,
       threads: false,
       pairing: false,
       inboundPrompt: false,
@@ -391,8 +393,12 @@ function stubChannel(id: string) {
   return { ch, sent, updates, reply: (m: Inbound) => onInbound!(m) }
 }
 
-async function bridgeRig(over: Record<string, unknown> = {}) {
-  const t = await rig()
+async function bridgeRig(
+  over: Record<string, unknown> = {},
+  tgOver: Partial<TelegramOptions> = {},
+  title = "Fix",
+) {
+  const t = await rig({ statusCard: false, ...tgOver })
   const cfg = parseConfig({
     channels: {
       ntfy: { server: "https://ntfy.example", topics: { out: "o", in: "i" } },
@@ -404,9 +410,21 @@ async function bridgeRig(over: Record<string, unknown> = {}) {
   const replies: unknown[] = []
   const sessions: Record<
     string,
-    { id: string; agent: string; directory: string; title: string }
+    {
+      id: string
+      agent: string
+      directory: string
+      title: string
+      model?: string
+    }
   > = {
-    root: { id: "root", agent: "coord", directory: "/w/shop", title: "Fix" },
+    root: {
+      id: "root",
+      agent: "coord",
+      directory: "/w/shop",
+      title,
+      model: "opus",
+    },
   }
   const router = new Router(cfg, async () => true)
   router.set("root", true)
@@ -454,7 +472,7 @@ describe("Bridge with telegram and another channel", () => {
     const id = b.store.list()[0].id
     assert.match(b.stub.sent[0].message, /answer via ntfy/)
     const tgMsg = b.tg.of("sendMessage")[0].body
-    assert.match(tgMsg.text, /Tap a button, or reply/)
+    assert.match(tgMsg.text, /Tap a button, ✏️ to type, or reply/)
     assert.equal(
       tgMsg.reply_markup.inline_keyboard[0][0].callback_data,
       `${id}:1`,
@@ -475,7 +493,10 @@ describe("Bridge with telegram and another channel", () => {
     const toast = b.tg.of("answerCallbackQuery")[0].body.text
     assert.equal(toast, "Answered: Yes")
     const edit = b.tg.of("editMessageText")[0].body
-    assert.match(edit.text, /Answered from telegram: Yes/)
+    assert.match(
+      edit.text,
+      /Answered<\/b> · Yes\n<i>via telegram · \d\d:\d\d<\/i>/,
+    )
     assert.deepEqual(edit.reply_markup, { inline_keyboard: [] })
     assert.deepEqual(b.stub.updates, [
       { ref: "ntfy1", message: "Answered from telegram: Yes" },
@@ -510,7 +531,7 @@ describe("Bridge with telegram and another channel", () => {
       { sessionID: "root", formID: "frm_1", answer: { q0: "No" } },
     ])
     const edit = b.tg.of("editMessageText")[0].body
-    assert.match(edit.text, /Answered from ntfy: No/)
+    assert.match(edit.text, /Answered<\/b> · No\n<i>via ntfy/)
     await b.done()
   })
 
@@ -522,7 +543,10 @@ describe("Bridge with telegram and another channel", () => {
       type: "form.replied",
       data: { id: "frm_1", sessionID: "root" },
     })
-    assert.match(b.tg.of("editMessageText")[0].body.text, /Answered in the TUI/)
+    assert.match(
+      b.tg.of("editMessageText")[0].body.text,
+      /Answered<\/b>\n<i>via TUI/,
+    )
     assert.match(b.stub.updates[0].message, /Answered in the TUI/)
     b.tg.callback(CHAT, 501, `${id}:1`)
     await b.tg.waitFor(() => b.tg.of("answerCallbackQuery")[0])
@@ -747,7 +771,8 @@ describe("TelegramConnector forum topics", () => {
     first.tg.forum = true
     await first.channel.send({ message: "a", session })
     const saved = JSON.parse(await readFile(topicsFile, "utf8"))
-    assert.deepEqual(saved, { [`${CHAT}:root`]: 9001 })
+    assert.equal(saved[`${CHAT}:root`].thread, 9001)
+    assert.equal(saved[`${CHAT}:root`].name, "shop · Fix checkout")
     await first.done()
 
     const second = await rig({ topicsFile })
@@ -828,5 +853,554 @@ describe("pending store refs", () => {
     await store.load()
     assert.deepEqual(store.get("ab12")!.refs, { ntfy: "m9" })
     assert.equal(store.byRef("ntfy", "m9")!.id, "ab12")
+  })
+})
+
+const ev = (type: string, data: Record<string, unknown> = {}) =>
+  ({ type, data: { sessionID: "root", ...data } }) as unknown as BridgeEvent
+
+describe("Telegram: typed answers and groups", () => {
+  it("✏️ asks for a typed answer in the same topic; a reply to that prompt is a literal answer", async () => {
+    const b = await bridgeRig()
+    await b.ask("frm_1", [yesNoField])
+    const id = b.store.list()[0].id
+    b.tg.callback(CHAT, 501, `${id}:x`, 9001)
+    const ask = await b.tg.waitFor(() => b.tg.of("sendMessage")[1])
+    assert.equal(ask.body.text, `Type your answer for #${id}`)
+    assert.equal(ask.body.message_thread_id, 9001)
+    assert.deepEqual(ask.body.reply_markup, {
+      force_reply: true,
+      input_field_placeholder: "Your answer",
+    })
+    assert.equal(b.tg.of("answerCallbackQuery").length, 1)
+    // "2" is text here, not the second option.
+    b.tg.message(CHAT, "2", 502)
+    await b.tg.waitFor(() => b.replies[0])
+    assert.deepEqual((b.replies[0] as { answer: unknown }).answer, { q0: "2" })
+    await b.done()
+  })
+
+  it("no ✏️ button when the question takes no custom answer", async () => {
+    const b = await bridgeRig()
+    await b.ask("frm_1", [{ ...yesNoField, custom: false }])
+    const kb = b.tg.of("sendMessage")[0].body.reply_markup.inline_keyboard
+    assert.equal(kb.length, 2)
+    await b.done()
+  })
+
+  it("pairs from a group by /start@bot CODE or a bare code, and says it is a topics group", async () => {
+    const r = await rig({ chatId: undefined })
+    const p = await r.channel.pair()
+    assert.equal(p.link, `https://t.me/oob_test_bot?start=${p.code}`)
+    assert.equal(
+      p.links![0].url,
+      `https://t.me/oob_test_bot?startgroup=${p.code}`,
+    )
+    r.tg.message(-100, `/start@oob_test_bot ${p.code}`, undefined, undefined, {
+      type: "supergroup",
+      title: "Ops <room>",
+      is_forum: true,
+    })
+    assert.equal(await p.done, true)
+    const hi = await r.tg.waitFor(() => r.tg.of("sendMessage")[0])
+    assert.equal(hi.body.chat_id, "-100")
+    assert.equal(
+      hi.body.text,
+      "Paired with Ops &lt;room&gt;. One topic per session.",
+    )
+
+    const q = await rig({ chatId: undefined })
+    const p2 = await q.channel.pair()
+    q.tg.message(-200, p2.code.toLowerCase(), undefined, undefined, {
+      type: "group",
+      title: "Plain",
+    })
+    assert.equal(await p2.done, true)
+    const hi2 = await q.tg.waitFor(() => q.tg.of("sendMessage")[0])
+    assert.equal(hi2.body.text, "Paired with Plain.")
+    await r.done()
+    await q.done()
+  })
+})
+
+describe("Telegram: message layout", () => {
+  it("a question and its answered edit, as the person reads them", async () => {
+    const b = await bridgeRig({}, {}, "Fix checkout")
+    await b.ask("frm_1", [
+      {
+        ...yesNoField,
+        options: [
+          { label: "Ship it (Recommended)", description: "Deploy to <prod>" },
+          { label: "Wait" },
+        ],
+      },
+    ])
+    const id = b.store.list()[0].id
+    const q = b.tg.of("sendMessage")[0].body
+    assert.equal(
+      q.text,
+      [
+        "❓ <b>coord</b> asks · <i>shop</i>",
+        "📌 Fix checkout",
+        "",
+        "<b>Go?</b>",
+        "",
+        "1️⃣ <b>Ship it ⭐</b>",
+        "      <i>Deploy to &lt;prod&gt;</i>",
+        "2️⃣ <b>Wait</b>",
+        "",
+        "<i>Tap a button, ✏️ to type, or reply.</i>",
+      ].join("\n"),
+    )
+    assert.equal(q.reply_markup.inline_keyboard[0][0].text, "1️⃣ Ship it ⭐")
+    b.tg.callback(CHAT, 501, `${id}:1`)
+    const e = await b.tg.waitFor(() => b.tg.of("editMessageText")[0])
+    assert.match(
+      e.body.text,
+      /^✅ <b>Answered<\/b> · Ship it \(Recommended\)\n<i>via telegram · \d\d:\d\d<\/i>\n\n<blockquote>Go\?<\/blockquote>$/,
+    )
+    await b.done()
+  })
+
+  it("in a topic the session title is left out of the question: the topic names it", async () => {
+    const b = await bridgeRig()
+    b.tg.forum = true
+    await b.ask("frm_1", [yesNoField])
+    const q = b.tg.of("sendMessage")[0].body
+    assert.equal(q.message_thread_id, 9001)
+    assert.doesNotMatch(q.text, /📌/)
+    await b.done()
+  })
+
+  it("keeps the user's own text for a kind they customised, in plain HTML", async () => {
+    const b = await bridgeRig({
+      messages: { question: { title: "{{agent}} <asks>" } },
+    })
+    await b.ask("frm_1", [yesNoField])
+    assert.match(
+      b.tg.of("sendMessage")[0].body.text,
+      /^<b>coord &lt;asks&gt;<\/b>\n\[Fix\]\nGo\?/,
+    )
+    await b.done()
+  })
+
+  it("a title already in brackets is not bracketed again, on ntfy too", async () => {
+    const a = await bridgeRig({}, {}, "[wip] fix")
+    await a.ask("frm_1", [yesNoField])
+    assert.match(a.stub.sent[0].message, /^\[wip\] fix\nGo\?/)
+    await a.done()
+    const b = await bridgeRig({}, {}, "Fix")
+    await b.ask("frm_1", [yesNoField])
+    assert.match(b.stub.sent[0].message, /^\[Fix\]\nGo\?/)
+    await b.done()
+  })
+})
+
+describe("Telegram: closing a question", () => {
+  it("answered in the TUI, the question message itself is edited, in its topic, with no new message", async () => {
+    const b = await bridgeRig()
+    b.tg.forum = true
+    await b.ask("frm_1", [yesNoField])
+    assert.deepEqual(b.store.list()[0].refs, { ntfy: "ntfy1", telegram: "501" })
+    await b.bridge.onEvent({
+      type: "form.replied",
+      data: { id: "frm_1", sessionID: "root" },
+    })
+    const edit = b.tg.of("editMessageText")
+    assert.equal(edit.length, 1)
+    assert.equal(edit[0].body.message_id, 501)
+    assert.match(edit[0].body.text, /^✅ <b>Answered<\/b>\n<i>via TUI · /)
+    assert.deepEqual(edit[0].body.reply_markup, { inline_keyboard: [] })
+    assert.equal(b.tg.of("sendMessage").length, 1, "no follow-up")
+    await b.done()
+  })
+
+  it("when the edit really fails, a follow-up message goes to the same topic", async () => {
+    const b = await bridgeRig()
+    b.tg.forum = true
+    await b.ask("frm_1", [yesNoField])
+    b.tg.fail("editMessageText", 400, {
+      description: "message can't be edited",
+    })
+    await b.bridge.onEvent({
+      type: "form.replied",
+      data: { id: "frm_1", sessionID: "root" },
+    })
+    const sent = b.tg.of("sendMessage")
+    assert.equal(sent.length, 2)
+    assert.equal(sent[1].body.message_thread_id, 9001)
+    assert.match(sent[1].body.text, /Answered/)
+    await b.done()
+  })
+
+  it("answered in the TUI while the message was still being sent: marked once the send lands", async () => {
+    const cfg = parseConfig({
+      channels: {
+        ntfy: { server: "https://ntfy.example", topics: { out: "o", in: "i" } },
+      },
+    }) as Config
+    const stub = stubChannel("ntfy")
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    const send = stub.ch.send
+    stub.ch.send = async (p) => {
+      await gate
+      return send(p)
+    }
+    const router = new Router(cfg, async () => true)
+    router.set("root", true)
+    const bridge = new Bridge(
+      cfg,
+      {
+        session: async () => ({ id: "root", agent: "a", directory: "/w/p" }),
+        root: (id) => id,
+        replyForm: async () => {},
+      },
+      [stub.ch],
+      new PendingStore(),
+      router,
+    )
+    const asking = bridge.onEvent({
+      type: "form.created",
+      data: {
+        form: {
+          id: "frm_1",
+          sessionID: "root",
+          metadata: { kind: "question" },
+          fields: [yesNoField],
+        },
+      },
+    } as BridgeEvent)
+    await sleep(20)
+    await bridge.onEvent(ev("form.replied", { id: "frm_1" }))
+    assert.equal(stub.updates.length, 0)
+    release()
+    await asking
+    assert.equal(stub.updates.length, 1)
+    assert.match(stub.updates[0].message, /Answered in the TUI/)
+  })
+})
+
+describe("Telegram: topic rights", () => {
+  const session = { id: "root", name: "shop · Fix" }
+  const denied = {
+    description: "Bad Request: not enough rights to create a topic",
+  }
+  const notices = (r: Awaited<ReturnType<typeof rig>>) =>
+    r.tg.of("sendMessage").filter((c) => /Manage Topics/.test(c.body.text))
+
+  it("says so once an hour, retries every five minutes, and shows the condition", async () => {
+    const clock = { t: 1_000_000 }
+    const r = await rig({ now: () => clock.t })
+    r.tg.forum = true
+    r.tg.fail("createForumTopic", 400, denied)
+    await r.channel.send({ message: "a", session })
+    assert.equal(notices(r).length, 1)
+    assert.match(
+      notices(r)[0].body.text,
+      /^⚠️ I need the Manage Topics admin right to give each session its own topic\. Posting in General until then\.$/,
+    )
+    assert.equal(
+      r.tg.of("sendMessage").at(-1)!.body.message_thread_id,
+      undefined,
+    )
+    assert.match(r.channel.status().warning ?? "", /Manage Topics/)
+
+    clock.t += 60_000
+    await r.channel.send({ message: "b", session })
+    assert.equal(
+      r.tg.of("createForumTopic").length,
+      1,
+      "not before five minutes",
+    )
+
+    r.tg.fail("createForumTopic", 400, denied)
+    clock.t += 5 * 60_000
+    await r.channel.send({ message: "c", session })
+    assert.equal(r.tg.of("createForumTopic").length, 2)
+    assert.equal(notices(r).length, 1, "no second notice within the hour")
+
+    r.tg.fail("createForumTopic", 400, denied)
+    clock.t += 60 * 60_000
+    await r.channel.send({ message: "d", session })
+    assert.equal(notices(r).length, 2, "again after an hour")
+
+    // The right is granted: the next try works, with no restart.
+    clock.t += 5 * 60_000
+    await r.channel.send({ message: "e", session })
+    assert.equal(r.tg.of("sendMessage").at(-1)!.body.message_thread_id, 9001)
+    assert.equal(r.channel.status().warning, undefined)
+    await r.done()
+  })
+
+  it("an error that is not about rights sends no notice", async () => {
+    const r = await rig()
+    r.tg.forum = true
+    r.tg.fail("createForumTopic", 500)
+    await r.channel.send({ message: "a", session })
+    assert.equal(notices(r).length, 0)
+    assert.equal(r.channel.status().warning, undefined)
+    await r.done()
+  })
+})
+
+describe("Telegram: status card, rename and icons", () => {
+  const state = (over: Record<string, unknown> = {}) => ({
+    id: "ses_abcdef123456",
+    name: "shop · Fix",
+    project: "shop",
+    title: "Fix",
+    agent: "coordinator",
+    model: "opus",
+    state: "working" as const,
+    at: new Date(2026, 0, 1, 14, 2).getTime(),
+    ...over,
+  })
+
+  it("keeps one pinned card per topic and edits it at most every ten seconds", async () => {
+    const clock = { t: 1_000_000 }
+    const r = await rig({ now: () => clock.t })
+    r.tg.forum = true
+    await r.channel.track(state())
+    const card = r.tg.of("sendMessage")[0].body
+    assert.equal(card.message_thread_id, 9001)
+    assert.equal(card.disable_notification, true)
+    assert.match(
+      card.text,
+      /^.+ 🟢 <b>Working<\/b>\n📌 Fix\n🤖 coordinator · opus\n📁 shop\n🆔 <code>123456<\/code>\n🕐 14:02$/,
+    )
+    const pin = r.tg.of("pinChatMessage")[0].body
+    assert.deepEqual(pin, {
+      chat_id: String(CHAT),
+      message_id: 501,
+      disable_notification: true,
+    })
+
+    clock.t += 3000
+    await r.channel.track(
+      state({ state: "idle", at: new Date(2026, 0, 1, 14, 5).getTime() }),
+    )
+    assert.equal(r.tg.of("editMessageText").length, 0, "too soon")
+
+    clock.t += 8000
+    await r.channel.track(
+      state({ state: "idle", at: new Date(2026, 0, 1, 14, 5).getTime() }),
+    )
+    const edit = r.tg.of("editMessageText")
+    assert.equal(edit.length, 1)
+    assert.equal(edit[0].body.message_id, 501)
+    assert.match(edit[0].body.text, /💤 <b>Idle<\/b> since 14:05/)
+    assert.equal(r.tg.of("sendMessage").length, 1, "still one card")
+    assert.equal(r.tg.of("pinChatMessage").length, 1)
+    await r.done()
+  })
+
+  it("remembers the card with the topic across restarts", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "oobb-card-"))
+    const topicsFile = join(dir, "t.json")
+    const a = await rig({ topicsFile })
+    a.tg.forum = true
+    await a.channel.track(state())
+    const saved = JSON.parse(await readFile(topicsFile, "utf8"))
+    assert.equal(saved[`${CHAT}:ses_abcdef123456`].card, 501)
+    assert.equal(saved[`${CHAT}:ses_abcdef123456`].thread, 9001)
+    await a.done()
+
+    const clock = { t: 5_000_000 }
+    const b = await rig({ topicsFile, now: () => clock.t })
+    b.tg.forum = true
+    await b.channel.track(state({ state: "idle" }))
+    assert.equal(b.tg.of("createForumTopic").length, 0)
+    assert.equal(b.tg.of("editMessageText")[0].body.message_id, 501)
+    assert.equal(b.tg.of("sendMessage").length, 0, "no second card")
+    await b.done()
+  })
+
+  it("no card outside a forum, or with statusCard off", async () => {
+    const a = await rig()
+    await a.channel.track(state())
+    assert.equal(a.tg.of("sendMessage").length, 0)
+    await a.done()
+    const b = await rig({ statusCard: false })
+    b.tg.forum = true
+    await b.channel.track(state())
+    assert.equal(b.tg.of("sendMessage").length, 0)
+    await b.done()
+  })
+
+  it("through the bridge: the card replaces 'finished' on Telegram, 'failed' still notifies, ntfy is unchanged", async () => {
+    const clock = { t: Date.now() }
+    const b = await bridgeRig({}, { statusCard: true, now: () => clock.t })
+    b.tg.forum = true
+    await b.bridge.onEvent(ev("session.execution.started"))
+    assert.match(b.tg.of("sendMessage")[0].body.text, /Working/)
+    assert.match(b.tg.of("sendMessage")[0].body.text, /🤖 coord · opus/)
+    await b.bridge.onEvent(ev("session.execution.succeeded"))
+    assert.equal(b.tg.of("sendMessage").length, 1, "no finished message")
+    assert.equal(b.stub.sent.length, 1, "ntfy still says finished")
+
+    clock.t += 11_000
+    await b.bridge.onEvent(ev("session.execution.failed"))
+    const sent = b.tg.of("sendMessage")
+    assert.equal(sent.length, 2)
+    assert.match(sent[1].body.text, /^❌ <b>Failed<\/b> · <i>shop<\/i>/)
+    assert.equal(sent[1].body.disable_notification, false)
+    assert.match(b.tg.of("editMessageText")[0].body.text, /❌ <b>Failed<\/b>/)
+    await b.done()
+  })
+
+  it("notify can switch 'finished' back on, or 'failed' off", async () => {
+    const a = await bridgeRig(
+      {},
+      { statusCard: true, notify: { finished: true } },
+    )
+    a.tg.forum = true
+    await a.bridge.onEvent(ev("session.execution.succeeded"))
+    assert.match(
+      a.tg
+        .of("sendMessage")
+        .map((c) => c.body.text)
+        .join("\n"),
+      /Finished/,
+    )
+    await a.done()
+    const b = await bridgeRig({}, { notify: { failed: false } })
+    await b.bridge.onEvent(ev("session.execution.failed"))
+    assert.equal(b.tg.of("sendMessage").length, 0)
+    assert.equal(b.stub.sent.length, 1)
+    await b.done()
+  })
+
+  it("renames the topic when the session is renamed, at most once a minute, and edits the card", async () => {
+    const clock = { t: 1_000_000 }
+    const b = await bridgeRig({}, { statusCard: true, now: () => clock.t })
+    b.tg.forum = true
+    await b.bridge.onEvent(ev("session.execution.started"))
+    await b.bridge.onEvent(ev("session.renamed", { title: "Plan the move" }))
+    const first = b.tg.of("editForumTopic")
+    assert.equal(first.length, 1)
+    assert.equal(first[0].body.message_thread_id, 9001)
+    assert.equal(first[0].body.name, "shop · Plan the move")
+
+    clock.t += 20_000
+    await b.bridge.onEvent(
+      ev("session.renamed", { title: "Plan the move, v2" }),
+    )
+    assert.equal(b.tg.of("editForumTopic").length, 1, "too soon")
+    clock.t += 41_000
+    await b.bridge.onEvent(
+      ev("session.renamed", { title: "Plan the move, v2" }),
+    )
+    assert.equal(
+      b.tg.of("editForumTopic")[1].body.name,
+      "shop · Plan the move, v2",
+    )
+    assert.match(
+      b.tg.of("editMessageText").at(-1)!.body.text,
+      /📌 Plan the move, v2/,
+    )
+    await b.done()
+  })
+
+  const topicBody = (r: Awaited<ReturnType<typeof rig>>) =>
+    r.tg.of("createForumTopic")[0].body
+
+  it("picks the same icon and color for the same session every time, and one project's sessions stay in a family", async () => {
+    const pick = async (id: string, project = "shop") => {
+      const r = await rig()
+      r.tg.forum = true
+      await r.channel.send({
+        message: "m",
+        session: { id, name: `${project} · x`, project },
+      })
+      const body = topicBody(r)
+      await r.done()
+      return body
+    }
+    const a1 = await pick("s1")
+    const a2 = await pick("s1")
+    assert.equal(a1.icon_custom_emoji_id, a2.icon_custom_emoji_id)
+    assert.equal(a1.icon_color, a2.icon_color)
+    assert.ok(
+      [7322096, 16766590, 13338331, 9367192, 16749490, 16478047].includes(
+        a1.icon_color,
+      ),
+    )
+    const base = hash("shop")
+    const near = new Set([0, 1, 2, 3].map((i) => `e${(base + i) % 12}`))
+    for (const id of ["s1", "s2", "s3", "s4", "s5", "s6"]) {
+      const b = await pick(id)
+      assert.ok(near.has(b.icon_custom_emoji_id), `${id} within the family`)
+      assert.equal(b.icon_color, a1.icon_color, "color follows the project")
+    }
+  })
+
+  it("a configured emoji wins: by agent regex, or by project glob", async () => {
+    const r = await rig({ icons: { "^coord": "🎯", "api*": "🛠" } })
+    r.tg.forum = true
+    await r.channel.send({
+      message: "m",
+      session: {
+        id: "a",
+        name: "shop · x",
+        project: "shop",
+        agent: "coordinator",
+      },
+    })
+    await r.channel.send({
+      message: "m",
+      session: { id: "b", name: "api · x", project: "api", agent: "builder" },
+    })
+    const [x, y] = r.tg.of("createForumTopic")
+    assert.equal(x.body.icon_custom_emoji_id, "e0", "🎯")
+    assert.equal(y.body.icon_custom_emoji_id, "e1", "🛠")
+    await r.done()
+  })
+
+  it("falls back to the color alone when the icon list cannot be had", async () => {
+    const r = await rig()
+    r.tg.forum = true
+    r.tg.fail("getForumTopicIconStickers", 500)
+    const ref = await r.channel.send({
+      message: "m",
+      session: { id: "a", name: "shop · x", project: "shop" },
+    })
+    assert.ok(ref)
+    const body = topicBody(r)
+    assert.equal(body.icon_custom_emoji_id, undefined)
+    assert.equal(typeof body.icon_color, "number")
+    await r.done()
+  })
+
+  it("the status card starts with the topic's emoji", async () => {
+    const r = await rig({ icons: { "^coord": "🎯" } })
+    r.tg.forum = true
+    await r.channel.track(state())
+    assert.match(r.tg.of("sendMessage")[0].body.text, /^🎯 🟢/)
+    await r.done()
+  })
+
+  it("changes the topic's icon when the configured pick changes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "oobb-icon-"))
+    const topicsFile = join(dir, "t.json")
+    const a = await rig({ topicsFile, statusCard: false })
+    a.tg.forum = true
+    await a.channel.track(state())
+    const first = topicBody(a).icon_custom_emoji_id
+    await a.done()
+
+    const b = await rig({
+      topicsFile,
+      statusCard: false,
+      icons: { "^coord": first === "e2" ? "🛠" : "🔥" },
+    })
+    b.tg.forum = true
+    await b.channel.track(state())
+    const edit = b.tg.of("editForumTopic")
+    assert.equal(edit.length, 1)
+    assert.equal(edit[0].body.message_thread_id, 9001)
+    assert.equal(edit[0].body.name, undefined, "only the icon changed")
+    assert.notEqual(edit[0].body.icon_custom_emoji_id, first)
+    await b.done()
   })
 })

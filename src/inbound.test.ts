@@ -60,6 +60,26 @@ describe("resolveAnswer", () => {
     )
   })
 
+  it("a literal answer is text even when it looks like an option number", () => {
+    assert.deepEqual(
+      resolveAnswer([q()], { id: "x", text: "2", literal: true }),
+      {
+        q0: "2",
+      },
+    )
+    assert.deepEqual(resolveAnswer([q()], { id: "x", text: "2" }), {
+      q0: "No",
+    })
+    assert.equal(
+      resolveAnswer([q({ custom: false })], {
+        id: "x",
+        text: "2",
+        literal: true,
+      }),
+      undefined,
+    )
+  })
+
   it("handles multiselect and several questions", () => {
     assert.deepEqual(
       resolveAnswer([q({ multiple: true })], { id: "x", text: "1, 3" }),
