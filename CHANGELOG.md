@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.12.0...v0.12.1) (2026-11-20)
+
+
+### Bug Fixes
+
+* **telegram:** keep the topic name plain, show the watch state on the card's first line ([#34](https://github.com/mrmm-labs/opencode-oob-bridge/issues/34)) ([55287f3](https://github.com/mrmm-labs/opencode-oob-bridge/commit/55287f36cddbb8a823858116830959c2b1f881da))
+
 ## [0.12.0](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.11.0...v0.12.0) (2026-11-20)
 
 
