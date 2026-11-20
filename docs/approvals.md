@@ -16,6 +16,7 @@ Goals:
   the machine itself for the highest.
 - A caller can verify that an answer came from the bridge and not from a process that wrote to its
   socket.
+- Where a request goes first, the phone or the machine, follows an explicit presence mode: AFK or present (section 3.1).
 
 Non-goals:
 
@@ -24,7 +25,7 @@ Non-goals:
   the caller decides what to do with the answer.
 - Unlocking anything. A phone approval only works while the calling tool already holds what it
   needs (for example an unlocked session). If it does not, the caller still needs the machine.
-- Storing a master password or any credential in the bridge.
+- Storing a master password or any credential that belongs to a caller. The bridge keeps only its own signing key and its TOTP seed, in the macOS Keychain (section 7.3).
 - A network listener. The endpoint is a local unix socket.
 
 The README line "Never route production approvals through this plugin" describes the plugin
@@ -57,6 +58,29 @@ phone, and at which level (section 6). The default configuration approves nothin
   machine") with no buttons.
 - The **level used** is part of the answer. Callers must record it as such and never as the
   stronger local method (a phone approval is never recorded as a biometric one).
+- L2 is the highest level a phone can reach. The operator may assign it to writes and to production-class actions.
+
+### 3.1 Presence: AFK mode
+
+The bridge keeps an explicit **presence mode**. It decides which path a caller tries first.
+
+| Mode | Meaning | The caller asks |
+| --- | --- | --- |
+| `afk` | The operator is away from the machine | The phone first. The machine only after the request expires, or never: the caller's `afk_fallback` setting is `local` (default) or `none` |
+| `present` | The operator is at the machine | The machine first (biometric or attended prompt). No phone prompt: the bridge refuses a request with `409 needs_local` and `reason: present` |
+
+- **Switching.** `/oob afk on|off|auto` in the TUI. `auto` is the default and uses the away rule: AFK after
+  `away.minutes` without a prompt typed in any window, present again at the next typed prompt. `on` and `off`
+  hold until changed. The mode is a runtime setting in `settings.json` and holds no secret.
+- **Only from the TUI.** Nothing sent from a channel and nothing on the socket can change the mode.
+- **Shown** in the sidebar and on the pinned status card of each topic.
+- **Callers read it** from `GET /v1/status` before choosing an order. The bridge also stamps the mode on every
+  request, copies it into the answer, and callers record it in their audit.
+- **Switching to present withdraws pending requests** (`reason_code: present`). The caller moves to its local path
+  at once, so a phone prompt and a machine prompt are never open together.
+- **No bridge, no AFK.** A caller that cannot reach the bridge behaves as in `present`.
+- **AFK lowers no level.** An L3 class stays machine-only in both modes.
+- The away rule counts input from every window, not one (section 4.3).
 
 ## 4. Endpoint
 
@@ -73,7 +97,7 @@ A local HTTP/1.1 server on a unix socket:
 | `GET /v1/approvals/{id}/events` | Server-sent events. `pending`, then one terminal `answer` event. Supports `Last-Event-ID`. |
 | `GET /v1/approvals/{id}?wait=<seconds>` | Long-poll alternative. Returns the request, with the answer once decided. |
 | `DELETE /v1/approvals/{id}` | The caller withdraws a pending request. The chat message is edited to say so. |
-| `GET /v1/status` | Which channels are paired and up, and which levels they can currently reach. Lets a caller skip straight to its local path. |
+| `GET /v1/status` | Which channels are paired and up, which levels they can currently reach, and the presence mode (`afk` or `present`). Lets a caller pick its order and skip straight to its local path. |
 
 Errors are JSON `{ "error": "<code>", "retryable": <bool> }`. Codes: `unauthenticated`,
 `forbidden_class`, `needs_local`, `not_paired`, `rate_limited`, `cooldown`,
@@ -91,6 +115,7 @@ Errors are JSON `{ "error": "<code>", "retryable": <bool> }`. Codes: `unauthenti
 | `reason` | string | Why the caller wants it. At most 300 characters. |
 | `ttl` | seconds | Default 120. The bridge caps it per class (default maximum 600). |
 | `required_level` | 1 or 2 or 3 | Optional. The effective level is the larger of this and the class minimum. |
+| `mode` | `afk` or `present` | Set by the bridge, never by the caller: the mode when the request was created. A request in `present` mode is refused (`needs_local`, `reason: present`). Copied into the answer. |
 
 The bridge masks anything in `scope_summary`, `reason` and `requester` that matches its secret
 filter before it reaches a channel or a log, and escapes markup. The caller is still responsible for
@@ -105,10 +130,31 @@ not sending secret values: the filter is a net, not a contract.
 | `approver` | The operator's Telegram user id, or `ntfy:<topic>` / `bridge` where no person is identified (see 5.3). |
 | `level` | The level actually used: `0` when the bridge decided alone (expiry, cooldown), otherwise 1 or 2. |
 | `decided_at` | RFC 3339 UTC, millisecond precision. |
+| `mode` | The mode the request was created in. Signed. |
 | `channel` | `{ type, message_ref }`, for example the Telegram chat and message id. |
-| `reason_code` | Optional: `timeout`, `cooldown`, `bad_code`, `withdrawn`, `bridge_restart`. |
+| `reason_code` | Optional: `timeout`, `cooldown`, `bad_code`, `withdrawn`, `present`, `bridge_restart`. |
 | `kid` | Identifier of the signing key. |
 | `sig` | Signature, see section 7. |
+
+### 4.3 Who owns the socket
+
+The first OpenCode window whose plugin starts owns the bot and the socket. Every other window is a client.
+
+- **Election.** An exclusive lock on `owner.lock` in the state directory. The holder binds `approvals.sock` and is
+  the only reader of the bot's updates. The other windows connect to that socket and report their last typed
+  input, which the away rule needs.
+- **Hand-over.** The lock is released when the owner exits, and by the OS if it crashes. Clients retry every two
+  seconds. The first to take the lock removes the stale socket, binds, loads the idempotency store and resumes
+  reading updates from the stored offset (kept in the state directory, so none are lost or replayed).
+- **Pending requests** at a hand-over expire with `reason_code: bridge_restart`. Callers retry with the same
+  idempotency key.
+- **Consequence: no phone approvals while OpenCode is closed.** With no window there is no owner and no socket.
+  Callers behave as in `present` and use the machine. A server without a TUI (`opencode serve`) has no plugin
+  either.
+- **Deferred.** A standalone daemon that owns the bot and socket independently of any window, for headless
+  callers, is a future option. This spec does not cover it.
+- **Not decided here.** Whether questions and pushes from the other windows also go through the owner. Approvals
+  and the away rule across windows need one owner either way.
 
 ## 5. Flow and rules
 
@@ -121,6 +167,7 @@ POST ──> pending ──┬─ Approve (L1) ───────────
                    ├─ wrong code x3 ─────────────────> denied   (reason_code bad_code)
                    ├─ ttl elapsed ───────────────────> expired
                    └─ DELETE ────────────────────────> withdrawn
+                   └─ AFK -> present ────────────────> withdrawn (reason_code present)
 ```
 
 A decided request never changes. The bridge keeps pending requests in memory: a restart expires them
@@ -143,7 +190,7 @@ with `reason_code: bridge_restart`, and the caller may retry with the same idemp
 - **Redaction.** Messages and bridge logs use the same redaction as every other push.
 - **Audit stays with the caller.** The bridge logs request id, caller, class, decision and level, with
   masked text, to its own log. The authoritative record is the caller's (hash-chained where the
-  caller has such a log). It must include the level used and the answer's `sig` or its hash.
+  caller has such a log). It must include the level used, the mode, and the answer's `sig` or its hash.
 
 ### 5.3 Channels
 
@@ -175,10 +222,7 @@ required level, the request fails fast with `unavailable` and does not wait for 
 
 The code is a standard TOTP (RFC 6238, SHA-1, 6 digits, 30 s step, one step of tolerance). Each time
 step is accepted at most once, so a code seen by someone cannot be replayed. Three wrong codes deny
-the request. The seed is enrolled from the TUI (`/oob approvals totp`, a QR code shown in the
-terminal only), and read through the same secret-reference mechanism as the bot token. It is never
-written to `settings.json` and never sent over a channel. L2 requires a seed to be enrolled; without
-one, L2 classes fail with `unavailable`.
+the request. The seed is enrolled from the TUI (`/oob approvals totp`, a QR code shown in the terminal only) and stored in the macOS Keychain (section 7.3). It is never written to a file or to `settings.json`, and never sent over a channel. L2 requires a seed to be enrolled; without one, L2 classes fail with `unavailable`.
 
 ## 6. Configuration
 
@@ -221,16 +265,11 @@ X-Caller-Mac: hex( HMAC-SHA256(caller_key, METHOD "\n" PATH "\n" ts "\n" sha256(
 ```
 
 The bridge rejects a timestamp more than 60 seconds off, and an unknown caller. The class list of
-section 6 then limits what the caller can ask for. A caller key is created at pairing:
-`/oob approvals pair-caller <name>` writes `callers/<name>.json` (mode `0600`) containing the caller
-key, the bridge's public key and the key id, for the caller to read. Revoking a caller deletes its entry.
+section 6 then limits what the caller can ask for. A caller key is created at pairing: `/oob approvals pair-caller <name>` writes `callers/<name>.json` (mode `0600`) with the caller key, the bridge's **public** key and the key id. The caller key is a request credential only. Anyone who holds it can ask, which is harmless, but it cannot make an answer the caller accepts (7.2), so it may live in a file. Revoking a caller deletes its entry.
 
 ### 7.2 Bridge to caller
 
-The answer is signed so that a caller can tell it came from the bridge. The default algorithm is
-**Ed25519**: the bridge keeps the private key, callers hold only the public key, so a leaked caller
-configuration cannot forge an approval. `hmac-sha256` with a shared key is allowed for callers that
-cannot verify Ed25519, and is weaker for that reason (a caller's key can mint answers).
+The answer is signed so that a caller can tell it came from the bridge. The algorithm is **Ed25519**: the bridge keeps the private key in the Keychain (7.3) and callers hold only the public key, so nothing a caller can read lets it forge an approval. There is no shared-key mode: a key the caller can read is a key an agent running as the same user can read.
 
 The signed string, UTF-8, fields joined by newline:
 
@@ -240,6 +279,7 @@ oob-approval-v1
 <request_hash>
 <decision>
 <level>
+<mode>
 <approver>
 <decided_at>
 ```
@@ -247,9 +287,36 @@ oob-approval-v1
 `request_hash` is the SHA-256 of the canonical JSON of the stored request (sorted keys, no spaces).
 A caller verifies, in order: signature with the key named by `kid`; `id` is one it created;
 `request_hash` matches its own copy of the request; `decided_at` lies between its send time and
-now (with the skew allowance); `level` is at least what it required for that class; the id is not
+now (with the skew allowance); `level` is at least what it required for that class; `mode` is `afk`; the id is not
 already spent. Any failure is a refusal, logged. Keys rotate by `kid`; both are accepted during an
 overlap the operator sets.
+
+### 7.3 Key storage
+
+The bridge's Ed25519 signing key and the TOTP seed are stored in the **macOS Keychain**. Neither is ever a file.
+
+- **Access rule.** The items' access list names only the host executable that runs the plugin (the OpenCode
+  binary). It never says "allow all applications". Any other process that asks gets a Keychain prompt on the Mac
+  or is refused. An unexpected prompt means something tried to read the item.
+- **User presence.** Required to create, replace or delete an item and to change its access rule. It is not
+  required on each use: use happens while the operator is AFK, and a biometric prompt per signature would make a
+  phone approval impossible.
+- **Public key.** Exported to callers at pairing. It is not a secret.
+- **In memory.** The private key and the seed are read when needed and held only for the signature or the code
+  check.
+- **Rotation and loss.** Losing an item means a new key id, re-pairing each caller, and re-enrolling the TOTP
+  seed.
+
+Limits to state plainly:
+
+- The trust unit is the host executable. Code running inside it, such as another plugin, can read the items.
+- Reinstalling or upgrading the host changes its code identity. macOS may ask again to allow it; allow it at
+  the Mac.
+- The items must be created and read through the Security framework from the host process. The `security`
+  command cannot be used: the access rule would then trust `security`, which any process can run, and a secret
+  passed to it appears in the process list. Whether the plugin runtime can call the Security framework is not yet
+  verified and is the first thing to check (section 10).
+- macOS only. Elsewhere approvals report `unavailable` until an equivalent store exists.
 
 ## 8. Threat model
 
@@ -261,7 +328,9 @@ overlap the operator sets.
 | **Leaked bot token** | Attacker can read what the bot sends and can send as the bot, but cannot make Telegram report a tap as the operator's user id | Callback data carries a request id and nonce. The user id comes from Telegram, not from our message | They can read redacted summaries, and can deny by spamming. Rotate the token |
 | **Replay** of an answer or a tap | Reuse for another action | Single use per id, request hash in the signature, one-time ntfy tokens, TOTP step used once, ttl | A caller that does not record spent ids is on its own |
 | **Malicious local process calls the socket** | Asks the operator to approve something misleading, or floods | Socket perms, per-caller key, class allowlist per caller, rate limit, cooldown, a visible requester line | A process running as the same user can read caller keys. This boundary is the user account |
-| **Forged answer to a caller** (a process pretends to be the bridge) | Caller believes it was approved | Signature over the request hash, verified with a public key the process cannot use to sign | A process that can read the bridge's private key (same user) can sign. Store it behind a key store |
+| **Forged answer to a caller** (a process pretends to be the bridge) | Caller believes it was approved | Signature over the request hash, verified with a public key the process cannot use to sign. The private key is in the Keychain, readable only by the host binary | Code inside the host process (another plugin) can sign |
+| **Another process reads the Keychain items** | It could sign answers or compute codes | The access rule admits only the host binary; any other process prompts or is refused | Code inside the host process, and anything the operator allows at a prompt |
+| **Presence mode forced to AFK** | A process makes the phone the first path | The mode cannot be changed from a channel or the socket; auto mode needs idle input; AFK lowers no level | An idle operator at the Mac gets a phone prompt instead of a local one |
 | **Misleading request text** | Operator approves the wrong thing | The caller writes the summary, but the message states the caller, session, class and level, and the text is plain, redacted and length-capped | Operators still have to read it |
 | **Telegram reads the chat** | Metadata and summaries are visible to Telegram | Summaries carry identifiers only, never values | Telegram is not end-to-end encrypted for bots |
 
@@ -270,7 +339,7 @@ overlap the operator sets.
 It protects against someone who can tap but does not hold the second factor: a session hijack, a
 leaked bot token, a bystander with the unlocked phone if the seed is elsewhere, and an accidental tap.
 It does not protect against someone who has both the chat and the seed, or against a compromise of the
-machine, where the seed reference and caller keys can be read.
+machine, where code in the host process can read the seed from the Keychain.
 
 ## 9. MCP elicitation
 
@@ -293,7 +362,7 @@ good L3 path (the operator is at the screen). The endpoint is still needed becau
 
 | Step | Work | Estimate |
 | --- | --- | --- |
-| 1 | Endpoint, Telegram L1 and L2, signing, caller pairing, first caller: a local secrets tool | 1.5 days |
+| 1 | First check that the host process can call the Security framework (7.3). Then owner election, AFK mode, Keychain keys, endpoint, Telegram L1 and L2, signing, caller pairing, first caller: a local secrets tool | 1.5 days (estimate before AFK mode and owner hand-over, which add to it) |
 | 2 | Command line resolver for a task-runner's blocked items, using `--via-oob` | 0.5 day |
 | 3 | A workflow engine adopts the contract for its own escalations | later |
 
@@ -302,14 +371,6 @@ Each step ships behind `approvals.enabled`, with fixtures for the signature and 
 
 ## 11. Open questions
 
-1. **Who owns the socket?** The bridge runs inside each TUI process, and only one process can bind the
-   socket (and read the bot's updates). Is the first TUI the owner, with a takeover when it exits, or
-   does the service move to a small standalone daemon? With no TUI running there is no bridge at all,
-   so L1 and L2 are unavailable and callers fall back to the machine.
-2. **Where does the TOTP seed live?** A different device from the phone with Telegram is what makes
-   L2 meaningful. Is that required at enrollment, or only advised?
-3. **Ed25519 as the default**, with the signed string extended by `request_hash` and `approver`:
-   acceptable, or HMAC only?
-4. **Should ntfy offer L1 at all**, given it identifies nobody? The default class config excludes it.
-5. **Mirror elicitation forms to the phone** through the existing question path? Needs a test of what
+1. **Should ntfy offer L1 at all**, given it identifies nobody? The default class config excludes it.
+2. **Mirror MCP elicitation forms to the phone** through the existing question path? It needs a test of what
    the plugin API exposes for them.
