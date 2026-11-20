@@ -1,147 +1,319 @@
 /**
- * The OOB block in the session sidebar: what it shows (a pure function of the
- * session's state), what a click does, and the claim of the sidebar slot. Drawing
- * is passed in as `view`, so this file needs no UI toolkit: `sidebar.tsx` draws.
+ * The OOB block at the top of the session sidebar: what it shows (a pure
+ * function of the session's state), the dialog each row opens, what a pick does,
+ * and the claim of the sidebar slot. Drawing is passed in as `view`, so this file
+ * needs no UI toolkit: `sidebar.tsx` draws.
  */
 import type { Plugin } from "@opencode/plugin/tui"
 
-import type { Delivery } from "./config.ts"
-import { applyRouting, type App } from "./menu.ts"
+import type { Delivery, SidebarMode } from "./config.ts"
+import { applyRouting, runCommand, sidebarMode, type App } from "./menu.ts"
+import type { Pending } from "./pending.ts"
 
 type Context = Plugin.Context
 
-export type Action = "route" | "chat" | "delivery"
+export type RowId = "notify" | "chat" | "replies" | "waiting"
 export type Tone = "normal" | "muted" | "ok" | "warn"
-export type Part = { text: string; action?: Action; tone: Tone }
-export type Line = { id: "route" | "chat" | "prompts"; parts: Part[] }
+export type Part = { text: string; tone: Tone }
+export type Row = { id: RowId; label: string; value: string; tone: Tone }
+
+export type SidebarModel =
+  | { mode: "off" }
+  | { mode: "compact"; parts: Part[] }
+  | { mode: "full"; title: string; channel: string; rows: Row[] }
+
+export type PendingItem = Pick<
+  Pending,
+  "id" | "kind" | "title" | "sessionID" | "askedAt"
+>
 
 export type SidebarState = {
   mode: "on" | "off" | "auto"
+  /** The channel the session mirrors through: its own choice, or the default. */
   channel: string
+  /** The session's own choice of channel, if it made one. */
+  via?: string
+  /** Ids of the channels of the plugin, for the routing choices. */
+  channels: string[]
+  /** `all`, or a channel, for a session that chose none. */
+  defaultChannel: string
   chat: boolean
   /** Why `chat.deny` blocks chat, when it does. */
   blocked?: string
-  /** Whether some enabled channel can carry a chat at all. */
+  /** Whether some selected channel can carry a chat at all. */
   chatCapable: boolean
   delivery: Delivery
   /** The session's delivery differs from `chat.delivery`. */
   override: boolean
-  open: number
+  defaultDelivery: Delivery
+  /** Minutes without input after which `when away` pushes. */
+  awayMinutes: number
+  pending: PendingItem[]
+  now: number
 }
 
 export type Outcome = { ok: boolean; text: string }
 
-export const TITLE = "OOB"
+export type Choice = {
+  title: string
+  value: string
+  description?: string
+  disabled?: boolean
+}
+export type DialogSpec = { title: string; options: Choice[]; current?: string }
+
+export const TITLE = "OOB - Remote access"
 
 export function sidebarState(app: App, root: string): SidebarState {
   const b = app.bridge
   return {
     mode: app.router.mode(root),
     channel: b.channelOf(root),
+    via: app.router.channel(root),
+    channels: b.connectors().map((c) => c.id),
+    defaultChannel: b.defaultChannel(),
     chat: b.chatEnabled(root),
     blocked: b.chatBlocked(root),
     chatCapable: b.canChat(root),
     delivery: b.delivery(root),
     override: b.deliveryOverride(root) !== undefined,
-    open: b.openPrompts(root),
+    defaultDelivery: b.defaultDelivery(),
+    awayMinutes: b.awayMinutes(),
+    pending: b.openPromptList(root),
+    now: Date.now(),
   }
 }
 
-const ON_OFF: Record<SidebarState["mode"], Tone> = {
+const MODE_TONE: Record<SidebarState["mode"], Tone> = {
   on: "ok",
   off: "muted",
   auto: "normal",
 }
 
-/** At most three lines: routing, chat and delivery, and open prompts when there are any. */
-export function sidebarLines(s: SidebarState): Line[] {
-  const lines: Line[] = [
-    {
-      id: "route",
-      parts: [
-        {
-          text: `📡 ${s.mode === "off" ? "off" : `${s.channel} · ${s.mode}`}`,
-          action: "route",
-          tone: ON_OFF[s.mode],
-        },
-      ],
-    },
-  ]
-  if (s.chatCapable) {
-    const chat: Part = s.blocked
-      ? { text: "💬 chat: denied", action: "chat", tone: "warn" }
-      : {
-          text: `💬 chat: ${s.chat ? "on" : "off"}`,
-          action: "chat",
-          tone: s.chat ? "ok" : "muted",
-        }
-    lines.push({
-      id: "chat",
-      parts: s.blocked
-        ? [chat]
-        : [
-            chat,
-            {
-              text: ` · ${s.delivery}${s.override ? "*" : ""}`,
-              action: "delivery",
-              tone: s.delivery === "steer" ? "warn" : "normal",
-            },
-          ],
-    })
-  }
-  if (s.open > 0)
-    lines.push({
-      id: "prompts",
-      parts: [
-        {
-          text: `⏳ ${s.open} open prompt${s.open === 1 ? "" : "s"}`,
-          tone: "warn",
-        },
-      ],
-    })
-  return lines
+/** Whether the session's questions and notices are pushed. */
+const notifyValue = (s: SidebarState) =>
+  s.mode === "auto" ? "when away" : s.mode
+
+const chatValue = (s: SidebarState) =>
+  s.blocked ? "denied" : s.chat ? "on" : "off"
+
+const chatTone = (s: SidebarState): Tone =>
+  s.blocked ? "warn" : s.chat ? "ok" : "muted"
+
+const repliesValue = (d: Delivery) =>
+  d === "steer" ? "immediately" : "after turn"
+
+const waitingValue = (s: SidebarState) => {
+  const n = s.pending.length
+  const word = s.pending.every((p) => p.kind === "question")
+    ? "question"
+    : "request"
+  return `${n} ${word}${n === 1 ? "" : "s"}`
 }
 
-const NEXT_MODE = { auto: "on", on: "off", off: "auto" } as const
+/** Notify, then Chat and Replies when a channel can chat, then Waiting when something waits. */
+export function sidebarRows(s: SidebarState): Row[] {
+  const rows: Row[] = [
+    {
+      id: "notify",
+      label: "Notify",
+      value: notifyValue(s),
+      tone: MODE_TONE[s.mode],
+    },
+  ]
+  if (s.chatCapable)
+    rows.push(
+      { id: "chat", label: "Chat", value: chatValue(s), tone: chatTone(s) },
+      {
+        id: "replies",
+        label: "Replies",
+        value: repliesValue(s.delivery),
+        tone: "normal",
+      },
+    )
+  if (s.pending.length > 0)
+    rows.push({
+      id: "waiting",
+      label: "Waiting",
+      value: waitingValue(s),
+      tone: "warn",
+    })
+  return rows
+}
 
-/** What a click on a line does. The result is shown as a toast. */
-export async function activate(
+/** The same facts on one line: `OOB - Remote · telegram · notify on · chat on ▾`. */
+export function compactParts(s: SidebarState): Part[] {
+  const dot: Part = { text: " · ", tone: "muted" }
+  const parts: Part[] = [
+    { text: "OOB - Remote", tone: "muted" },
+    dot,
+    { text: s.channel, tone: "normal" },
+    dot,
+    { text: `notify ${notifyValue(s)}`, tone: MODE_TONE[s.mode] },
+  ]
+  if (s.chatCapable)
+    parts.push(dot, { text: `chat ${chatValue(s)}`, tone: chatTone(s) })
+  if (s.pending.length > 0)
+    parts.push(dot, { text: `${s.pending.length} waiting`, tone: "warn" })
+  parts.push({ text: " ▾", tone: "muted" })
+  return parts
+}
+
+export function sidebarModel(s: SidebarState, mode: SidebarMode): SidebarModel {
+  if (mode === "off") return { mode }
+  if (mode === "compact") return { mode, parts: compactParts(s) }
+  return { mode, title: TITLE, channel: s.channel, rows: sidebarRows(s) }
+}
+
+const age = (ms: number) => {
+  const m = Math.max(0, Math.round(ms / 60_000))
+  return m < 1
+    ? "just now"
+    : m < 60
+      ? `${m} min ago`
+      : `${Math.round(m / 60)} h ago`
+}
+
+const short = (text: string, max: number) =>
+  text.length > max ? `${text.slice(0, max - 1)}…` : text
+
+/** Every option of a row, in plain words, with the current one named. */
+export function rowDialog(s: SidebarState, row: RowId): DialogSpec {
+  if (row === "notify")
+    return {
+      title: "Notify about this session",
+      current: s.mode === "on" && s.via ? `on:${s.via}` : s.mode,
+      options: [
+        {
+          title: "On — push questions and notices now",
+          value: "on",
+          description: `through ${s.defaultChannel}`,
+        },
+        ...s.channels.map((id) => ({
+          title: `On via ${id} — push now, only through ${id}`,
+          value: `on:${id}`,
+        })),
+        ...(s.channels.length > 1
+          ? [
+              {
+                title: "On via all — push now, through every channel",
+                value: "on:all",
+              },
+            ]
+          : []),
+        {
+          title: `When away — after ${s.awayMinutes} min without input`,
+          value: "auto",
+          description: "and only for sessions the rules pick",
+        },
+        { title: "Off — never push this session", value: "off" },
+      ],
+    }
+  if (row === "chat")
+    return {
+      title: s.blocked
+        ? "Chat is blocked for this session"
+        : "Write to this session from the channel",
+      current: s.chat ? "on" : "off",
+      options: [
+        {
+          title: "On — messages you send in its topic reach the session",
+          value: "on",
+          disabled: s.blocked !== undefined,
+          description: s.blocked
+            ? `Blocked by chat.deny in the config (${s.blocked})`
+            : undefined,
+        },
+        { title: "Off — take no messages", value: "off" },
+      ],
+    }
+  if (row === "replies")
+    return {
+      title: "How your messages arrive",
+      current: s.override ? s.delivery : "default",
+      options: [
+        {
+          title: "Immediately — join the running turn",
+          value: "steer",
+        },
+        {
+          title: "After turn — wait for the current turn to finish",
+          value: "queue",
+        },
+        {
+          title: `Default — follow the config (${repliesValue(s.defaultDelivery)})`,
+          value: "default",
+        },
+      ],
+    }
+  return {
+    title: "Open questions: pick one to go to its session",
+    options: s.pending.map((p) => ({
+      title: short(`${p.kind}: ${p.title}`, 60),
+      value: p.id,
+      description: age(s.now - p.askedAt),
+    })),
+  }
+}
+
+/** What a pick does. `go` moves the TUI to a session and says whether it could. */
+export async function applyPick(
   app: App,
   root: string,
-  action: Action,
+  row: RowId,
+  value: string,
+  go: (sessionID: string) => boolean,
 ): Promise<Outcome> {
   const b = app.bridge
-  if (action === "route") {
-    const next = NEXT_MODE[app.router.mode(root)]
-    applyRouting(app, root, next, app.router.channel(root))
+  if (row === "notify") {
+    const [mode, channel] = value.split(":") as [string, string | undefined]
+    if (mode !== "on" && mode !== "off" && mode !== "auto")
+      return { ok: false, text: "Unknown choice." }
+    if (
+      channel !== undefined &&
+      channel !== "all" &&
+      !b.connectors().some((c) => c.id === channel)
+    )
+      return { ok: false, text: `No channel "${channel}".` }
+    applyRouting(app, root, mode, channel)
     return {
       ok: true,
       text:
-        next === "on"
-          ? `Routing on via ${b.channelOf(root)}`
-          : `Routing ${next}`,
+        mode === "on"
+          ? `Notify on via ${b.channelOf(root)}`
+          : mode === "auto"
+            ? "Notify when away"
+            : "Notify off",
     }
   }
-  if (action === "chat") return b.setChat(root, !b.chatEnabled(root))
-  const next: Delivery = b.delivery(root) === "queue" ? "steer" : "queue"
-  // Back at the configured default, the session needs no override.
-  b.setDelivery(root, next === b.defaultDelivery() ? undefined : next)
-  return {
-    ok: true,
-    text:
-      next === "steer"
-        ? "Delivery: steer. Messages from a chat are injected into the running turn."
-        : "Delivery: queue. Messages from a chat wait for the turn to end.",
+  if (row === "chat") {
+    if (value !== "on" && value !== "off")
+      return { ok: false, text: "Unknown choice." }
+    return b.setChat(root, value === "on")
   }
+  if (row === "replies") {
+    if (value !== "queue" && value !== "steer" && value !== "default")
+      return { ok: false, text: "Unknown choice." }
+    b.setDelivery(root, value === "default" ? undefined : value)
+    return { ok: true, text: `Replies: ${repliesValue(b.delivery(root))}` }
+  }
+  const p = b.openPromptList(root).find((x) => x.id === value)
+  if (!p) return { ok: false, text: "That prompt is no longer open." }
+  return go(p.sessionID)
+    ? { ok: true, text: "Opened the session." }
+    : { ok: false, text: "That session cannot be opened from here." }
 }
 
 /** What a drawing function is given for one sidebar. */
 export type SidebarView = (p: {
-  /** Re-read on every change: the lines to draw. */
-  lines: () => Line[]
+  /** Re-read on every change. */
+  model: () => SidebarModel
   /** Calls `fn` on every change; returns the way to stop. */
   subscribe: (fn: () => void) => () => void
-  activate: (a: Action) => void
+  /** A row was clicked: opens its dialog. */
+  open: (row: RowId) => void
+  /** The compact line was clicked: opens `/oob`. */
+  openMenu: () => void
   colors: () => Record<Tone, unknown>
 }) => unknown
 
@@ -161,7 +333,7 @@ export function toneColors(ctx: Context): Record<Tone, unknown> {
 }
 
 /**
- * Claims the end of the session sidebar. Safe to call before the bridge exists:
+ * Claims the top of the session sidebar. Safe to call before the bridge exists:
  * the block stays empty until `attach`.
  */
 export function registerSidebar(
@@ -173,34 +345,59 @@ export function registerSidebar(
   const listeners = new Set<() => void>()
   const emit = () => listeners.forEach((fn) => fn())
   const rootOf = (id: string) => ctx.data.session.root(id) || id
+  const toast = (out: Outcome) =>
+    ctx.ui.toast.show({
+      message: out.text,
+      variant: out.ok ? "success" : "warning",
+    })
+  const failed = () =>
+    ctx.ui.toast.show({
+      message: "That did not work: see the log.",
+      variant: "error",
+    })
+  const go = (id: string) => {
+    if (!ctx.data.session.get(id)) return false
+    ctx.ui.router.navigate({ type: "session", sessionID: id })
+    return true
+  }
 
   const release = ctx.ui.slot({
-    append: "sidebar.content",
+    // First in the sidebar: before the sections other plugins append.
+    prepend: "sidebar.content",
     render: (input) =>
       view({
-        lines: () => {
+        model: () => {
           const root = rootOf(input.sessionID)
-          return app && root ? sidebarLines(sidebarState(app, root)) : []
+          return app && root
+            ? sidebarModel(sidebarState(app, root), sidebarMode(app))
+            : { mode: "off" }
         },
         subscribe: (fn) => {
           listeners.add(fn)
           return () => void listeners.delete(fn)
         },
-        activate: (action) => {
+        open: (row) => {
           const a = app
           if (!a) return
-          void activate(a, rootOf(input.sessionID), action).then(
-            (out) =>
-              ctx.ui.toast.show({
-                message: out.text,
-                variant: out.ok ? "success" : "warning",
-              }),
-            () =>
-              ctx.ui.toast.show({
-                message: "That did not work: see the log.",
-                variant: "error",
-              }),
-          )
+          const root = rootOf(input.sessionID)
+          const spec = rowDialog(sidebarState(a, root), row)
+          if (spec.options.length === 0) return
+          void ctx.ui.dialog
+            .select<string>({
+              title: spec.title,
+              current: spec.current,
+              options: spec.options,
+            })
+            .then((value) =>
+              value === undefined
+                ? undefined
+                : applyPick(a, root, row, value, go).then(toast),
+            )
+            .catch(failed)
+        },
+        openMenu: () => {
+          const a = app
+          if (a) void runCommand(ctx, a).catch(failed)
         },
         colors: () => toneColors(ctx),
       }) as never,

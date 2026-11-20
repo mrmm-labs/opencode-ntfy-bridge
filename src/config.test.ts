@@ -205,6 +205,18 @@ describe("parseConfig channels", () => {
       )
   })
 
+  it("reads sidebar (full by default) and refuses an unknown size", () => {
+    const base = { channels: { telegram: { token: { env: "TG" } } } }
+    assert.equal((parseConfig(base) as Config).sidebar, "full")
+    for (const m of ["full", "compact", "off"])
+      assert.equal((parseConfig({ ...base, sidebar: m }) as Config).sidebar, m)
+    for (const bad of ["big", true, 1])
+      assert.match(
+        (parseConfig({ ...base, sidebar: bad }) as { error: string }).error,
+        /sidebar must be/,
+      )
+  })
+
   it("reads chat.delivery and chat.streamMs (800 at least), and refuses bad ones", () => {
     const base = { channels: { telegram: { token: { env: "TG" } } } }
     const c = parseConfig({

@@ -59,6 +59,7 @@ nothing and opens no connection.**
 | `channels.ntfy`     | none     | The ntfy channel. See [Channels](#channels).                                  |
 | `channels.telegram` | none     | The Telegram channel. See [Channels](#channels).                              |
 | `defaultChannel`    | `all`    | Where pushes go for a session that chose no channel: `all` or a channel name. |
+| `sidebar`           | `full`   | The sidebar section: `full`, `compact` or `off`. See [Sidebar](#sidebar).     |
 | `away.minutes`      | `10`     | Minutes without input in the TUI before matching sessions are mirrored.       |
 | `rules`             | `[]`     | Which sessions are mirrored while you are away. Empty: all.                   |
 | `redact`            | `full`   | `full`, `head:<n>` (first n characters) or `title` (no body at all).          |
@@ -350,27 +351,42 @@ and is subject to `chat.deny`. At most five are started an hour. Each one is log
 
 ## Sidebar
 
-The session sidebar gets a small block for the session in view:
+The top of the session sidebar gets a section for the session in view. The channel is on the
+right of the title, muted; labels are dim, and a value is green for on, muted for off and amber for
+denied or waiting:
 
 ```
-OOB
-📡 telegram · on
-💬 chat: on · queue
-⏳ 1 open prompt
+OOB - Remote access         telegram
+  Notify    on                     ▾
+  Chat      on                     ▾
+  Replies   after turn             ▾
+  Waiting   1 question             ▾
 ```
 
-- **Routing** (`📡`): the channel and `on`, `off` or `auto`. Click to cycle auto, on, off.
-- **Chat** (`💬`): on or off. Click to switch it. A session blocked by `chat.deny` shows `denied`,
-  and a click says which rule blocks it. The line is left out when no selected channel can chat.
-- **Delivery** (after the dot): `queue` or `steer`. Click to flip it for this session; a `*` marks
-  a session that differs from `chat.delivery`. Kept in the settings file across restarts.
-- **Open prompts** (`⏳`): only when a question or permission of the session waits for an answer.
+Click a row to open a list of every choice, the current one marked. The sidebar updates at once.
 
-The block follows the TUI theme and updates when anything changes. Clicking needs a mouse; the
-same things are done from the keyboard with `/oob on|off|auto`, `/oob chat on|off` and
-`/oob delivery queue|steer|default`. The block is drawn by `sidebar.tsx`, which needs `solid-js`
-and `@opentui/solid` (the OpenCode TUI provides them). If they cannot be loaded, the bridge works
-without the block.
+| Row     | Shows                                                                         | The list                                                                                                                               |
+| ------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Notify  | Whether questions and finish notices are pushed: `on`, `off`, `when away`.    | On (default channel), On via each channel, On via all, When away (after `away.minutes`), Off.                                          |
+| Chat    | Whether you can write to the session from the channel: `on`, `off`, `denied`. | On, Off. When `chat.deny` blocks the session, the list says which rule and On is disabled. Left out when no selected channel can chat. |
+| Replies | How your messages arrive: `after turn` (queue) or `immediately` (steer).      | Immediately, After turn, Default (follow `chat.delivery`). A choice is kept per session in the settings file.                          |
+| Waiting | Open questions and requests; only when there are some.                        | The open prompts, oldest first; pick one to go to its session.                                                                         |
+
+`sidebar` sets the size: `"full"` (default), `"compact"` or `"off"`. Compact is one line, and a
+click opens the `/oob` menu:
+
+```
+OOB - Remote · telegram · notify on · chat on ▾
+```
+
+A narrow sidebar truncates the middle of that line with `…`. The `/oob` menu has a Sidebar entry
+for the size, kept in the settings file; it wins over the config.
+
+Clicking needs a mouse. From the keyboard: `/oob on|off|auto`, `/oob chat on|off`,
+`/oob delivery queue|steer|default` and `/oob sidebar full|compact|off`. The section is drawn by
+`sidebar.tsx`, which needs `solid-js` and `@opentui/solid` (the OpenCode TUI provides them). If
+they cannot be loaded, the bridge works without it. Other plugins that claim the sidebar are
+placed after it.
 
 ## Telemetry
 
