@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.11.0...v0.12.0) (2026-11-20)
+
+
+### Features
+
+* **telegram:** reaction acks, watch state in the topic, photo and document upload ([#32](https://github.com/mrmm-labs/opencode-oob-bridge/issues/32)) ([379b410](https://github.com/mrmm-labs/opencode-oob-bridge/commit/379b410bc4cc8558633a023f26968c6835570f6a))
+
 ## [0.11.0](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.10.0...v0.11.0) (2026-11-20)
 
 
