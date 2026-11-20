@@ -128,7 +128,7 @@ say who answered ("Answered from telegram: Yes", "Answered in the TUI").
 | `notify`                        | `{ finished: false, failed: true }` | Which session-end pushes arrive. `finished` is `true` when `statusCard` is `false`.         |
 | `icons`                         | none                                | `{ "<agent regex or project glob>": "<emoji>" }`: the topic icon for matching sessions.     |
 
-Which channels are on is also a TUI setting (`/oob`, "Channels"). The choice is stored in
+Which channels are on is also a TUI setting (`/oob channel <name> on|off`). The choice is stored in
 `settings.json` in the state directory and layered over the config file, which the plugin never
 rewrites.
 
@@ -147,7 +147,7 @@ degrades to match:
 | `multiselect`   | A multiple-choice question gets no toggle buttons, only numbered text.   |
 | `edit`          | The outcome ("Answered from ...") is a follow-up message, not an edit.   |
 | `threads`       | The session is named in each message, not given its own thread or topic. |
-| `pairing`       | There is no "Pair" menu item and `/oob pair` refuses it.                 |
+| `pairing`       | `/oob pair` refuses it.                                                  |
 | `inboundPrompt` | Reserved: sending text into a session from a chat. No connector has it.  |
 
 ntfy has buttons and edit; Telegram has all of them but `inboundPrompt`. A new connector is one
@@ -349,6 +349,36 @@ and is subject to `chat.deny`. At most five are started an hour. Each one is log
 }
 ```
 
+## The `/oob` command
+
+One slash command, `/oob` (alias `/ntfy`), with sub-commands. The host completes only the command
+name, so `/oob` alone opens a picker instead: a searchable list of every sub-command with what it
+does and its usage underneath. Pick one and it asks for what it still needs: a list of the live
+values for a choice (the current one marked, with the same descriptions as the sidebar), a prompt
+for free text. Esc at any step cancels with nothing changed.
+
+Typing is the fast path:
+
+- `/oob chat on` runs at once. Any prefix of a name works when it fits one sub-command (`/oob au`).
+- A prefix that fits several (`/oob o`) opens the picker with just those.
+- A missing argument is asked for alone: `/oob delivery` opens the list of values.
+- A wrong value (`/oob chat maybe`) says which values are valid and opens that list.
+- `/oob help` shows the table below inside the TUI.
+
+| Command                                 | What it does                                                                                            |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `/oob on [<channel\|all>]`              | Push this session's questions and notices now, through one channel or all.                              |
+| `/oob off`                              | Never push this session.                                                                                |
+| `/oob auto`                             | Push this session after the away time without input, if the rules pick it.                              |
+| `/oob chat <on\|off>`                   | Let messages in the session's topic reach it, or stop taking them.                                      |
+| `/oob delivery <queue\|steer\|default>` | How your messages from a channel reach a busy session: queue, steer, or the config's default.           |
+| `/oob channel <channel> <on\|off>`      | Turn a channel on or off for every session; kept across restarts.                                       |
+| `/oob pair <channel>`                   | Show the code or link that binds a channel to a chat (the name can be left out when only one can pair). |
+| `/oob test`                             | Push a test message through every enabled channel.                                                      |
+| `/oob sidebar <full\|compact\|off>`     | How big the section in the session sidebar is: full, compact or off.                                    |
+| `/oob status`                           | Show each channel's connection, the open prompts and this session's settings.                           |
+| `/oob help`                             | List every sub-command with its usage.                                                                  |
+
 ## Sidebar
 
 The top of the session sidebar gets a section for the session in view. The channel is on the
@@ -373,14 +403,14 @@ Click a row to open a list of every choice, the current one marked. The sidebar 
 | Waiting | Open questions and requests; only when there are some.                        | The open prompts, oldest first; pick one to go to its session.                                                                         |
 
 `sidebar` sets the size: `"full"` (default), `"compact"` or `"off"`. Compact is one line, and a
-click opens the `/oob` menu:
+click opens the `/oob` picker:
 
 ```
 OOB - Remote · telegram · notify on · chat on ▾
 ```
 
-A narrow sidebar truncates the middle of that line with `…`. The `/oob` menu has a Sidebar entry
-for the size, kept in the settings file; it wins over the config.
+A narrow sidebar truncates the middle of that line with `…`. `/oob sidebar` sets the size, kept
+in the settings file; it wins over the config.
 
 Clicking needs a mouse. From the keyboard: `/oob on|off|auto`, `/oob chat on|off`,
 `/oob delivery queue|steer|default` and `/oob sidebar full|compact|off`. The section is drawn by
@@ -435,14 +465,12 @@ never affects a session.
 
 ## Which sessions are mirrored
 
-- `/oob` opens a settings menu: **This session** (on with the default channel, on via telegram,
-  on via ntfy, off, auto), **Channels** (switch each on or off), **Pair Telegram**, **Send test
-  push** (to every enabled channel) and **Status** (channels, connection, last error, open
-  prompts). It is also in the command palette.
+- `/oob` opens a picker of sub-commands (see [The `/oob` command](#the-oob-command)). It is also
+  in the command palette.
 - The same from the prompt: `/oob on` mirrors the session now, through `defaultChannel`;
   `/oob on telegram`, `/oob on ntfy` or `/oob on all` picks the channel for this session;
   `/oob off` never mirrors it; `/oob auto` returns it to the away rule. `/oob status`,
-  `/oob test` and `/oob pair telegram` do what the menu items do. `/ntfy` still works as an
+  `/oob test` and `/oob pair telegram` work the same way. `/ntfy` still works as an
   alias. The setting covers the session's subagents and is remembered across restarts (in
   `settings.json`).
 - Otherwise, a session is mirrored when nobody has typed a message in the TUI for `away.minutes`

@@ -17,14 +17,23 @@ function fakeCtx(size?: { width: number; height: number }) {
   const toasts: string[] = []
   const commands: Array<{
     palette?: boolean
-    slash?: { name: string; aliases?: string[] }
+    slash?: { name: string; aliases?: string[]; arguments?: true }
     run: (i?: string) => unknown
   }> = []
   const dialogs: Array<{
     title: string
     message?: string
-    options?: Array<{ title: string; value: unknown; description?: string }>
+    placeholder?: string
+    value?: string
+    options?: Array<{
+      title: string
+      value: unknown
+      description?: string
+      footer?: string
+      category?: string
+    }>
     current?: unknown
+    search?: (q: string, o: unknown[]) => Array<{ value: unknown }>
   }> = []
   // What the operator picks, in order; undefined dismisses.
   const picks: unknown[] = []
@@ -81,6 +90,10 @@ function fakeCtx(size?: { width: number; height: number }) {
       toast: { show: (o: { message: string }) => toasts.push(o.message) },
       dialog: {
         select: async (o: (typeof dialogs)[number]) => {
+          dialogs.push(o)
+          return picks.shift()
+        },
+        prompt: async (o: (typeof dialogs)[number]) => {
           dialogs.push(o)
           return picks.shift()
         },
@@ -194,10 +207,10 @@ describe("TUI entry", () => {
     assert.ok(cleanup)
     assert.ok(f.handlers.has("form.created"))
     const cmd = f.commands.find((c) => c.slash?.name === "oob")!
-    cmd.run("on")
+    await cmd.run("on")
     assert.equal(f.toasts.at(-1), "oob routing: on")
-    cmd.run("bogus")
-    assert.match(f.toasts.at(-1)!, /Usage/)
+    await cmd.run("bogus")
+    assert.match(f.toasts.at(-1)!, /No sub-command "bogus"/)
 
     f.handlers.get("form.created")!({
       type: "form.created",
@@ -283,10 +296,12 @@ describe("/oob menu and channels", () => {
     assert.equal(f.commands.length, 1)
     assert.equal(f.commands[0].palette, true)
     assert.deepEqual(f.commands[0].slash?.aliases, ["ntfy"])
+    assert.equal(f.commands[0].slash?.name, "oob")
+    assert.equal(f.commands[0].slash?.arguments, true)
     assert.deepEqual(f.modes, ["global"])
   })
 
-  it("opens a menu with routing, channels, pairing, test and status", async () => {
+  it("/oob alone opens a searchable picker of every sub-command, then walks the arguments", async () => {
     const n = await fakeNtfy()
     const { f, cmd, cleanup } = await started({
       ntfy: { server: n.url, topics: { out: "o", in: "i" } },
@@ -294,24 +309,95 @@ describe("/oob menu and channels", () => {
     })
     await cmd.run()
     const m = f.dialogs[0]
+    assert.equal(m.title, "OOB - Remote access")
     assert.deepEqual(
       m.options!.map((o) => o.value),
-      ["routing", "channels", "pair:telegram", "sidebar", "test", "status"],
+      [
+        "on",
+        "off",
+        "auto",
+        "chat",
+        "delivery",
+        "channel",
+        "pair",
+        "test",
+        "sidebar",
+        "status",
+        "help",
+      ],
     )
-    assert.equal(m.options![0].description, "now: auto")
-    assert.equal(m.options![1].description, "ntfy on, telegram on")
+    const delivery = m.options!.find((o) => o.value === "delivery")!
+    assert.equal(delivery.footer, "/oob delivery <queue|steer|default>")
+    assert.equal(delivery.category, "This session")
+    assert.ok(delivery.description)
+    assert.deepEqual(
+      m.search!("stat", m.options!).map((o) => o.value),
+      ["status"],
+    )
 
-    f.picks.push("routing", "off")
+    // Pick "delivery", then a value: the same list as the sidebar's dropdown.
+    f.picks.push("delivery", "steer")
     await cmd.run()
-    assert.equal(
-      f.dialogs.find((d) => d.title === "This session")!.current,
-      "auto",
+    const list = f.dialogs.find((d) => d.title === "How your messages arrive")!
+    assert.equal(list.current, "default")
+    assert.deepEqual(
+      list.options!.map((o) => o.value),
+      ["steer", "queue", "default"],
     )
+    assert.match(f.toasts.at(-1)!, /Delivery for this session: steer/)
+
+    // Esc at the picker, and Esc at an argument: nothing happens.
+    const toasts = f.toasts.length
+    await cmd.run()
+    f.picks.push("chat", undefined)
+    await cmd.run()
+    assert.equal(f.toasts.length, toasts)
+
+    f.picks.push("off")
+    await cmd.run()
     assert.equal(f.toasts.at(-1), "oob routing: off")
     await cmd.run("auto")
     assert.equal(f.toasts.at(-1), "oob routing: auto")
     await cleanup()
     await n.close()
+  })
+
+  it("a prefix that fits two sub-commands opens the picker with just those; one runs at once", async () => {
+    const n = await fakeNtfy()
+    const { f, cmd, cleanup } = await started({
+      ntfy: { server: n.url, topics: { out: "o", in: "i" } },
+    })
+    f.picks.push("off")
+    await cmd.run("o")
+    assert.deepEqual(
+      f.dialogs[0].options!.map((o) => o.value),
+      ["on", "off"],
+    )
+    assert.equal(f.toasts.at(-1), "oob routing: off")
+    await cmd.run("au")
+    assert.equal(f.toasts.at(-1), "oob routing: auto")
+    assert.equal(f.dialogs.length, 1)
+    await cleanup()
+    await n.close()
+  })
+
+  it("/oob help lists every sub-command with its usage", async () => {
+    const { f, cmd, cleanup } = await started({
+      telegram: { token: { env: "OOBB_TG" } },
+    })
+    await cmd.run("help")
+    const d = f.dialogs.at(-1)!
+    assert.equal(d.title, "OOB - Remote access: commands")
+    for (const u of [
+      "/oob on [<channel|all>]",
+      "/oob chat <on|off>",
+      "/oob delivery <queue|steer|default>",
+      "/oob sidebar <full|compact|off>",
+      "/oob channel <channel> <on|off>",
+      "/oob status",
+    ])
+      assert.ok(d.message!.includes(u), u)
+    await cleanup()
   })
 
   it("switches a channel off, persists it, and stops its subscription", async () => {
@@ -320,8 +406,9 @@ describe("/oob menu and channels", () => {
       ntfy: { server: n.url, topics: { out: "o", in: "i" } },
     })
     await n.waitFor(() => n.subscribes.length > 0)
-    f.picks.push("channels", "ntfy")
+    f.picks.push("channel", "ntfy", "off")
     await cmd.run()
+    assert.equal(f.dialogs.at(-1)!.current, "on")
     assert.equal(f.toasts.at(-1), "ntfy: off")
     const saved = await readJson(join(dir, "settings.json"))
     assert.equal(saved.channels.ntfy.enabled, false)
@@ -429,7 +516,7 @@ describe("/oob menu and channels", () => {
     await tg.close()
   })
 
-  it("/oob chat on turns chat on for the session, keeps it across a restart, and the menu offers it", async () => {
+  it("/oob chat on turns chat on for the session, keeps it across a restart, and the picker shows it", async () => {
     const tg = await fakeTelegram()
     const { f, dir, cmd, cleanup } = await started({
       telegram: { token: { env: "OOBB_TG" }, chatId: 7, apiBase: tg.url },
@@ -447,15 +534,12 @@ describe("/oob menu and channels", () => {
       undefined,
       dir,
     )
-    await again.cmd.run()
-    assert.equal(
-      again.f.dialogs.at(-1)!.options![0].description,
-      "now: on, chat on",
-    )
-    again.f.picks.push("routing", "chat")
-    await again.cmd.run()
-    const menu = again.f.dialogs.find((d) => d.title === "This session")!
-    assert.ok(menu.options!.some((o) => o.title === "Chat from Telegram: on"))
+    again.f.picks.push("off")
+    await again.cmd.run("chat")
+    const ask = again.f.dialogs.find(
+      (d) => d.title === "Write to this session from the channel",
+    )!
+    assert.equal(ask.current, "on")
     assert.match(again.f.toasts.at(-1)!, /Chat is off/)
     await again.cleanup()
     const off = await readJson(join(dir, "settings.json"))
@@ -667,7 +751,10 @@ describe("/oob menu and channels", () => {
     await cmd.run("on telegram")
     assert.equal(f.toasts.at(-1), "oob routing: on via telegram")
     await cmd.run("on bogus")
-    assert.match(f.toasts.at(-1)!, /No channel "bogus"/)
+    assert.match(
+      f.toasts.at(-1)!,
+      /"bogus" is not a channel\. Use: ntfy, telegram, all/,
+    )
     await cmd.run("on telegram extra")
     assert.match(f.toasts.at(-1)!, /Usage/)
 
@@ -699,17 +786,19 @@ describe("/oob menu and channels", () => {
     await cleanup()
 
     const again = await started(channels, {}, undefined, dir)
+    // Esc at the channel list changes nothing.
+    again.f.picks.push("on", undefined)
     await again.cmd.run()
-    const m = again.f.dialogs.at(-1)!
-    assert.equal(m.options![0].description, "now: on via telegram")
-    again.f.picks.push("routing", "auto")
-    await again.cmd.run()
-    const r = again.f.dialogs.find((d) => d.title === "This session")!
-    assert.equal(r.current, "on:telegram")
+    const r = again.f.dialogs.find(
+      (d) => d.title === "Push through which channel?",
+    )!
+    assert.equal(r.current, "telegram")
     assert.deepEqual(
       r.options!.map((o) => o.value),
-      ["on", "on:ntfy", "on:telegram", "on:all", "off", "auto", "chat", "back"],
+      ["", "ntfy", "telegram", "all"],
     )
+    assert.equal(again.f.toasts.length, 0)
+    await again.cmd.run("auto")
     assert.equal(again.f.toasts.at(-1), "oob routing: auto")
     await again.cleanup()
     assert.deepEqual((await readJson(join(dir, "settings.json"))).sessions, {})
@@ -717,58 +806,23 @@ describe("/oob menu and channels", () => {
     await tg.close()
   })
 
-  it("the main menu loops until Esc; submenus return to it with Back", async () => {
-    const n = await fakeNtfy()
-    const { f, cmd, cleanup } = await started({
-      ntfy: { server: n.url, topics: { out: "o", in: "i" } },
-    })
-    // routing -> Back, status, test, then Esc (undefined).
-    f.picks.push("routing", "back", "status", "test")
-    await cmd.run()
-    assert.deepEqual(
-      f.dialogs.map((d) => d.title),
-      [
-        "OOB - Remote access",
-        "This session",
-        "OOB - Remote access",
-        "OOB - Remote access status",
-        "OOB - Remote access",
-        "OOB - Remote access",
-      ],
-    )
-    assert.ok(f.dialogs[1].options!.at(-1)!.value === "back")
-    assert.equal(
-      f.toasts.some((t) => t.startsWith("oob routing")),
-      false,
-      "Back changes nothing",
-    )
-    assert.match(f.toasts.at(-1)!, /^Test push/)
-    await cleanup()
-    await n.close()
-  })
-
-  it("the channel list stays open for several switches, until Back", async () => {
+  it("channel <name> <state> works typed, and the picker marks the current state", async () => {
     const n = await fakeNtfy()
     const tg = await fakeTelegram()
     const { f, dir, cmd, cleanup } = await started({
       ntfy: { server: n.url, topics: { out: "o", in: "i" } },
       telegram: { token: { env: "OOBB_TG" }, chatId: 7, apiBase: tg.url },
     })
-    f.picks.push("channels", "ntfy", "telegram", "ntfy", "back")
-    await cmd.run()
-    const lists = f.dialogs.filter((d) => d.title.startsWith("Channels"))
-    assert.equal(lists.length, 4)
-    assert.equal(lists[0].options!.at(-1)!.value, "back")
-    assert.deepEqual(
-      lists.map((l) => l.options!.slice(0, 2).map((o) => o.title)),
-      [
-        ["ntfy: on", "telegram: on"],
-        ["ntfy: off", "telegram: on"],
-        ["ntfy: off", "telegram: off"],
-        ["ntfy: on", "telegram: off"],
-      ],
-    )
-    // The file is written after the menu moves on: wait for the last switch.
+    await cmd.run("channel ntfy off")
+    assert.equal(f.toasts.at(-1), "ntfy: off")
+    // Only the state is missing: just that is asked, with the current one marked.
+    f.picks.push("on")
+    await cmd.run("channel ntfy")
+    const ask = f.dialogs.at(-1)!
+    assert.equal(ask.title, "Turn it")
+    assert.equal(ask.current, "off")
+    assert.equal(f.toasts.at(-1), "ntfy: on")
+    await cmd.run("channel telegram off")
     await cleanup()
     const saved = await readJson(join(dir, "settings.json"))
     assert.equal(saved.channels.ntfy.enabled, true)
@@ -777,21 +831,22 @@ describe("/oob menu and channels", () => {
     await tg.close()
   })
 
-  it("pairing from the menu returns to the menu when its dialog closes", async () => {
+  it("pairing: the name is optional with one pairable channel, and the command does not wait for the dialog", async () => {
     const tg = await fakeTelegram()
     const { f, cmd, cleanup } = await started({
       telegram: { token: { env: "OOBB_TG" }, apiBase: tg.url },
     })
-    f.picks.push("pair:telegram")
+    f.picks.push("pair")
     await cmd.run()
     assert.deepEqual(
       f.dialogs.map((d) => d.title),
-      ["OOB - Remote access", "Pair telegram", "OOB - Remote access"],
+      ["OOB - Remote access", "Pair telegram"],
     )
-    // From the command line the command returns at once, without waiting for the dialog.
     const before = f.dialogs.length
-    await cmd.run("pair telegram")
+    await cmd.run("pair")
     assert.equal(f.dialogs.length, before + 1)
+    await cmd.run("pair telegram")
+    assert.equal(f.dialogs.length, before + 2)
     await cleanup()
     await tg.close()
   })
@@ -803,8 +858,8 @@ describe("/oob menu and channels", () => {
     })
     await cmd.run("pair telegram")
     assert.match(f.toasts.at(-1)!, /No channel can be paired/)
-    await cmd.run("bogus")
-    assert.match(f.toasts.at(-1)!, /Usage/)
+    await cmd.run("status now")
+    assert.equal(f.toasts.at(-1), "Usage: /oob status")
     await cleanup()
     await n.close()
   })
