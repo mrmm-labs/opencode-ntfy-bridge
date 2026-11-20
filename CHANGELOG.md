@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.7.1...v0.8.0) (2026-11-20)
+
+
+### Features
+
+* steer delivery, faster streaming, token backoff and a sidebar block ([#24](https://github.com/mrmm-labs/opencode-oob-bridge/issues/24)) ([ec58d63](https://github.com/mrmm-labs/opencode-oob-bridge/commit/ec58d6305613e035650af555e2180c75e9163367))
+
 ## [0.7.1](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.7.0...v0.7.1) (2026-11-20)
 
 
