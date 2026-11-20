@@ -31,7 +31,7 @@ import { log } from "./logger.ts"
 import { format, isCustomized, type Kind, type Vars } from "./messages.ts"
 import { noTelemetry, type Telemetry } from "./otel.ts"
 import type { Pending, PendingStore } from "./pending.ts"
-import type { Router, SessionFacts } from "./routing.ts"
+import { globToRegExp, type Router, type SessionFacts } from "./routing.ts"
 import { clock, formatDuration, truncate } from "./util.ts"
 
 export type SessionInfo = {
@@ -48,6 +48,10 @@ export interface Host {
   session(id: string): Promise<SessionInfo | undefined>
   root(id: string): string
   replyForm(sessionID: string, formID: string, answer: Answer): Promise<void>
+  /** Sends a user prompt into a session; it is queued behind a running turn, never refused for being busy. */
+  prompt(sessionID: string, text: string): Promise<void>
+  /** Whether a turn is running in the session. */
+  busy(sessionID: string): boolean
 }
 
 type FormOption =
@@ -119,6 +123,24 @@ export type BridgeEvent =
       data: { sessionID: string }
     }
   | { type: "session.renamed"; data: { sessionID: string; title: string } }
+  | {
+      type: "session.text.delta"
+      data: {
+        sessionID: string
+        assistantMessageID: string
+        ordinal: number
+        delta: string
+      }
+    }
+  | {
+      type: "session.text.ended"
+      data: {
+        sessionID: string
+        assistantMessageID: string
+        ordinal: number
+        text: string
+      }
+    }
   | {
       type: "session.model.selected"
       data: { sessionID: string; model: { id: string } }
@@ -197,6 +219,11 @@ export type BridgeStatus = {
   pending: number
 }
 
+type Routed = NonNullable<Awaited<ReturnType<Bridge["routed"]>>>
+
+const HINT_EVERY_MS = 60 * 60_000
+const FEED_MS = 200
+
 export class Bridge {
   private readonly controllers = new Map<string, AbortController>()
 
@@ -208,6 +235,23 @@ export class Bridge {
   private readonly now: () => number
   private readonly tel: Telemetry
   /** The last state shown per top-level session, and when its run started. */
+  /** Top-level sessions that may be chatted with from a connector. */
+  private readonly chat = new Set<string>()
+  /** When a session last got the "chat is off" hint. */
+  private readonly hinted = new Map<string, number>()
+  /** The assistant text of the turn in progress, by top-level session. */
+  private readonly turns = new Map<
+    string,
+    { msg?: string; parts: Map<number, string> }
+  >()
+  /** Sessions whose running turn began with a prompt from a connector. */
+  private readonly remote = new Set<string>()
+  /** Where a running turn is shown, and the pending stream update. */
+  private readonly feeds = new Map<
+    string,
+    { r?: Routed; timer?: ReturnType<typeof setTimeout>; streamed?: boolean }
+  >()
+  private chatListener: ((root: string) => void) | undefined
   private readonly states = new Map<
     string,
     { state: SessionState["state"]; at: number; started?: number }
@@ -314,6 +358,8 @@ export class Bridge {
   async stop(): Promise<void> {
     for (const ac of this.controllers.values()) ac.abort()
     this.controllers.clear()
+    for (const f of this.feeds.values()) clearTimeout(f.timer)
+    this.feeds.clear()
     await this.store.flush()
   }
 
@@ -336,9 +382,15 @@ export class Bridge {
           if (e.data.item?.type === "user") this.router.touch()
           return
         case "session.execution.started":
+          this.turns.delete(e.data.sessionID)
           return await this.onState(e.data.sessionID, "working")
         case "session.execution.interrupted":
+          await this.endTurn(e.data.sessionID)
           return await this.onState(e.data.sessionID, "idle")
+        case "session.text.delta":
+          return await this.onText(e.data, e.data.delta)
+        case "session.text.ended":
+          return await this.onText(e.data, undefined, e.data.text)
         case "session.execution.succeeded":
         case "session.execution.failed":
           return await this.onFinished(
@@ -695,6 +747,7 @@ export class Bridge {
       model: patch.model ?? r.root?.model,
       state: next.state,
       at: next.at,
+      chat: this.chat.has(r.rootID),
     }
     await Promise.all(
       r.to.map((c) =>
@@ -704,6 +757,159 @@ export class Bridge {
     return next
   }
 
+  chatEnabled(root: string): boolean {
+    return this.chat.has(root)
+  }
+
+  /** Called after chat is switched on or off for a session, to keep it across restarts. */
+  onChat(fn: (root: string) => void): void {
+    this.chatListener = fn
+  }
+
+  /** Puts chat back on for a session from the stored settings. Whether it is allowed is checked at each prompt. */
+  restoreChat(root: string): void {
+    this.chat.add(root)
+  }
+
+  private denied(facts: { agent?: string; directory?: string } | undefined) {
+    return this.cfg.chat.deny.some(
+      (d) =>
+        (!d.agent || d.agent.test(facts?.agent ?? "")) &&
+        (!d.directory ||
+          globToRegExp(d.directory).test(facts?.directory ?? "")),
+    )
+  }
+
+  /** Switches chat from a connector on or off for a top-level session. */
+  async setChat(root: string, on: boolean): Promise<Outcome> {
+    if (!on) {
+      this.chat.delete(root)
+      await this.onState(root)
+      this.chatListener?.(root)
+      return { ok: true, text: "Chat is off for this session." }
+    }
+    if (this.denied(await this.host.session(root)))
+      return no("Chat is blocked for this session by chat.deny in the config.")
+    if (!this.targets(root).some((c) => c.capabilities.inboundPrompt))
+      return no(
+        "No channel that can chat is selected for this session: use /oob on telegram first.",
+      )
+    const mirrored = this.router.mode(root) === "on"
+    // The session's topic is where the chat happens, so it is mirrored too.
+    this.router.set(root, true, this.router.channel(root))
+    this.chat.add(root)
+    await this.onState(root)
+    this.chatListener?.(root)
+    return {
+      ok: true,
+      text: mirrored
+        ? "Chat is on for this session."
+        : "Chat is on for this session. It is now mirrored too (routing on).",
+    }
+  }
+
+  private joined(root: string): string {
+    const parts = this.turns.get(root)?.parts
+    return parts
+      ? [...parts.entries()]
+          .sort((a, b) => a[0] - b[0])
+          .map((e) => e[1])
+          .join("\n\n")
+      : ""
+  }
+
+  /** Text of the turn's assistant message, as it arrives. */
+  private async onText(
+    d: { sessionID: string; assistantMessageID: string; ordinal: number },
+    delta?: string,
+    full?: string,
+  ) {
+    const root = this.host.root(d.sessionID)
+    if (root !== d.sessionID || !this.chat.has(root)) return
+    let buf = this.turns.get(root)
+    if (!buf) this.turns.set(root, (buf = { parts: new Map() }))
+    // A new assistant message (a later step) replaces what was shown.
+    if (buf.msg !== d.assistantMessageID) {
+      buf.msg = d.assistantMessageID
+      buf.parts = new Map()
+    }
+    buf.parts.set(
+      d.ordinal,
+      full ?? (buf.parts.get(d.ordinal) ?? "") + (delta ?? ""),
+    )
+    if (!this.cfg.chat.stream) return
+    if (this.cfg.chat.mirror === "remote-only" && !this.remote.has(root)) return
+    const feed = this.feeds.get(root) ?? {}
+    this.feeds.set(root, feed)
+    if (feed.timer) return
+    feed.timer = setTimeout(() => {
+      feed.timer = undefined
+      void this.feed(root)
+    }, FEED_MS)
+    ;(feed.timer as { unref?: () => void }).unref?.()
+  }
+
+  private async feed(root: string) {
+    try {
+      const feed = this.feeds.get(root)
+      if (!feed || !this.chat.has(root)) return
+      const r = (feed.r ??= await this.routed(root))
+      const text = this.joined(root).trim()
+      if (!r || !text) return
+      feed.streamed = true
+      const clean = redact(text, this.cfg.redact)
+      for (const c of r.to)
+        if (c.capabilities.inboundPrompt && c.stream) c.stream(r.session, clean)
+    } catch (err) {
+      log("stream_error", { message: (err as Error).message })
+    }
+  }
+
+  /**
+   * A turn ended. Posts its final assistant text when chat is on, or settles a
+   * stream that was cut short (`final` false: nothing is posted unless one ran).
+   */
+  private async endTurn(sessionID: string, r?: Routed, final = false) {
+    if (this.host.root(sessionID) !== sessionID) return
+    const feed = this.feeds.get(sessionID)
+    clearTimeout(feed?.timer)
+    this.feeds.delete(sessionID)
+    const remote = this.remote.delete(sessionID)
+    const text = this.joined(sessionID).trim()
+    this.turns.delete(sessionID)
+    if (!this.chat.has(sessionID) || !text) return
+    if (!final && !feed?.streamed) return
+    if (this.cfg.chat.mirror === "remote-only" && !remote) return
+    r ??= feed?.r ?? (await this.routed(sessionID))
+    if (r) await this.postReply(r, text)
+  }
+
+  private async postReply(r: Routed, text: string) {
+    const clean = redact(text, this.cfg.redact)
+    await Promise.all(
+      r.to
+        .filter((c) => c.capabilities.inboundPrompt && c.reply)
+        .map(async (c) => {
+          const attrs = { "connector.type": c.type }
+          const span = this.tel.begin("oob.reply", {
+            session: r.rootID,
+            attrs,
+          })
+          const res = await this.safely(c, () => c.reply!(r.session, clean))
+          this.tel.count(res ? "oob.replies" : "oob.reply.errors", attrs)
+          span.end(
+            {
+              ok: res !== undefined,
+              parts: res?.parts,
+              chars: clean.length,
+              documents: res?.documents,
+            },
+            res ? undefined : "send-failed",
+          )
+        }),
+    )
+  }
+
   private async onState(
     sessionID: string,
     state?: SessionState["state"],
@@ -711,7 +917,9 @@ export class Bridge {
   ) {
     if (this.host.root(sessionID) !== sessionID) return
     const r = await this.routed(sessionID)
-    if (r) await this.track(r, state, patch)
+    if (!r) return
+    if (state === "working") this.feeds.set(sessionID, { r })
+    await this.track(r, state, patch)
   }
 
   private async onFinished(sessionID: string, failed: boolean) {
@@ -720,6 +928,7 @@ export class Bridge {
     if (!r) return
     const kind = failed ? "failed" : "finished"
     const st = await this.track(r, failed ? "failed" : "idle")
+    await this.endTurn(sessionID, r, !failed)
     const duration =
       st.started === undefined
         ? undefined
@@ -817,10 +1026,13 @@ export class Bridge {
     ch: Connector,
     m: Inbound,
   ): Promise<Outcome | undefined> {
+    const kind = this.inboundKind(ch, m)
     const span = this.tel.begin("oob.inbound", {
-      attrs: { kind: m.kind, "connector.type": ch.type },
+      attrs: { kind, "connector.type": ch.type },
     })
-    const info: { outcome: string; pending?: Pending } = { outcome: "ignored" }
+    const info: { outcome: string; pending?: Pending; root?: string } = {
+      outcome: "ignored",
+    }
     try {
       const out = await this.apply(ch, m, info)
       if (out && !out.ok && !m.inline) {
@@ -834,6 +1046,10 @@ export class Bridge {
               kind: "notice",
               text: out.text,
             })),
+            // A notice about a session's chat belongs in its topic.
+            ...(info.root && ch.capabilities.threads
+              ? { session: { id: info.root, name: info.root } }
+              : {}),
           }),
           {
             root: info.pending?.rootSessionID,
@@ -841,12 +1057,17 @@ export class Bridge {
           },
         )
       }
-      if (info.outcome !== "applied" && info.outcome !== "ignored")
+      if (kind === "prompt")
+        this.tel.count("oob.prompts", {
+          "connector.type": ch.type,
+          outcome: info.outcome,
+        })
+      if (!["applied", "ignored", "sent", "queued"].includes(info.outcome))
         this.tel.count("oob.inbound.rejected", {
           "connector.type": ch.type,
           reason: info.outcome,
         })
-      span.setSession(info.pending?.rootSessionID)
+      span.setSession(info.pending?.rootSessionID ?? info.root)
       span.end(
         { outcome: info.outcome, "pending.id": info.pending?.id },
         out && !out.ok ? info.outcome : undefined,
@@ -859,12 +1080,96 @@ export class Bridge {
     }
   }
 
+  /** A reply that answers no question we track is text for the session. */
+  private inboundKind(ch: Connector, m: Inbound): Inbound["kind"] {
+    return m.kind === "answer" &&
+      !m.pendingId &&
+      m.replyTo &&
+      m.sessionKey &&
+      ch.capabilities.inboundPrompt &&
+      !this.store.byRef(ch.id, m.replyTo)
+      ? "prompt"
+      : m.kind
+  }
+
+  /** Rate-limited: a session hears the same hint once an hour. */
+  private hint(root: string, text: string): Outcome | undefined {
+    const last = this.hinted.get(root)
+    if (last !== undefined && this.now() - last < HINT_EVERY_MS)
+      return undefined
+    this.hinted.set(root, this.now())
+    return no(text)
+  }
+
+  /** Text from a connector for a session. */
+  private async prompt(
+    ch: Connector,
+    m: Inbound,
+    info: { outcome: string; root?: string },
+  ): Promise<Outcome | undefined> {
+    const root = m.sessionKey
+    const text = m.text.trim()
+    if (
+      !ch.capabilities.inboundPrompt ||
+      !root ||
+      !text ||
+      this.host.root(root) !== root
+    ) {
+      log("inbound_ignored", { connector: ch.id, kind: m.kind })
+      return undefined
+    }
+    info.root = root
+    if (!this.chat.has(root)) {
+      info.outcome = "off"
+      return this.hint(
+        root,
+        "Chat is off for this session: run /oob chat on in the TUI.",
+      )
+    }
+    const facts = await this.host.session(root)
+    if (this.denied(facts)) {
+      info.outcome = "denied"
+      return this.hint(root, "Chat is blocked for this session by chat.deny.")
+    }
+    const busy = this.host.busy(root)
+    try {
+      await this.host.prompt(root, text)
+    } catch (err) {
+      log("prompt_error", { message: (err as Error).message })
+      info.outcome = "failed"
+      return no("Could not send that to the session.")
+    }
+    this.remote.add(root)
+    info.outcome = busy ? "queued" : "sent"
+    const where = `${facts?.agent ?? "agent"} · ${facts?.directory ? basename(facts.directory) : "opencode"}`
+    return {
+      ok: true,
+      sent: true,
+      text: busy ? `→ queued for ${where} (busy)` : `→ sent to ${where}`,
+    }
+  }
+
+  /** A connector's own button. The only one is turning chat off: chat is never switched on from a chat. */
+  private async control(
+    ch: Connector,
+    m: Inbound,
+    info: { outcome: string; root?: string },
+  ): Promise<Outcome | undefined> {
+    const root = m.sessionKey
+    if (!ch.capabilities.inboundPrompt || !root || m.text !== "chat off")
+      return undefined
+    info.root = root
+    info.outcome = "applied"
+    return this.setChat(root, false)
+  }
+
   private async apply(
     ch: Connector,
     m: Inbound,
-    info: { outcome: string; pending?: Pending },
+    info: { outcome: string; pending?: Pending; root?: string },
   ): Promise<Outcome | undefined> {
-    // Sending text into a session is not built: nothing is applied.
+    if (m.kind === "control") return this.control(ch, m, info)
+    if (m.kind === "prompt") return this.prompt(ch, m, info)
     if (m.kind !== "answer") {
       log("inbound_ignored", { connector: ch.id, kind: m.kind })
       return undefined
@@ -880,7 +1185,10 @@ export class Bridge {
     } else if (m.replyTo) {
       // A reply to the message itself; one that answers nothing we track is not ours.
       const target = this.store.byRef(ch.id, m.replyTo)
-      if (!target) return undefined
+      if (!target)
+        return m.sessionKey && ch.capabilities.inboundPrompt
+          ? this.prompt(ch, m, info)
+          : undefined
       id = target.id
       reply = { id, text: m.text }
     } else return undefined

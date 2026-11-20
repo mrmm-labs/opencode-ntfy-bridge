@@ -16,7 +16,7 @@ export type App = {
 }
 
 const USAGE =
-  "Usage: /oob [on [<channel>|all]|off|auto|status|test|pair <channel>]"
+  "Usage: /oob [on [<channel>|all]|off|auto|chat on|chat off|status|test|pair <channel>]"
 
 /** Connectors that can bind to a chat. */
 const pairable = (app: App) =>
@@ -57,6 +57,8 @@ export async function runCommand(
     return setRouting(ctx, app, "on", via)
   if ((word === "off" || word === "auto") && via === undefined)
     return setRouting(ctx, app, word)
+  if (word === "chat" && (via === "on" || via === "off") && extra.length === 0)
+    return setChat(ctx, app, via === "on")
   if (arg === "status") return status(ctx, app)
   if (arg === "test") return test(ctx, app)
   if (word === "pair" && extra.length === 0) {
@@ -95,18 +97,40 @@ function setRouting(
     channel = c.id
   }
   app.router.set(root, mode === "auto" ? undefined : mode === "on", channel)
+  saveSession(app, root)
+  toast(ctx, `oob routing: ${describe(app, root)}`)
+}
+
+/** Keeps a session's routing and chat choices across restarts. */
+export function saveSession(app: App, root: string): void {
+  const mode = app.router.mode(root)
+  const chat = app.bridge.chatEnabled(root)
   app.settings.setSession(
     root,
-    mode === "auto" ? undefined : { on: mode === "on", channel },
+    mode === "auto" && !chat
+      ? undefined
+      : {
+          on: mode === "auto" ? undefined : mode === "on",
+          channel: app.router.channel(root),
+          chat: chat || undefined,
+        },
   )
-  toast(ctx, `oob routing: ${describe(app, root)}`)
+}
+
+async function setChat(ctx: Context, app: App, on: boolean): Promise<void> {
+  const root = sessionRoot(ctx)
+  if (!root) return toast(ctx, "Open a session first", "warning")
+  const out = await app.bridge.setChat(root, on)
+  toast(ctx, out.text, out.ok ? "success" : "warning")
 }
 
 const describe = (app: App, root: string) => {
   const via = app.router.channel(root)
-  return app.router.mode(root) === "on" && via
-    ? `on via ${via}`
-    : app.router.mode(root)
+  const base =
+    app.router.mode(root) === "on" && via
+      ? `on via ${via}`
+      : app.router.mode(root)
+  return app.bridge.chatEnabled(root) ? `${base}, chat on` : base
 }
 
 const BACK = { title: "← Back", value: "back", description: undefined }
@@ -161,6 +185,7 @@ async function routing(ctx: Context, app: App): Promise<void> {
   const ids = app.bridge.status().channels.map((c) => c.id)
   const via = app.router.channel(root)
   const mode = app.router.mode(root)
+  const chat = app.bridge.chatEnabled(root)
   const pick = await ctx.ui.dialog.select<string>({
     title: "This session",
     current: mode === "on" && via ? `on:${via}` : mode,
@@ -173,10 +198,18 @@ async function routing(ctx: Context, app: App): Promise<void> {
       })),
       { title: "off", value: "off", description: "never mirror" },
       { title: "auto", value: "auto", description: "when away, by the rules" },
+      {
+        title: `Chat from Telegram: ${chat ? "on" : "off"}`,
+        value: "chat",
+        description: chat
+          ? "stop taking messages from the topic"
+          : "let messages in this session's topic reach it",
+      },
       BACK,
     ],
   })
   if (!pick || pick === "back") return
+  if (pick === "chat") return setChat(ctx, app, !chat)
   const [m, ch] = pick.split(":")
   setRouting(ctx, app, m as "on" | "off" | "auto", ch)
 }

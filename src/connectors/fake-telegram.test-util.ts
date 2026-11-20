@@ -44,7 +44,22 @@ export async function fakeTelegram(token = "123456:TESTTOKEN") {
     req.on("end", async () => {
       const m = /^\/bot([^/]+)\/(\w+)$/.exec(req.url ?? "")
       if (req.method !== "POST" || !m) return void res.writeHead(404).end()
-      const body = data ? JSON.parse(data) : {}
+      // A file upload is multipart: its fields and the file text are kept as they came.
+      const multipart = /multipart/.test(req.headers["content-type"] ?? "")
+      const body = multipart
+        ? {
+            multipart: true,
+            fields: Object.fromEntries(
+              [
+                ...data.matchAll(
+                  /name="([^"]+)"(?:; filename="[^"]*")?\r\n(?:Content-Type: [^\r]*\r\n)?\r\n([\s\S]*?)\r\n--/g,
+                ),
+              ].map((m) => [m[1], m[2]]),
+            ),
+          }
+        : data
+          ? JSON.parse(data)
+          : {}
       const call = { method: m[2], token: m[1], body }
       const send = (status: number, json: unknown) => {
         res.writeHead(status, { "Content-Type": "application/json" })

@@ -21,7 +21,7 @@ export type Capabilities = {
   threads: boolean
   /** The connector can bind itself to a chat through `pair()`. */
   pairing: boolean
-  /** Messages typed in a session's thread may be sent to the session. Not implemented by any connector yet. */
+  /** Messages typed in a session's thread may be sent to the session, and its replies are posted back (`reply`). */
   inboundPrompt: boolean
 }
 
@@ -87,6 +87,8 @@ export type SessionState = {
   state: "working" | "idle" | "failed"
   /** Epoch ms of the last change. */
   at: number
+  /** Chatting with this session from the connector is on. */
+  chat?: boolean
 }
 
 /** Filled in by the connector during `send`/`update`, for the trace. */
@@ -109,8 +111,11 @@ export type Push = {
 
 /** Something a person sent through a connector. */
 export type Inbound = {
-  /** `answer` replies to a prompt; `prompt` is text for a session (reserved, ignored by the core for now). */
-  kind: "answer" | "prompt"
+  /**
+   * `answer` replies to a pending question; `prompt` is text for a session;
+   * `control` is a button of the connector's own (`text` is "chat off").
+   */
+  kind: "answer" | "prompt" | "control"
   /** Transport message id, to tell a replay from a second answer. */
   id: string
   /** Seconds since the epoch. */
@@ -119,7 +124,7 @@ export type Inbound = {
   pendingId?: string
   /** Reference of the message replied to, when the sender replied to one. */
   replyTo?: string
-  /** The thread or room it was sent in, as the connector's `send` grouped it. */
+  /** The top-level session whose thread it was sent in, or whose message it replies to, as `push.session.id`. */
   sessionKey?: string
   text: string
   /** 1-based option from a button tap. */
@@ -132,7 +137,12 @@ export type Inbound = {
   literal?: boolean
 }
 
-export type Outcome = { ok: boolean; text: string }
+export type Outcome = {
+  ok: boolean
+  text: string
+  /** The text of a message was sent to a session: the connector may acknowledge it. */
+  sent?: boolean
+}
 
 /** Resolves undefined for input that is silently ignored. */
 export type OnInbound = (m: Inbound) => Promise<Outcome | undefined>
@@ -171,6 +181,13 @@ export interface Connector {
   hint(id: string, questions: Question[]): string
   /** Which of the session-end pushes this connector wants. Both when unset. */
   readonly notify?: { finished: boolean; failed: boolean }
+  /** Shows the reply being written: all of its text so far. Only with `inboundPrompt`; never throws. */
+  stream?(session: NonNullable<Push["session"]>, text: string): void
+  /** Posts the final text of a turn to the session's thread. Only with `inboundPrompt`; never throws. */
+  reply?(
+    session: NonNullable<Push["session"]>,
+    text: string,
+  ): Promise<{ parts: number; documents: number } | undefined>
   /** Keeps a live view of a session (a status card, a topic title). Never throws. */
   track?(state: SessionState): Promise<void>
   /** Returns a reference to the sent message; never throws. */

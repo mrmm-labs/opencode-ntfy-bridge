@@ -156,6 +156,37 @@ describe("parseConfig channels", () => {
       )
   })
 
+  it("reads chat.deny, chat.mirror and chat.stream, and refuses bad ones", () => {
+    const base = { channels: { telegram: { token: { env: "TG" } } } }
+    const d = parseConfig(base) as Config
+    assert.deepEqual(d.chat, { deny: [], mirror: "replies", stream: true })
+    const c = parseConfig({
+      ...base,
+      chat: {
+        mirror: "remote-only",
+        stream: false,
+        deny: [{ directory: "**/payroll" }, { agent: "^ops$" }],
+      },
+    }) as Config
+    assert.equal(c.chat.mirror, "remote-only")
+    assert.equal(c.chat.stream, false)
+    assert.equal(c.chat.deny[0].directory, "**/payroll")
+    assert.ok(c.chat.deny[1].agent!.test("ops"))
+    for (const bad of [
+      "yes",
+      { mirror: "all" },
+      { stream: "no" },
+      { deny: {} },
+      { deny: [{}] },
+      { deny: [{ agent: "(" }] },
+      { deny: ["x"] },
+    ])
+      assert.ok(
+        "error" in (parseConfig({ ...base, chat: bad }) as object),
+        JSON.stringify(bad),
+      )
+  })
+
   it("runs both channels together", () => {
     const c = parseConfig({
       channels: { ntfy, telegram: { token: { env: "TG" } } },

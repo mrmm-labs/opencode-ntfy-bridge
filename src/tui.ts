@@ -11,7 +11,7 @@ import { connectorTypes } from "./connectors/index.ts"
 import type { Connector } from "./connectors/types.ts"
 import { dataDir, loadConfig } from "./config.ts"
 import { log } from "./logger.ts"
-import { runCommand, type App } from "./menu.ts"
+import { runCommand, saveSession, type App } from "./menu.ts"
 import { resolveOtel, Telemetry } from "./otel.ts"
 import { PendingStore } from "./pending.ts"
 import { Router } from "./routing.ts"
@@ -32,6 +32,8 @@ const EVENTS: BridgeEvent["type"][] = [
   "session.execution.interrupted",
   "session.renamed",
   "session.model.selected",
+  "session.text.delta",
+  "session.text.ended",
 ]
 
 export function host(ctx: Context): Host {
@@ -57,6 +59,11 @@ export function host(ctx: Context): Host {
     root: (id) => ctx.data.session.root(id) || id,
     replyForm: (sessionID, formID, answer) =>
       ctx.data.session.form.reply({ sessionID, formID, answer }),
+    // Queued behind a running turn, so a message sent while the agent works never interrupts a step.
+    prompt: async (sessionID, text) => {
+      await ctx.client.session.prompt({ sessionID, text, delivery: "queue" })
+    },
+    busy: (id) => ctx.data.session.status(id) === "running",
   }
 }
 
@@ -129,6 +136,9 @@ export async function setup(
     tel,
   )
   app = { router, bridge, settings }
+  for (const [id, v] of Object.entries(settings.sessions()))
+    if (v.chat) bridge.restoreChat(id)
+  bridge.onChat((root) => saveSession(app!, root))
 
   const off = EVENTS.map((type) =>
     ctx.data.on(
