@@ -346,7 +346,7 @@ describe("chat from Telegram: deny list and the Stop button", () => {
     assert.deepEqual(card.reply_markup, {
       inline_keyboard: [[{ text: "🛑 Stop chat", callback_data: "chatoff" }]],
     })
-    assert.match(card.text, /💬 Chat on/)
+    assert.match(card.text.split("\n")[0], /💬 on — /)
     r.tg.callback(CHAT, 501, "chatoff", 9001)
     await r.tg.waitFor(() => r.tg.of("answerCallbackQuery")[0])
     assert.equal(r.bridge.chatEnabled("root"), false)

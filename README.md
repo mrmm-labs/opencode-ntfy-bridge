@@ -222,20 +222,23 @@ What you get in Telegram:
   `redact` is `title`), and its messages go there. Elsewhere everything goes to the chat, with the
   project and session in each message. The topic is renamed when the session is (at most once a
   minute).
-  - Its first message is a **status card**, pinned without a sound: `🟢 Working`,
-    `💤 Idle since 14:05` or `❌ Failed 14:05`, then the session title, agent and model, project,
-    short session id and last activity. It is edited in place, at most once every 10 seconds.
+  - Its first message is a **status card**, pinned without a sound. The first line, which is all
+    the pinned-message bar shows, reads `<watch> · <chat> — <state>`, for example
+    `👁 on·telegram · 💬 on — 💤 Idle 22:06`. Then come the session title, agent and model,
+    project, short session id and last activity. It is edited in place, at most once every 10 seconds.
     Set `statusCard: false` to turn it off; `notify.finished: true` brings back one message per
     finished turn.
   - Each topic gets an **icon** and a color. The color follows the project, the icon comes from a
     small family per project and the session picks within it, the same every time. `icons` pins
     an emoji for an agent or a project (for example `{ "^coordinator$": "🎯", "api*": "🛠" }`).
-    The card starts with the same emoji. If the icon list is unavailable, only the color is set.
-  - The **topic name and card say how the session is watched**: `👁 on` (forced on; `👁 on·telegram`
-    when forced to one channel), `⏱ auto` (the away rule; the card adds the minutes) or `🔕 off`,
-    then `💬` when chat is on. They follow `/oob on|off|auto` and `/oob chat` at once, but the
-    topic is renamed at most once a minute. A session you switch off before it has a topic does
-    not get one.
+    The card shows the same emoji beside the project. If the icon list is unavailable, only the
+    color is set.
+  - The **first line of the card says how the session is watched**: `👁 on` (forced on;
+    `👁 on·telegram` when forced to one channel), `⏱ auto` (the away rule; a later line adds the
+    minutes) or `🔕 off`, then `💬 on` or `💬 off` for chat, then the state: `🟢 Working`,
+    `💤 Idle 22:06` or `❌ Failed 22:06`. It follows `/oob on|off|auto` and `/oob chat` at once. The
+    topic name is never changed for this, so topics stay easy to tell apart in Telegram's list. A
+    session you switch off before it has a topic does not get one.
   - Without the **Manage topics** admin right the bot cannot make topics. It then says so in the
     chat (at most once an hour), posts in the main chat meanwhile, tries again every 5 minutes, and
     `/oob` Status shows the condition. Granting the right needs no restart.

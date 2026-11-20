@@ -833,7 +833,7 @@ describe("TelegramConnector forum topics", () => {
       type: "session.execution.succeeded",
       data: { sessionID: "root" },
     })
-    assert.equal(a.tg.of("createForumTopic")[0].body.name, "👁 on · shop · Fix")
+    assert.equal(a.tg.of("createForumTopic")[0].body.name, "shop · Fix")
     await a.done()
     const b = await bridgeRig({ redact: "title" })
     b.tg.forum = true
@@ -841,7 +841,7 @@ describe("TelegramConnector forum topics", () => {
       type: "session.execution.succeeded",
       data: { sessionID: "root" },
     })
-    assert.equal(b.tg.of("createForumTopic")[0].body.name, "👁 on · shop")
+    assert.equal(b.tg.of("createForumTopic")[0].body.name, "shop")
     await b.done()
   })
 })
@@ -1172,7 +1172,7 @@ describe("Telegram: status card, rename and icons", () => {
     assert.equal(card.disable_notification, true)
     assert.match(
       card.text,
-      /^.+ 🟢 <b>Working<\/b>\n📌 Fix\n🤖 coordinator · opus\n📁 shop\n🆔 <code>123456<\/code>\n💬 Chat off\n🕐 14:02$/,
+      /^🟢 <b>Working<\/b>\n📌 Fix\n🤖 coordinator · opus\n📁 shop .+\n🆔 <code>123456<\/code>\n🕐 14:02$/,
     )
     const pin = r.tg.of("pinChatMessage")[0].body
     assert.deepEqual(pin, {
@@ -1194,7 +1194,7 @@ describe("Telegram: status card, rename and icons", () => {
     const edit = r.tg.of("editMessageText")
     assert.equal(edit.length, 1)
     assert.equal(edit[0].body.message_id, 501)
-    assert.match(edit[0].body.text, /💤 <b>Idle<\/b> since 14:05/)
+    assert.match(edit[0].body.text, /💤 <b>Idle<\/b> 14:05/)
     assert.equal(r.tg.of("sendMessage").length, 1, "still one card")
     assert.equal(r.tg.of("pinChatMessage").length, 1)
     await r.done()
@@ -1285,7 +1285,7 @@ describe("Telegram: status card, rename and icons", () => {
     const first = b.tg.of("editForumTopic")
     assert.equal(first.length, 1)
     assert.equal(first[0].body.message_thread_id, 9001)
-    assert.equal(first[0].body.name, "👁 on · shop · Plan the move")
+    assert.equal(first[0].body.name, "shop · Plan the move")
 
     clock.t += 20_000
     await b.bridge.onEvent(
@@ -1298,7 +1298,7 @@ describe("Telegram: status card, rename and icons", () => {
     )
     assert.equal(
       b.tg.of("editForumTopic")[1].body.name,
-      "👁 on · shop · Plan the move, v2",
+      "shop · Plan the move, v2",
     )
     assert.match(
       b.tg.of("editMessageText").at(-1)!.body.text,
@@ -1307,35 +1307,70 @@ describe("Telegram: status card, rename and icons", () => {
     await b.done()
   })
 
-  it("the topic and the card show how the session is watched, and follow a change within the rename gap", async () => {
+  it("the topic keeps its plain name; the card's first line shows the watch state and follows a change", async () => {
     const clock = { t: 1_000_000 }
     const b = await bridgeRig({}, { statusCard: true, now: () => clock.t })
     b.tg.forum = true
     await b.bridge.onEvent(ev("session.execution.started"))
-    assert.equal(b.tg.of("createForumTopic")[0].body.name, "👁 on · shop · Fix")
-    assert.match(
-      b.tg.of("sendMessage")[0].body.text,
-      /\n👁 <b>Watched<\/b>: on\n💬 Chat off\n/,
+    assert.equal(b.tg.of("createForumTopic")[0].body.name, "shop · Fix")
+    const firstLine = (t: string) => t.split("\n")[0].replace(/<\/?b>/g, "")
+    assert.equal(
+      firstLine(b.tg.of("sendMessage")[0].body.text),
+      "👁 on · 💬 off — 🟢 Working",
     )
 
+    // The card follows at once, even inside the ten-second gap; the topic is never renamed.
+    clock.t += 1000
     b.router.set("root", undefined)
     await b.bridge.retrack("root")
-    assert.equal(b.tg.of("editForumTopic").length, 1)
-    assert.equal(b.tg.of("editForumTopic")[0].body.name, "⏱ auto · shop · Fix")
-
-    clock.t += 20_000
+    assert.equal(
+      firstLine(b.tg.of("editMessageText").at(-1)!.body.text),
+      "⏱ auto · 💬 off — 🟢 Working",
+    )
+    clock.t += 1000
     b.router.set("root", false)
     await b.bridge.retrack("root")
-    assert.equal(b.tg.of("editForumTopic").length, 1, "too soon to rename")
-    assert.match(
-      b.tg.of("editMessageText").at(-1)!.body.text,
-      /\n🔕 <b>Not watched<\/b>\n/,
+    assert.equal(
+      firstLine(b.tg.of("editMessageText").at(-1)!.body.text),
+      "🔕 off · 💬 off — 🟢 Working",
     )
-    clock.t += 41_000
-    await b.bridge.retrack("root")
-    assert.equal(b.tg.of("editForumTopic").length, 2)
-    assert.equal(b.tg.of("editForumTopic")[1].body.name, "🔕 off · shop · Fix")
+    assert.equal(
+      b.tg.of("editForumTopic").length,
+      0,
+      "no rename for a watch change",
+    )
     await b.done()
+  })
+
+  it("a topic that 0.12.0 renamed gets its plain name back on the next update, then waits the rename gap", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "oobb-rename-"))
+    const topicsFile = join(dir, "t.json")
+    await writeFile(
+      topicsFile,
+      JSON.stringify({
+        [CHAT + ":ses_abcdef123456"]: {
+          thread: 9001,
+          card: 501,
+          name: "👁 on·telegram 💬 · shop · Fix",
+        },
+      }),
+    )
+    const clock = { t: 5_000_000 }
+    const r = await rig({ topicsFile, now: () => clock.t })
+    r.tg.forum = true
+    await r.channel.track(state())
+    const edits = r.tg.of("editForumTopic")
+    assert.equal(edits.length, 1)
+    assert.equal(edits[0].body.name, "shop · Fix")
+    assert.equal(edits[0].body.message_thread_id, 9001)
+    assert.equal(r.tg.of("createForumTopic").length, 0)
+    const saved = JSON.parse(await readFile(topicsFile, "utf8"))
+    assert.equal(saved[CHAT + ":ses_abcdef123456"].name, "shop · Fix")
+
+    clock.t += 1000
+    await r.channel.track(state({ title: "Fix 2", name: "shop · Fix 2" }))
+    assert.equal(r.tg.of("editForumTopic").length, 1, "inside the rename gap")
+    await r.done()
   })
 
   it("switching a session off opens no topic for it, but a session already shown keeps its topic", async () => {
@@ -1348,10 +1383,7 @@ describe("Telegram: status card, rename and icons", () => {
     await r.channel.track(
       state({ watch: { ...off, mode: "on", channel: "telegram" } }),
     )
-    assert.equal(
-      r.tg.of("createForumTopic")[0].body.name,
-      "👁 on·telegram · shop · Fix",
-    )
+    assert.equal(r.tg.of("createForumTopic")[0].body.name, "shop · Fix")
     await r.done()
   })
 
@@ -1425,11 +1457,11 @@ describe("Telegram: status card, rename and icons", () => {
     await r.done()
   })
 
-  it("the status card starts with the topic's emoji", async () => {
+  it("the status card shows the topic's emoji with the project", async () => {
     const r = await rig({ icons: { "^coord": "🎯" } })
     r.tg.forum = true
     await r.channel.track(state())
-    assert.match(r.tg.of("sendMessage")[0].body.text, /^🎯 🟢/)
+    assert.match(r.tg.of("sendMessage")[0].body.text, /\n📁 shop 🎯\n/)
     await r.done()
   })
 
