@@ -7,15 +7,22 @@ import { after, before, describe, it } from "node:test"
 import { fakeNtfy } from "./connectors/fake-ntfy.test-util.ts"
 import { fakeTelegram } from "./connectors/fake-telegram.test-util.ts"
 import type { SidebarView } from "./sidebar.ts"
+import { commandIndex } from "./menu.ts"
 import plugin, { setup } from "./tui.ts"
 
 type Handler = (e: unknown) => void
+
+// One entry per sub-command, besides /oob itself.
+const SUBS = 11
 
 function fakeCtx(size?: { width: number; height: number }) {
   const handlers = new Map<string, Handler>()
   const replies: unknown[] = []
   const toasts: string[] = []
   const commands: Array<{
+    id?: string
+    title?: string
+    description?: string
     palette?: boolean
     slash?: { name: string; aliases?: string[]; arguments?: true }
     run: (i?: string) => unknown
@@ -166,7 +173,7 @@ describe("TUI entry", () => {
     assert.equal(f.handlers.size, 0)
     // /ntfy is registered before any await (OpenCode 2.3.2 drops later layers);
     // without config it only explains itself.
-    assert.equal(f.commands.length, 1)
+    assert.equal(f.commands.length, SUBS + 1)
     // The default "base" mode is inactive while the prompt has focus.
     assert.deepEqual(f.modes, ["global"])
   })
@@ -290,15 +297,82 @@ describe("/oob menu and channels", () => {
     return { f, dir, cmd, cleanup }
   }
 
-  it("is a palette command with the ntfy alias, registered synchronously", async () => {
+  it("registers /oob (alias ntfy, in the palette) and one /oob-<sub> per sub-command, synchronously", async () => {
     const f = fakeCtx()
     void setup(f.ctx)
-    assert.equal(f.commands.length, 1)
-    assert.equal(f.commands[0].palette, true)
-    assert.deepEqual(f.commands[0].slash?.aliases, ["ntfy"])
-    assert.equal(f.commands[0].slash?.name, "oob")
-    assert.equal(f.commands[0].slash?.arguments, true)
+    const main = f.commands.filter((c) => c.slash?.name === "oob")
+    assert.equal(main.length, 1)
+    assert.equal(main[0].palette, true)
+    assert.deepEqual(main[0].slash?.aliases, ["ntfy"])
+    assert.equal(main[0].slash?.arguments, true)
+    assert.equal(f.commands.length, SUBS + 1)
     assert.deepEqual(f.modes, ["global"])
+  })
+
+  it("the /oob-<sub> entries match the registry 1:1, with unique names and ids", async () => {
+    const f = fakeCtx()
+    void setup(f.ctx)
+    const reg = commandIndex(f.ctx)
+    const subs = f.commands.filter((c) => c.slash?.name !== "oob")
+    assert.deepEqual(
+      subs.map((c) => c.slash!.name),
+      reg.map((c) => `oob-${c.name}`),
+    )
+    assert.deepEqual(
+      subs.map((c) => c.slash!.name),
+      [
+        "oob-on",
+        "oob-off",
+        "oob-auto",
+        "oob-chat",
+        "oob-delivery",
+        "oob-channel",
+        "oob-pair",
+        "oob-test",
+        "oob-sidebar",
+        "oob-status",
+        "oob-help",
+      ],
+    )
+    for (const [i, c] of subs.entries()) {
+      assert.equal(c.slash!.arguments, true)
+      assert.equal(c.slash!.aliases, undefined)
+      assert.equal(c.palette, undefined)
+      assert.equal(c.title, `oob: ${reg[i].title}`)
+      assert.ok(c.description!.includes(reg[i].description))
+      assert.ok(c.description!.includes(reg[i].usage))
+    }
+    const all = f.commands.map((c) => c.slash!.name)
+    assert.equal(new Set(all).size, all.length)
+    const ids = f.commands.map((c) => c.id)
+    assert.equal(new Set(ids).size, ids.length)
+  })
+
+  it("/oob-<sub> <rest> runs exactly like /oob <sub> <rest>", async () => {
+    const tg = await fakeTelegram()
+    const { f, cleanup } = await started({
+      telegram: { token: { env: "OOBB_TG" }, chatId: 7, apiBase: tg.url },
+    })
+    const by = (n: string) => f.commands.find((c) => c.slash?.name === n)!
+    await by("oob-delivery").run("steer")
+    assert.match(f.toasts.at(-1)!, /Delivery for this session: steer/)
+    await by("oob-chat").run("on")
+    assert.match(f.toasts.at(-1)!, /Chat is on/)
+    await by("oob-off").run()
+    assert.equal(f.toasts.at(-1), "oob routing: off, chat on")
+    // Nothing typed after the name: the argument is asked for, as in /oob chat.
+    f.picks.push("off")
+    await by("oob-chat").run()
+    assert.equal(
+      f.dialogs.at(-1)!.title,
+      "Write to this session from the channel",
+    )
+    assert.match(f.toasts.at(-1)!, /Chat is off/)
+    // A wrong value is named, as in the typed form.
+    await by("oob-delivery").run("fast")
+    assert.match(f.toasts.at(-1)!, /"fast" is not a mode/)
+    await cleanup()
+    await tg.close()
   })
 
   it("/oob alone opens a searchable picker of every sub-command, then walks the arguments", async () => {
@@ -433,7 +507,7 @@ describe("/oob menu and channels", () => {
     )
     await new Promise((r) => setTimeout(r, 100))
     assert.equal(n2.subscribes.length, 0)
-    await f2.commands[0].run("test")
+    await f2.commands.find((c) => c.slash?.name === "oob")!.run("test")
     assert.equal(f2.toasts.at(-1), "No channel is enabled")
     await cleanup2!()
     await n2.close()

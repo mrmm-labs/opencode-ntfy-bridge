@@ -301,6 +301,32 @@ export async function dispatch(
   if (values) await b.cmd.run(values)
 }
 
+export type SlashEntry = {
+  id: string
+  title: string
+  description: string
+  slash: { name: string; arguments: true }
+  run: (input?: string) => void | Promise<void>
+}
+
+/**
+ * One host slash entry per sub-command: the host completes only slash names, so
+ * `/oob-chat` is how a sub-command shows up in its list. `run` is given what
+ * `/oob <name> ` would be followed by.
+ */
+export function slashEntries(
+  cmds: SubCommand[],
+  runLine: (line: string) => void | Promise<void>,
+): SlashEntry[] {
+  return cmds.map((c) => ({
+    id: `oob-bridge.sub.${c.name}`,
+    title: `oob: ${c.title}`,
+    description: `${c.description} (${c.usage})`,
+    slash: { name: `oob-${c.name}`, arguments: true as const },
+    run: (input) => runLine(`${c.name} ${input ?? ""}`.trim()),
+  }))
+}
+
 /** The table behind `/oob help`, aligned for a dialog. */
 export function helpText(cmds: SubCommand[]): string {
   const width = Math.max(...cmds.map((c) => c.usage.length))
