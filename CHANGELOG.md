@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.5.0...v0.6.0) (2026-11-20)
+
+
+### Features
+
+* Telegram free-text answers, group pairing, status card, icons and richer messages ([#17](https://github.com/mrmm-labs/opencode-oob-bridge/issues/17)) ([055fc68](https://github.com/mrmm-labs/opencode-oob-bridge/commit/055fc68c6631eb3db61c27be3d2994b5510f163c))
+
 ## [0.5.0](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.4.0...v0.5.0) (2026-11-19)
 
 
