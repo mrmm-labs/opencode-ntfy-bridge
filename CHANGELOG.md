@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.8.0...v0.9.0) (2026-11-20)
+
+
+### Features
+
+* sidebar section at the top with rows, dropdowns and a compact mode ([#26](https://github.com/mrmm-labs/opencode-oob-bridge/issues/26)) ([bc79d4a](https://github.com/mrmm-labs/opencode-oob-bridge/commit/bc79d4ad61364c664d95b065199e5387aa9d9067))
+
 ## [0.8.0](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.7.1...v0.8.0) (2026-11-20)
 
 
