@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.9.0...v0.10.0) (2026-11-20)
+
+
+### Features
+
+* one registry of /oob sub-commands, with a searchable picker ([#28](https://github.com/mrmm-labs/opencode-oob-bridge/issues/28)) ([8f15959](https://github.com/mrmm-labs/opencode-oob-bridge/commit/8f1595925b381f92906e0ce3f0cb2ee4478fd941))
+
 ## [0.9.0](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.8.0...v0.9.0) (2026-11-20)
 
 
