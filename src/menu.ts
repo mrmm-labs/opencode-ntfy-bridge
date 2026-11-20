@@ -1,12 +1,21 @@
-/** The `/oob` command: routing for the session, channel settings, pairing, test push, status. */
+/** What the `/oob` sub-commands do; which ones there are is in `buildCommands`. */
 import type { Plugin } from "@opencode/plugin/tui"
 
 import type { Bridge } from "./bridge.ts"
-import { SIDEBAR_MODES, type Delivery, type SidebarMode } from "./config.ts"
+import type { Delivery, SidebarMode } from "./config.ts"
 import type { Connector } from "./connectors/types.ts"
 import { renderQr } from "./qr.ts"
 import type { Router } from "./routing.ts"
 import type { SettingsStore } from "./settings.ts"
+import { rowDialog, sidebarState, TITLE } from "./sidebar.ts"
+import {
+  dispatch,
+  helpText,
+  sub,
+  type Option,
+  type SubCommand,
+  type Ui,
+} from "./subcommands.ts"
 
 type Context = Plugin.Context
 
@@ -15,9 +24,6 @@ export type App = {
   bridge: Bridge
   settings: SettingsStore
 }
-
-const USAGE =
-  "Usage: /oob [on [<channel>|all]|off|auto|chat on|chat off|delivery queue|steer|default|sidebar full|compact|off|status|test|pair <channel>]"
 
 /** Connectors that can bind to a chat. */
 const pairable = (app: App) =>
@@ -37,59 +43,6 @@ function sessionRoot(ctx: Context): string | undefined {
   return route.type === "session"
     ? ctx.data.session.root(route.sessionID) || route.sessionID
     : undefined
-}
-
-export async function runCommand(
-  ctx: Context,
-  app: App | undefined,
-  input?: string,
-): Promise<void> {
-  if (!app)
-    return toast(
-      ctx,
-      "oob bridge is not configured or still starting",
-      "warning",
-    )
-  app.router.touch()
-  const arg = (input ?? "").trim().toLowerCase().replace(/\s+/g, " ")
-  if (!arg) return menu(ctx, app)
-  const [word, via, ...extra] = arg.split(" ")
-  if (word === "on" && extra.length === 0)
-    return setRouting(ctx, app, "on", via)
-  if ((word === "off" || word === "auto") && via === undefined)
-    return setRouting(ctx, app, word)
-  if (word === "chat" && (via === "on" || via === "off") && extra.length === 0)
-    return setChat(ctx, app, via === "on")
-  if (
-    word === "delivery" &&
-    (via === "queue" || via === "steer" || via === "default") &&
-    extra.length === 0
-  )
-    return setDelivery(ctx, app, via === "default" ? undefined : via)
-  if (
-    word === "sidebar" &&
-    SIDEBAR_MODES.includes(via as SidebarMode) &&
-    extra.length === 0
-  ) {
-    setSidebarMode(app, via as SidebarMode)
-    return toast(ctx, `Sidebar block: ${via}`)
-  }
-  if (arg === "status") return status(ctx, app)
-  if (arg === "test") return test(ctx, app)
-  if (word === "pair" && extra.length === 0) {
-    const c = via === undefined ? pairable(app)[0] : find(app, via)
-    if (via === undefined && pairable(app).length > 1)
-      return toast(
-        ctx,
-        `Pair which? ${pairable(app)
-          .map((x) => x.id)
-          .join(", ")}`,
-        "warning",
-      )
-    // From the command line the dialog is not awaited: the command returns at once.
-    return void (await pair(ctx, app, c))
-  }
-  toast(ctx, USAGE, "warning")
 }
 
 function setRouting(
@@ -136,27 +89,6 @@ export function setSidebarMode(app: App, mode: SidebarMode): void {
   app.bridge.notify()
 }
 
-async function sidebarChoice(ctx: Context, app: App): Promise<void> {
-  const pick = await ctx.ui.dialog.select<SidebarMode>({
-    title: "Sidebar block",
-    current: sidebarMode(app),
-    options: [
-      {
-        title: "full",
-        value: "full",
-        description: "a row each for routing, chat, delivery",
-      },
-      {
-        title: "compact",
-        value: "compact",
-        description: "one line; click it to open /oob",
-      },
-      { title: "off", value: "off", description: "no block" },
-    ],
-  })
-  if (pick) setSidebarMode(app, pick)
-}
-
 /** Keeps a session's routing and chat choices across restarts. */
 export function saveSession(app: App, root: string): void {
   const mode = app.router.mode(root)
@@ -199,114 +131,265 @@ const describe = (app: App, root: string) => {
   return app.bridge.chatEnabled(root) ? `${base}, chat on` : base
 }
 
-const BACK = { title: "← Back", value: "back", description: undefined }
+const SESSION = "Open a session first"
+const needSession = (ctx: Context) => (sessionRoot(ctx) ? undefined : SESSION)
 
-/** Stays open after each action; Esc closes it, "← Back" in a submenu returns here. */
-async function menu(ctx: Context, app: App): Promise<void> {
-  for (;;) {
-    const choice = await mainMenu(ctx, app)
-    if (!choice) return
-    if (choice === "routing") await routing(ctx, app)
-    else if (choice === "channels") await channelList(ctx, app)
-    else if (choice.startsWith("pair:")) {
-      const closed = await pair(ctx, app, find(app, choice.slice(5)))
-      if (closed) await closed
-    } else if (choice === "sidebar") await sidebarChoice(ctx, app)
-    else if (choice === "test") await test(ctx, app)
-    else if (choice === "status") await status(ctx, app)
-  }
-}
+const onOff = (): Option[] => [
+  { value: "on", title: "On" },
+  { value: "off", title: "Off" },
+]
 
-function mainMenu(ctx: Context, app: App): Promise<string | undefined> {
-  const root = sessionRoot(ctx)
-  const channels = app.bridge.status().channels
-  return ctx.ui.dialog.select({
-    title: "OOB - Remote access",
-    options: [
-      {
-        title: "This session",
-        description: root ? `now: ${describe(app, root)}` : "open a session",
-        value: "routing",
-      },
-      {
-        title: "Channels",
-        description: channels
-          .map((c) => `${c.id} ${c.enabled ? "on" : "off"}`)
-          .join(", "),
-        value: "channels",
-      },
-      ...pairable(app).map((c) => ({
-        title: `Pair ${c.id}`,
-        value: `pair:${c.id}`,
-        description: undefined,
-      })),
-      {
-        title: "Sidebar",
-        description: sidebarMode(app),
-        value: "sidebar",
-      },
-      { title: "Send test push", value: "test", description: undefined },
-      { title: "Status", value: "status", description: undefined },
-    ],
-  })
-}
-
-async function routing(ctx: Context, app: App): Promise<void> {
-  const root = sessionRoot(ctx)
-  if (!root) return toast(ctx, "Open a session first", "warning")
-  const ids = app.bridge.status().channels.map((c) => c.id)
-  const via = app.router.channel(root)
-  const mode = app.router.mode(root)
-  const chat = app.bridge.chatEnabled(root)
-  const pick = await ctx.ui.dialog.select<string>({
-    title: "This session",
-    current: mode === "on" && via ? `on:${via}` : mode,
-    options: [
-      { title: "on", value: "on", description: "mirror now, default channel" },
-      ...[...ids, ...(ids.length > 1 ? ["all"] : [])].map((id) => ({
-        title: `on via ${id}`,
-        value: `on:${id}`,
-        description: `mirror now, only ${id === "all" ? "through every channel" : id}`,
-      })),
-      { title: "off", value: "off", description: "never mirror" },
-      { title: "auto", value: "auto", description: "when away, by the rules" },
-      {
-        title: `Chat from Telegram: ${chat ? "on" : "off"}`,
-        value: "chat",
-        description: chat
-          ? "stop taking messages from the topic"
-          : "let messages in this session's topic reach it",
-      },
-      BACK,
-    ],
-  })
-  if (!pick || pick === "back") return
-  if (pick === "chat") return setChat(ctx, app, !chat)
-  const [m, ch] = pick.split(":")
-  setRouting(ctx, app, m as "on" | "off" | "auto", ch)
-}
-
-/** Stays open so several channels can be switched in a row. */
-async function channelList(ctx: Context, app: App): Promise<void> {
-  for (;;) {
-    const channels = app.bridge.status().channels
-    const id = await ctx.ui.dialog.select<string>({
-      title: "Channels (pick one to switch it)",
-      options: [
-        ...channels.map((c) => ({
-          title: `${c.id}: ${c.enabled ? "on" : "off"}`,
-          value: c.id,
-          description: undefined,
-        })),
-        BACK,
+/** Every `/oob` sub-command. The typed form, the picker, help and the README read this list. */
+export function buildCommands(ctx: Context, app: App): SubCommand[] {
+  const root = () => sessionRoot(ctx)!
+  const dialog = (row: "chat" | "replies") => () =>
+    rowDialog(sidebarState(app, root()), row)
+  const channelIds = () => app.bridge.connectors().map((c) => c.id)
+  const cmds: SubCommand[] = [
+    sub({
+      name: "on",
+      title: "Notify: on",
+      description:
+        "Push this session's questions and notices now, through one channel or all.",
+      group: "This session",
+      unavailable: () => needSession(ctx),
+      args: [
+        {
+          name: "channel",
+          kind: "enum",
+          title: "Push through which channel?",
+          placeholder: "channel|all",
+          optional: true,
+          noneTitle: "Default channel",
+          options: () => [
+            ...channelIds().map((id) => ({
+              value: id,
+              title: id,
+              description: `push now, only through ${id}`,
+            })),
+            ...(channelIds().length > 1
+              ? [
+                  {
+                    value: "all",
+                    title: "all",
+                    description: "push now, through every channel",
+                  },
+                ]
+              : []),
+          ],
+          current: () => app.router.channel(root()),
+        },
       ],
-    })
-    const c = channels.find((x) => x.id === id)
-    if (!c) return
-    app.bridge.setEnabled(c.id, !c.enabled)
-    app.settings.set(c.id, { enabled: !c.enabled })
-    toast(ctx, `${c.id}: ${c.enabled ? "off" : "on"}`)
-  }
+      run: (v) => setRouting(ctx, app, "on", v.channel),
+    }),
+    sub({
+      name: "off",
+      title: "Notify: off",
+      description: "Never push this session.",
+      group: "This session",
+      unavailable: () => needSession(ctx),
+      run: () => setRouting(ctx, app, "off"),
+    }),
+    sub({
+      name: "auto",
+      title: "Notify: when away",
+      description:
+        "Push this session after the away time without input, if the rules pick it.",
+      group: "This session",
+      unavailable: () => needSession(ctx),
+      run: () => setRouting(ctx, app, "auto"),
+    }),
+    sub({
+      name: "chat",
+      title: "Chat",
+      description:
+        "Let messages in the session's topic reach it, or stop taking them.",
+      group: "This session",
+      unavailable: () => needSession(ctx),
+      args: [
+        {
+          name: "state",
+          kind: "enum",
+          title: "Write to this session from the channel",
+          placeholder: "on|off",
+          options: () => dialog("chat")().options,
+          current: () => dialog("chat")().current,
+        },
+      ],
+      run: (v) => setChat(ctx, app, v.state === "on"),
+    }),
+    sub({
+      name: "delivery",
+      title: "Replies",
+      description:
+        "How your messages from a channel reach a busy session: queue, steer, or the config's default.",
+      group: "This session",
+      unavailable: () => needSession(ctx),
+      args: [
+        {
+          name: "mode",
+          kind: "enum",
+          title: "How your messages arrive",
+          placeholder: "queue|steer|default",
+          options: () => dialog("replies")().options,
+          current: () => dialog("replies")().current,
+        },
+      ],
+      run: (v) =>
+        setDelivery(
+          ctx,
+          app,
+          v.mode === "default" ? undefined : (v.mode as Delivery),
+        ),
+    }),
+    sub({
+      name: "channel",
+      title: "Switch a channel",
+      description:
+        "Turn a channel on or off for every session; kept across restarts.",
+      group: "Channels",
+      args: [
+        {
+          name: "name",
+          kind: "enum",
+          title: "Which channel?",
+          placeholder: "channel",
+          options: () =>
+            app.bridge.status().channels.map((c) => ({
+              value: c.id,
+              title: c.id,
+              description: c.enabled ? "on" : "off",
+            })),
+        },
+        {
+          name: "state",
+          kind: "enum",
+          title: "Turn it",
+          placeholder: "on|off",
+          options: () => onOff(),
+          current: (g) =>
+            app.bridge.status().channels.find((c) => c.id === g.name)?.enabled
+              ? "on"
+              : "off",
+        },
+      ],
+      run: (v) => {
+        const enabled = v.state === "on"
+        app.bridge.setEnabled(v.name!, enabled)
+        app.settings.set(v.name!, { enabled })
+        toast(ctx, `${v.name}: ${v.state}`)
+      },
+    }),
+    sub({
+      name: "pair",
+      title: "Pair a channel",
+      description:
+        "Show the code or link that binds a channel to a chat (the name can be left out when only one can pair).",
+      group: "Channels",
+      unavailable: () =>
+        pairable(app).length === 0
+          ? "No channel can be paired: add one that supports it to the config file"
+          : undefined,
+      args: [
+        {
+          name: "channel",
+          kind: "enum",
+          title: "Pair which channel?",
+          placeholder: "channel",
+          options: () =>
+            pairable(app).map((c) => ({ value: c.id, title: c.id })),
+          default: () =>
+            pairable(app).length === 1 ? pairable(app)[0].id : undefined,
+        },
+      ],
+      // The command returns at once; the dialog closes by itself when pairing ends.
+      run: async (v) => void (await pair(ctx, app, find(app, v.channel!))),
+    }),
+    sub({
+      name: "test",
+      title: "Send test push",
+      description: "Push a test message through every enabled channel.",
+      group: "Channels",
+      run: () => test(ctx, app),
+    }),
+    sub({
+      name: "sidebar",
+      title: "Sidebar section",
+      description:
+        "How big the section in the session sidebar is: full, compact or off.",
+      group: "Plugin",
+      args: [
+        {
+          name: "size",
+          kind: "enum",
+          title: "Sidebar section",
+          placeholder: "full|compact|off",
+          options: () => [
+            {
+              value: "full",
+              title: "full",
+              description: "a row each for notify, chat, replies",
+            },
+            {
+              value: "compact",
+              title: "compact",
+              description: "one line; click it to open /oob",
+            },
+            { value: "off", title: "off", description: "no section" },
+          ],
+          current: () => sidebarMode(app),
+        },
+      ],
+      run: (v) => {
+        setSidebarMode(app, v.size as SidebarMode)
+        toast(ctx, `Sidebar block: ${v.size}`)
+      },
+    }),
+    sub({
+      name: "status",
+      title: "Status",
+      description:
+        "Show each channel's connection, the open prompts and this session's settings.",
+      group: "Plugin",
+      run: () => status(ctx, app),
+    }),
+  ]
+  cmds.push(
+    sub({
+      name: "help",
+      title: "Help",
+      description: "List every sub-command with its usage.",
+      group: "Plugin",
+      run: () =>
+        ctx.ui.dialog.alert({
+          title: `${TITLE}: commands`,
+          message: helpText(cmds),
+        }),
+    }),
+  )
+  return cmds
+}
+
+const uiOf = (ctx: Context): Ui => ({
+  select: (o) => ctx.ui.dialog.select(o as never),
+  prompt: (o) => ctx.ui.dialog.prompt(o),
+  toast: (message, variant = "info") => toast(ctx, message, variant),
+})
+
+/** `/oob` with what was typed after it: nothing opens the picker. */
+export async function runCommand(
+  ctx: Context,
+  app: App | undefined,
+  input?: string,
+): Promise<void> {
+  if (!app)
+    return toast(
+      ctx,
+      "oob bridge is not configured or still starting",
+      "warning",
+    )
+  app.router.touch()
+  await dispatch(uiOf(ctx), TITLE, buildCommands(ctx, app), input)
 }
 
 async function test(ctx: Context, app: App): Promise<void> {
@@ -339,7 +422,7 @@ async function status(ctx: Context, app: App): Promise<void> {
   lines.push(`Open prompts: ${st.pending}`)
   if (root) lines.push(`This session: ${describe(app, root)}`)
   await ctx.ui.dialog.alert({
-    title: "OOB - Remote access status",
+    title: `${TITLE} status`,
     message: lines.join("\n"),
   })
 }
