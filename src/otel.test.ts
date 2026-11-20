@@ -509,7 +509,16 @@ describe("connector telemetry carries no identifiers", () => {
     conn.start(async () => undefined, ac.signal)
     tg.fail("getUpdates", 502)
     tg.message(999, `intruder says ${SECRET}`)
-    await new Promise((r) => setTimeout(r, 300))
+    // Until both have happened, not for a fixed time: a loaded machine is slower.
+    const end = Date.now() + 5000
+    const seen = () =>
+      ["oob.reconnect", "oob.inbound"].every((n) =>
+        c.spans().some((s) => s.name === n),
+      )
+    while (!seen() && Date.now() < end) {
+      await tel.flush()
+      await new Promise((r) => setTimeout(r, 20))
+    }
     await conn.send({ title: TITLE, message: `${QUESTION} ${SECRET}` })
     ac.abort()
     await tel.flush()

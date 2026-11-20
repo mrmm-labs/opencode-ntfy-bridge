@@ -96,6 +96,12 @@ describe("lazyToken backoff", () => {
   })
 })
 
+/** Polls until `fn` holds: the wait text only shows between two tries, so one look can miss it under load. */
+async function until(fn: () => boolean, ms = 5000) {
+  const end = Date.now() + ms
+  while (!fn() && Date.now() < end) await sleep(10)
+}
+
 /** Waits for the second try, then counts the tries over a stretch much longer than a fast loop would need. */
 async function triesAfterSecond(state: { calls: number }) {
   const until = Date.now() + 5000
@@ -123,6 +129,7 @@ describe("Telegram while the token is unavailable", () => {
       assert.ok(before >= 2, `${before} tries`)
       // A fast loop at 5-10 ms would make dozens; one try per 250 ms makes about two.
       assert.ok(during <= 6, `${during} tries in 600 ms`)
+      await until(() => WAITING.test(c.status().lastError ?? ""))
       assert.match(c.status().lastError ?? "", WAITING)
       assert.equal(c.status().connected, false)
     } finally {
@@ -149,6 +156,7 @@ describe("ntfy while the token is unavailable", () => {
       assert.ok(before >= 2, `${before} tries`)
       assert.ok(during <= 6, `${during} tries in 600 ms`)
       assert.equal(f.subscribes.length, 0, "no anonymous subscription")
+      await until(() => WAITING.test(n.error() ?? ""))
       assert.match(n.error() ?? "", WAITING)
     } finally {
       ac.abort()

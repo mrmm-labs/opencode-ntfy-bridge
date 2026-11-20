@@ -44,8 +44,8 @@
   "scripts": {
     "build": "rm -rf dist && tsc",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.tui.json",
-    "test": "OPENCODE_OOB_BRIDGE_CONFIG=/nonexistent/oob-bridge.jsonc OPENCODE_OOB_BRIDGE_DATA=/nonexistent/oob-bridge OPENCODE_OOB_BRIDGE_LOG=/dev/null node --test --test-timeout=60000 --experimental-strip-types 'src/**/*.test.ts'",
-    "test:e2e": "OPENCODE_OOB_BRIDGE_CONFIG=/nonexistent/oob-bridge.jsonc OPENCODE_OOB_BRIDGE_DATA=/nonexistent/oob-bridge OPENCODE_OOB_BRIDGE_LOG=/dev/null node --test --test-timeout=120000 --experimental-strip-types src/e2e.test.ts",
+    "test": "OPENCODE_OOB_BRIDGE_CONFIG=/nonexistent/oob-bridge.jsonc OPENCODE_OOB_BRIDGE_DATA=/nonexistent/oob-bridge OPENCODE_OOB_BRIDGE_LOG=/dev/null node --test --test-force-exit --test-timeout=60000 --experimental-strip-types 'src/**/*.test.ts'",
+    "test:e2e": "OPENCODE_OOB_BRIDGE_CONFIG=/nonexistent/oob-bridge.jsonc OPENCODE_OOB_BRIDGE_DATA=/nonexistent/oob-bridge OPENCODE_OOB_BRIDGE_LOG=/dev/null node --test --test-force-exit --test-timeout=120000 --experimental-strip-types src/e2e.test.ts",
     "lint": "oxlint && oxfmt --check .",
     "lint:fix": "oxlint --fix . && oxfmt --write .",
     "format": "oxfmt --write .",
