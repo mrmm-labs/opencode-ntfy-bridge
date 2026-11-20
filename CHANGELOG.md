@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.0](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.6.0...v0.7.0) (2026-11-20)
+
+
+### Features
+
+* chat with a session from its Telegram topic, with live streaming ([#19](https://github.com/mrmm-labs/opencode-oob-bridge/issues/19)) ([4ae0579](https://github.com/mrmm-labs/opencode-oob-bridge/commit/4ae057985ff5d0d6e441e5780c1d9ecea293ae41))
+* start sessions and run slash commands from Telegram ([#20](https://github.com/mrmm-labs/opencode-oob-bridge/issues/20)) ([a77d884](https://github.com/mrmm-labs/opencode-oob-bridge/commit/a77d8840ee36e2e972159aad17603b6fe2099246))
+
 ## [0.6.0](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.5.0...v0.6.0) (2026-11-20)
 
 
