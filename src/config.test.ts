@@ -163,9 +163,19 @@ describe("parseConfig channels", () => {
       deny: [],
       mirror: "replies",
       stream: true,
+      redact: { mode: "full" },
       projects: {},
       models: [],
     })
+    assert.deepEqual(
+      (parseConfig({ ...base, redact: "head:300" }) as Config).chat.redact,
+      { mode: "full" },
+    )
+    assert.deepEqual(
+      (parseConfig({ ...base, redact: "title" }) as Config).chat.redact,
+      { mode: "title" },
+    )
+    assert.ok("error" in parseConfig({ ...base, chat: { redact: "half" } }))
     const c = parseConfig({
       ...base,
       chat: {

@@ -36,6 +36,8 @@ export type ChatConfig = {
   mirror: "replies" | "remote-only"
   /** Show a reply being written, in one message edited as it grows. */
   stream: boolean
+  /** Applied to chat replies instead of `redact`: a reply cut at a prompt's preview length is unreadable. Default `full`. */
+  redact: Redact
   /** The folders a session can be started in from a chat, by name. Empty: starting sessions from a chat is off. */
   projects: Record<
     string,
@@ -163,6 +165,7 @@ function parseChat(raw: unknown): ChatConfig | { error: string } {
       deny: [],
       mirror: "replies",
       stream: true,
+      redact: { mode: "full" },
       projects: {},
       models: [],
     }
@@ -173,6 +176,9 @@ function parseChat(raw: unknown): ChatConfig | { error: string } {
   const stream = raw.stream ?? true
   if (typeof stream !== "boolean")
     return { error: "chat.stream must be true or false" }
+  const redact = parseRedact(raw.redact)
+  if (!redact)
+    return { error: 'chat.redact must be "full", "title" or "head:<n>"' }
   const deny: ChatConfig["deny"] = []
   if (raw.deny !== undefined && !Array.isArray(raw.deny))
     return { error: "chat.deny must be a list" }
@@ -193,7 +199,14 @@ function parseChat(raw: unknown): ChatConfig | { error: string } {
   if ("error" in projects) return projects
   const models = parseModels(raw.models, "chat.models")
   if (typeof models === "string") return { error: models }
-  return { deny, mirror, stream, projects: projects.projects, models }
+  return {
+    deny,
+    mirror,
+    stream,
+    redact,
+    projects: projects.projects,
+    models,
+  }
 }
 
 /** Validates a parsed config file. Returns the config or the first problem. */
@@ -265,6 +278,12 @@ export function parseConfig(raw: unknown): Config | { error: string } {
 
   const chat = parseChat(raw.chat)
   if ("error" in chat) return chat
+  // "title" hides content, so replies inherit it; a head:<n> preview limit does not.
+  if (
+    redact.mode === "title" &&
+    !(isObject(raw.chat) && raw.chat.redact !== undefined)
+  )
+    chat.redact = redact
 
   const messages = parseFormats(raw.messages, "messages")
   if (typeof messages === "string") return { error: messages }

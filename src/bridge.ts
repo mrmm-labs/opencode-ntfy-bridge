@@ -963,7 +963,7 @@ export class Bridge {
       const text = this.joined(root).trim()
       if (!r || !text) return
       feed.streamed = true
-      const clean = redact(text, this.cfg.redact)
+      const clean = redact(text, this.cfg.chat.redact)
       for (const c of r.to)
         if (c.capabilities.inboundPrompt && c.stream) c.stream(r.session, clean)
     } catch (err) {
@@ -991,7 +991,7 @@ export class Bridge {
   }
 
   private async postReply(r: Routed, text: string) {
-    const clean = redact(text, this.cfg.redact)
+    const clean = redact(text, this.cfg.chat.redact)
     await Promise.all(
       r.to
         .filter((c) => c.capabilities.inboundPrompt && c.reply)

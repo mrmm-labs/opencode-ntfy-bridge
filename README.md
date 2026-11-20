@@ -261,6 +261,7 @@ How it behaves:
 ```jsonc
 "chat": {
   "stream": true,         // edit one message while the reply is written
+  "redact": "full",       // replies only; default full, "title" in the top-level redact carries over
   "mirror": "replies",    // "replies": post every final reply; "remote-only": only turns you started from Telegram
   "deny": [ { "directory": "**/payroll" }, { "agent": "^ops$" } ]
 }

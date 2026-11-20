@@ -338,6 +338,28 @@ describe("chat from Telegram: replies", () => {
     await r.done()
   })
 
+  it("a prompt preview limit does not cut replies: chat.redact applies, full by default", async () => {
+    const long = `${"word ".repeat(200)}END`
+    const r = await chatRig({ redact: "head:300", chat: { stream: false } })
+    await chatOn(r)
+    await turn(r, long)
+    const m = await r.tg.waitFor(() =>
+      r.sends().find((b) => /END/.test(b.text)),
+    )
+    assert.ok(m.text.endsWith("END"))
+    await r.done()
+
+    const cut = await chatRig({ chat: { stream: false, redact: "head:50" } })
+    await chatOn(cut)
+    await turn(cut, long, "m2")
+    const c = await cut.tg.waitFor(() =>
+      cut.sends().find((b) => b.text.startsWith("word")),
+    )
+    assert.ok(c.text.length <= 60)
+    assert.ok(!c.text.includes("END"))
+    await cut.done()
+  })
+
   it("only the last assistant message of the turn counts, and secrets are filtered", async () => {
     const r = await chatRig({ chat: { stream: false } })
     await chatOn(r)

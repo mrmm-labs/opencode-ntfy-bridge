@@ -63,6 +63,9 @@
   // "chat": {
   //   "stream": true,
   //   "mirror": "replies", // or "remote-only"
+  //   // Replies use this instead of the top-level "redact" (default "full"):
+  //   // a head:<n> preview limit would cut every reply. "title" carries over.
+  //   "redact": "full",
   //   // Never chat with these, even after /oob chat on.
   //   "deny": [{ "directory": "**/payroll" }, { "agent": "^ops$" }],
   //   // /new starts sessions only in these folders (absolute paths). Without
