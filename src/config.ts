@@ -30,6 +30,10 @@ export type ChannelConfig = {
 
 export type Delivery = "queue" | "steer"
 
+/** The OOB block of the session sidebar: all rows, one line, or nothing. */
+export type SidebarMode = "full" | "compact" | "off"
+export const SIDEBAR_MODES: readonly SidebarMode[] = ["full", "compact", "off"]
+
 export const MIN_STREAM_MS = 800
 const DEFAULT_STREAM_MS = 1000
 
@@ -65,6 +69,8 @@ export type Config = {
   rules: Rule[]
   redact: Redact
   chat: ChatConfig
+  /** Default for the sidebar block; a choice made in the TUI wins. */
+  sidebar: SidebarMode
   messages: Formats
   profiles: Profile[]
   /** Set when `otel.endpoint` is; the environment may still turn telemetry on. */
@@ -272,6 +278,10 @@ export function parseConfig(raw: unknown): Config | { error: string } {
     rules.push(rule)
   }
 
+  const sidebar = raw.sidebar ?? "full"
+  if (!SIDEBAR_MODES.includes(sidebar as SidebarMode))
+    return { error: 'sidebar must be "full", "compact" or "off"' }
+
   const redact = parseRedact(raw.redact)
   if (!redact) return { error: 'redact must be "full", "title" or "head:<n>"' }
 
@@ -319,6 +329,7 @@ export function parseConfig(raw: unknown): Config | { error: string } {
   return {
     channels: configured,
     defaultChannel,
+    sidebar: sidebar as SidebarMode,
     away: { minutes },
     rules,
     redact,

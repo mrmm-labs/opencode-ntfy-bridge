@@ -31,10 +31,11 @@ function fakeCtx(size?: { width: number; height: number }) {
   let cleared = 0
   const modes: Array<string | undefined> = []
   const claims: Array<{
-    append?: string
+    prepend?: string
     render: (i: { sessionID: string }) => unknown
   }> = []
   let released = 0
+  const navigations: unknown[] = []
   const sessions: Record<string, Record<string, unknown>> = {
     root: {
       id: "root",
@@ -73,7 +74,10 @@ function fakeCtx(size?: { width: number; height: number }) {
         claims.push(c)
         return () => void released++
       },
-      router: { current: () => ({ type: "session", sessionID: "root" }) },
+      router: {
+        current: () => ({ type: "session", sessionID: "root" }),
+        navigate: (r: unknown) => navigations.push(r),
+      },
       toast: { show: (o: { message: string }) => toasts.push(o.message) },
       dialog: {
         select: async (o: (typeof dialogs)[number]) => {
@@ -98,6 +102,7 @@ function fakeCtx(size?: { width: number; height: number }) {
     dialogs,
     picks,
     claims,
+    navigations,
     released: () => released,
     cleared: () => cleared,
   }
@@ -291,7 +296,7 @@ describe("/oob menu and channels", () => {
     const m = f.dialogs[0]
     assert.deepEqual(
       m.options!.map((o) => o.value),
-      ["routing", "channels", "pair:telegram", "test", "status"],
+      ["routing", "channels", "pair:telegram", "sidebar", "test", "status"],
     )
     assert.equal(m.options![0].description, "now: auto")
     assert.equal(m.options![1].description, "ntfy on, telegram on")
@@ -473,22 +478,36 @@ describe("/oob menu and channels", () => {
     )
     await new Promise((r) => setTimeout(r, 30))
     assert.equal(f.claims.length, 1)
-    assert.equal(f.claims[0].append, "sidebar.content")
+    assert.equal(f.claims[0].prepend, "sidebar.content")
     assert.equal(f.claims[0].render({ sessionID: "root" }), "block")
-    assert.deepEqual(
-      seen[0].lines().map((l) => l.parts.map((p) => p.text).join("")),
-      ["📡 all · auto", "💬 chat: off · queue"],
-    )
+    const rows = () => {
+      const m = seen[0].model()
+      return m.mode === "full"
+        ? m.rows.map((r) => `${r.label}: ${r.value}`)
+        : []
+    }
+    assert.deepEqual(rows(), [
+      "Notify: when away",
+      "Chat: off",
+      "Replies: after turn",
+    ])
     // A change made from the command shows without a new render.
     let changes = 0
     seen[0].subscribe(() => changes++)
     await cmd.run("chat on")
     assert.ok(changes >= 1)
-    assert.equal(seen[0].lines()[1].parts[0].text, "💬 chat: on")
-    // And a click does what the command does.
-    seen[0].activate("delivery")
+    assert.equal(rows()[1], "Chat: on")
+    // A click opens the row's dialog; the pick does what the command does.
+    f.picks.push("steer")
+    seen[0].open("replies")
     await new Promise((r) => setTimeout(r, 30))
-    assert.match(f.toasts.at(-1)!, /Delivery: steer/)
+    assert.match(f.toasts.at(-1)!, /Replies: immediately/)
+    assert.equal(rows()[2], "Replies: immediately")
+    // The sidebar size is a setting: compact and off change the model.
+    await cmd.run("sidebar compact")
+    assert.equal(seen[0].model().mode, "compact")
+    await cmd.run("sidebar off")
+    assert.equal(seen[0].model().mode, "off")
     await cleanup()
     assert.equal(f.released(), 1)
     await tg.close()
@@ -709,12 +728,12 @@ describe("/oob menu and channels", () => {
     assert.deepEqual(
       f.dialogs.map((d) => d.title),
       [
-        "OOB bridge",
+        "OOB - Remote access",
         "This session",
-        "OOB bridge",
-        "OOB bridge status",
-        "OOB bridge",
-        "OOB bridge",
+        "OOB - Remote access",
+        "OOB - Remote access status",
+        "OOB - Remote access",
+        "OOB - Remote access",
       ],
     )
     assert.ok(f.dialogs[1].options!.at(-1)!.value === "back")
@@ -767,7 +786,7 @@ describe("/oob menu and channels", () => {
     await cmd.run()
     assert.deepEqual(
       f.dialogs.map((d) => d.title),
-      ["OOB bridge", "Pair telegram", "OOB bridge"],
+      ["OOB - Remote access", "Pair telegram", "OOB - Remote access"],
     )
     // From the command line the command returns at once, without waiting for the dialog.
     const before = f.dialogs.length

@@ -44,6 +44,9 @@
   // "all" (every enabled channel), "ntfy" or "telegram".
   "defaultChannel": "all",
 
+  // The sidebar section: "full" (a row each), "compact" (one line) or "off".
+  "sidebar": "full",
+
   // Mirror sessions after this many minutes without input in the TUI.
   "away": { "minutes": 10 },
 

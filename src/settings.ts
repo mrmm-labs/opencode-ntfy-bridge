@@ -5,6 +5,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { dirname } from "node:path"
 
+import { SIDEBAR_MODES, type SidebarMode } from "./config.ts"
 import type { ConnectorSettings } from "./connectors/types.ts"
 import { log } from "./logger.ts"
 
@@ -17,6 +18,8 @@ export type SessionSetting = {
   delivery?: "queue" | "steer"
 }
 export type Settings = {
+  /** The sidebar block's size, when chosen in the TUI. */
+  sidebar?: SidebarMode
   channels?: Record<string, ConnectorSettings>
   sessions?: Record<string, SessionSetting>
 }
@@ -53,6 +56,16 @@ export class SettingsStore {
         [id]: { ...this.channel(id), ...patch },
       },
     }
+    this.save()
+  }
+
+  sidebar(): SidebarMode | undefined {
+    const v = this.data.sidebar
+    return SIDEBAR_MODES.includes(v as SidebarMode) ? v : undefined
+  }
+
+  setSidebar(mode: SidebarMode | undefined): void {
+    this.data = { ...this.data, sidebar: mode }
     this.save()
   }
 

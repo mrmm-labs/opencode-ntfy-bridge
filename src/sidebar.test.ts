@@ -4,16 +4,19 @@ import { describe, it } from "node:test"
 import { Bridge, type Host } from "./bridge.ts"
 import { parseConfig, type Config } from "./config.ts"
 import type { Connector } from "./connectors/types.ts"
-import { saveSession, type App } from "./menu.ts"
+import { saveSession, setSidebarMode, type App } from "./menu.ts"
 import { PendingStore } from "./pending.ts"
 import { Router } from "./routing.ts"
 import { SettingsStore } from "./settings.ts"
 import {
-  activate,
+  applyPick,
+  compactParts,
   registerSidebar,
-  sidebarLines,
+  rowDialog,
+  sidebarModel,
+  sidebarRows,
   sidebarState,
-  type Line,
+  type PendingItem,
   type SidebarState,
   type SidebarView,
 } from "./sidebar.ts"
@@ -22,88 +25,218 @@ import { sleep } from "./util.ts"
 const state = (o: Partial<SidebarState> = {}): SidebarState => ({
   mode: "auto",
   channel: "all",
+  channels: ["telegram", "ntfy"],
+  defaultChannel: "all",
   chat: false,
   chatCapable: true,
   delivery: "queue",
   override: false,
-  open: 0,
+  defaultDelivery: "queue",
+  awayMinutes: 10,
+  pending: [],
+  now: 10 * 60_000,
   ...o,
 })
 
-const text = (lines: Line[]) =>
-  lines.map((l) => l.parts.map((p) => p.text).join(""))
+const prompt = (id: string, askedAt = 0): PendingItem => ({
+  id,
+  kind: "question",
+  title: `Pick ${id}`,
+  sessionID: `s-${id}`,
+  askedAt,
+})
 
-describe("sidebarLines", () => {
-  it("shows routing with its channel, and chat with its delivery", () => {
+const flat = (s: SidebarState) =>
+  sidebarRows(s).map((r) => `${r.label}|${r.value}|${r.tone}`)
+
+describe("sidebarRows", () => {
+  it("Notify says on, off or when away, and Chat and Replies follow", () => {
+    assert.deepEqual(flat(state()), [
+      "Notify|when away|normal",
+      "Chat|off|muted",
+      "Replies|after turn|normal",
+    ])
     assert.deepEqual(
-      text(
-        sidebarLines(state({ mode: "on", channel: "telegram", chat: true })),
+      flat(
+        state({
+          mode: "on",
+          channel: "telegram",
+          chat: true,
+          delivery: "steer",
+        }),
       ),
-      ["📡 telegram · on", "💬 chat: on · queue"],
+      ["Notify|on|ok", "Chat|on|ok", "Replies|immediately|normal"],
     )
-    assert.deepEqual(text(sidebarLines(state({ mode: "off" }))), [
-      "📡 off",
-      "💬 chat: off · queue",
-    ])
-    assert.deepEqual(text(sidebarLines(state({ mode: "auto" }))), [
-      "📡 all · auto",
-      "💬 chat: off · queue",
-    ])
+    assert.equal(sidebarRows(state({ mode: "off" }))[0].tone, "muted")
   })
 
-  it("marks a delivery the session chose itself", () => {
-    const [, chat] = sidebarLines(
-      state({ chat: true, delivery: "steer", override: true }),
+  it("Waiting shows only when something waits, in the singular too", () => {
+    assert.equal(sidebarRows(state()).length, 3)
+    assert.deepEqual(flat(state({ pending: [prompt("a")] })).slice(3), [
+      "Waiting|1 question|warn",
+    ])
+    assert.equal(
+      sidebarRows(state({ pending: [prompt("a"), prompt("b")] }))[3].value,
+      "2 questions",
     )
-    assert.equal(chat.parts[1].text, " · steer*")
-    assert.equal(chat.parts[1].tone, "warn")
-  })
-
-  it("shows open prompts only when there are some, in the singular too", () => {
-    assert.equal(sidebarLines(state()).length, 2)
-    assert.deepEqual(text(sidebarLines(state({ open: 1 })).slice(2)), [
-      "⏳ 1 open prompt",
-    ])
-    assert.deepEqual(text(sidebarLines(state({ open: 3 })).slice(2)), [
-      "⏳ 3 open prompts",
-    ])
-  })
-
-  it("never more than three lines, and none of them wide", () => {
-    const lines = sidebarLines(
-      state({
-        mode: "on",
-        channel: "telegram",
-        chat: true,
-        delivery: "steer",
-        override: true,
-        open: 12,
-      }),
+    const permission = { ...prompt("p"), kind: "permission" as const }
+    assert.equal(
+      sidebarRows(state({ pending: [permission] }))[3].value,
+      "1 request",
     )
-    assert.equal(lines.length, 3)
-    for (const t of text(lines)) assert.ok(t.length <= 28, t)
   })
 
-  it("says denied, with no delivery to toggle, when chat.deny blocks the session", () => {
-    const [, chat] = sidebarLines(state({ blocked: "directory **/payroll" }))
-    assert.deepEqual(text([chat]), ["💬 chat: denied"])
-    assert.equal(chat.parts.length, 1)
-    assert.equal(chat.parts[0].tone, "warn")
-    assert.equal(chat.parts[0].action, "chat")
+  it("chat.deny shows denied in the warning tone", () => {
+    const [, chat] = sidebarRows(state({ blocked: "directory **/payroll" }))
+    assert.equal(chat.value, "denied")
+    assert.equal(chat.tone, "warn")
   })
 
-  it("has no chat line when no selected channel can chat", () => {
-    assert.deepEqual(text(sidebarLines(state({ chatCapable: false }))), [
-      "📡 all · auto",
+  it("has no Chat or Replies row when no selected channel can chat", () => {
+    assert.deepEqual(flat(state({ chatCapable: false })), [
+      "Notify|when away|normal",
     ])
   })
 
-  it("routing, chat and delivery are clickable; open prompts are not", () => {
-    const lines = sidebarLines(state({ chat: true, open: 1 }))
+  it("names the plugin once, in the title, and describes the rest in words", () => {
+    const m = sidebarModel(state({ pending: [prompt("a")] }), "full")
+    if (m.mode !== "full") throw new Error("full")
+    assert.equal(m.title, "OOB - Remote access")
+    assert.ok(!m.rows.some((r) => /oob/i.test(r.label + r.value)))
+  })
+
+  it("keeps every row short enough for a narrow sidebar", () => {
+    const s = state({
+      mode: "on",
+      chat: true,
+      delivery: "steer",
+      override: true,
+      pending: [prompt("a")],
+    })
+    for (const r of sidebarRows(s))
+      assert.ok(r.label.length <= 8 && r.value.length <= 14, r.label)
+  })
+})
+
+describe("sidebarModel", () => {
+  it("full has the title, the channel for the right of it, and the rows", () => {
+    const m = sidebarModel(state({ channel: "telegram", mode: "on" }), "full")
+    assert.equal(m.mode, "full")
+    if (m.mode !== "full") return
+    assert.equal(m.title, "OOB - Remote access")
+    assert.equal(m.channel, "telegram")
+    assert.equal(m.rows.length, 3)
+  })
+
+  it("compact is one line: Remote · channel · notify · chat", () => {
+    const text = (s: SidebarState) =>
+      compactParts(s)
+        .map((p) => p.text)
+        .join("")
+    assert.equal(
+      text(state({ mode: "on", channel: "telegram", chat: true })),
+      "OOB - Remote · telegram · notify on · chat on ▾",
+    )
+    assert.equal(
+      text(state()),
+      "OOB - Remote · all · notify when away · chat off ▾",
+    )
+    assert.equal(
+      text(state({ chatCapable: false, mode: "off" })),
+      "OOB - Remote · all · notify off ▾",
+    )
+    assert.equal(
+      text(state({ pending: [prompt("a"), prompt("b")], blocked: "x" })),
+      "OOB - Remote · all · notify when away · chat denied · 2 waiting ▾",
+    )
+  })
+
+  it("off draws nothing", () => {
+    assert.deepEqual(sidebarModel(state(), "off"), { mode: "off" })
+  })
+})
+
+describe("rowDialog", () => {
+  const titles = (s: SidebarState, row: Parameters<typeof rowDialog>[1]) =>
+    rowDialog(s, row).options.map((o) => o.title)
+
+  it("Notify lists on, on per channel, on via all, when away and off", () => {
+    assert.deepEqual(titles(state(), "notify"), [
+      "On — push questions and notices now",
+      "On via telegram — push now, only through telegram",
+      "On via ntfy — push now, only through ntfy",
+      "On via all — push now, through every channel",
+      "When away — after 10 min without input",
+      "Off — never push this session",
+    ])
     assert.deepEqual(
-      lines.flatMap((l) => l.parts.map((p) => p.action)),
-      ["route", "chat", "delivery", undefined],
+      rowDialog(state(), "notify").options.map((o) => o.value),
+      ["on", "on:telegram", "on:ntfy", "on:all", "auto", "off"],
     )
+  })
+
+  it("Notify with one channel has no via-all", () => {
+    assert.ok(
+      !titles(state({ channels: ["telegram"] }), "notify").some((t) =>
+        /all/.test(t),
+      ),
+    )
+  })
+
+  it("Notify marks the current choice", () => {
+    assert.equal(rowDialog(state(), "notify").current, "auto")
+    assert.equal(rowDialog(state({ mode: "off" }), "notify").current, "off")
+    assert.equal(rowDialog(state({ mode: "on" }), "notify").current, "on")
+    assert.equal(
+      rowDialog(state({ mode: "on", via: "ntfy", channel: "ntfy" }), "notify")
+        .current,
+      "on:ntfy",
+    )
+  })
+
+  it("Chat has on and off; denied disables on and says why", () => {
+    const free = rowDialog(state({ chat: true }), "chat")
+    assert.deepEqual(
+      free.options.map((o) => [o.value, o.disabled]),
+      [
+        ["on", false],
+        ["off", undefined],
+      ],
+    )
+    assert.equal(free.current, "on")
+    const denied = rowDialog(state({ blocked: "agent ^coord$" }), "chat")
+    assert.equal(denied.options[0].disabled, true)
+    assert.match(denied.options[0].description!, /chat\.deny .*agent \^coord\$/)
+    assert.match(denied.title, /blocked/)
+  })
+
+  it("Replies has immediately, after turn and the config default", () => {
+    assert.deepEqual(titles(state({ defaultDelivery: "steer" }), "replies"), [
+      "Immediately — join the running turn",
+      "After turn — wait for the current turn to finish",
+      "Default — follow the config (immediately)",
+    ])
+    assert.equal(rowDialog(state(), "replies").current, "default")
+    assert.equal(
+      rowDialog(state({ override: true, delivery: "steer" }), "replies")
+        .current,
+      "steer",
+    )
+  })
+
+  it("Waiting lists the open prompts with their age", () => {
+    const d = rowDialog(
+      state({ pending: [prompt("a", 0), prompt("b", 9 * 60_000 + 40_000)] }),
+      "waiting",
+    )
+    assert.deepEqual(
+      d.options.map((o) => [o.value, o.description]),
+      [
+        ["a", "10 min ago"],
+        ["b", "just now"],
+      ],
+    )
+    assert.match(d.options[0].title, /^question: Pick a/)
   })
 })
 
@@ -114,6 +247,7 @@ function rig(
   const cfg = parseConfig({
     channels: { telegram: { token: { env: "X" } } },
     chat,
+    sidebar: o.sidebar,
   }) as Config
   const connector = {
     id: "telegram",
@@ -151,127 +285,169 @@ function rig(
   return { app, store, bridge, router, settings }
 }
 
-describe("sidebarState and activate", () => {
+describe("sidebarState and applyPick", () => {
+  const go = (ok = true) => {
+    const seen: string[] = []
+    return { seen, fn: (id: string) => (seen.push(id), ok) }
+  }
+
   it("reads the state of a session from the bridge", () => {
     const { app } = rig()
-    assert.deepEqual(sidebarState(app, "root"), {
-      mode: "auto",
-      channel: "all",
-      chat: false,
-      blocked: undefined,
-      chatCapable: true,
-      delivery: "queue",
-      override: false,
-      open: 0,
-    })
+    const s = sidebarState(app, "root")
+    assert.equal(s.mode, "auto")
+    assert.equal(s.channel, "all")
+    assert.deepEqual(s.channels, ["telegram"])
+    assert.equal(s.defaultChannel, "all")
+    assert.equal(s.awayMinutes, 10)
+    assert.deepEqual(s.pending, [])
   })
 
-  it("a click on routing cycles auto, on, off, auto, and keeps the choice", async () => {
+  it("a Notify pick sets the routing and keeps it", async () => {
     const { app, settings } = rig()
-    const seen: string[] = []
-    for (let i = 0; i < 3; i++) {
-      const out = await activate(app, "root", "route")
-      assert.equal(out.ok, true)
-      seen.push(app.router.mode("root"))
-    }
-    assert.deepEqual(seen, ["on", "off", "auto"])
-    assert.equal(settings.sessions().root, undefined, "auto needs no record")
-    await activate(app, "root", "route")
+    assert.match(
+      (await applyPick(app, "root", "notify", "on:telegram", go().fn)).text,
+      /Notify on via telegram/,
+    )
     assert.equal(app.router.mode("root"), "on")
+    assert.equal(app.router.channel("root"), "telegram")
     assert.equal(settings.sessions().root.on, true)
-    assert.match((await activate(app, "root", "route")).text, /Routing off/)
-    assert.equal(settings.sessions().root.on, false)
+    assert.equal(
+      (await applyPick(app, "root", "notify", "off", go().fn)).text,
+      "Notify off",
+    )
+    assert.equal(app.router.mode("root"), "off")
+    assert.equal(
+      (await applyPick(app, "root", "notify", "auto", go().fn)).text,
+      "Notify when away",
+    )
+    assert.equal(settings.sessions().root, undefined)
+    assert.equal(
+      (await applyPick(app, "root", "notify", "on", go().fn)).ok,
+      true,
+    )
+    assert.equal(
+      (await applyPick(app, "root", "notify", "on:all", go().fn)).ok,
+      true,
+    )
   })
 
-  it("a click on chat turns it on and off", async () => {
+  it("a Notify pick of something unknown changes nothing", async () => {
     const { app } = rig()
-    assert.equal((await activate(app, "root", "chat")).ok, true)
-    assert.equal(app.bridge.chatEnabled("root"), true)
+    assert.equal(
+      (await applyPick(app, "root", "notify", "bogus", go().fn)).ok,
+      false,
+    )
+    const out = await applyPick(app, "root", "notify", "on:nope", go().fn)
+    assert.equal(out.ok, false)
+    assert.equal(app.router.mode("root"), "auto")
+  })
+
+  it("a Chat pick turns it on and off", async () => {
+    const { app } = rig()
+    assert.equal((await applyPick(app, "root", "chat", "on", go().fn)).ok, true)
     assert.equal(sidebarState(app, "root").chat, true)
-    assert.equal((await activate(app, "root", "chat")).ok, true)
+    assert.equal(
+      (await applyPick(app, "root", "chat", "off", go().fn)).ok,
+      true,
+    )
     assert.equal(app.bridge.chatEnabled("root"), false)
   })
 
-  it("chat.deny shows denied, and a click says why and changes nothing", async () => {
+  it("chat.deny is shown, explained in the dialog, and refused on a pick", async () => {
     const { app } = rig({ deny: [{ directory: "**/shop" }] })
     const s = sidebarState(app, "root")
     assert.equal(s.blocked, "directory **/shop")
-    assert.deepEqual(text(sidebarLines(s)), [
-      "📡 all · auto",
-      "💬 chat: denied",
-    ])
-    const out = await activate(app, "root", "chat")
+    assert.equal(sidebarRows(s)[1].value, "denied")
+    assert.equal(rowDialog(s, "chat").options[0].disabled, true)
+    const out = await applyPick(app, "root", "chat", "on", go().fn)
     assert.equal(out.ok, false)
-    assert.match(out.text, /blocked .* chat\.deny .*directory \*\*\/shop/)
+    assert.match(out.text, /chat\.deny .*directory \*\*\/shop/)
     assert.equal(app.bridge.chatEnabled("root"), false)
   })
 
-  it("a click on delivery flips queue and steer for the session, and keeps it in the settings", async () => {
+  it("a Replies pick sets the session's delivery, and default clears it", async () => {
     const { app, settings } = rig()
-    const out = await activate(app, "root", "delivery")
-    assert.match(out.text, /Delivery: steer/)
-    assert.equal(app.bridge.delivery("root"), "steer")
+    assert.equal(
+      (await applyPick(app, "root", "replies", "steer", go().fn)).text,
+      "Replies: immediately",
+    )
     assert.equal(settings.sessions().root.delivery, "steer")
     assert.equal(sidebarState(app, "root").override, true)
-    // Back at the default: no override left.
-    assert.match(
-      (await activate(app, "root", "delivery")).text,
-      /Delivery: queue/,
-    )
+    await applyPick(app, "root", "replies", "default", go().fn)
     assert.equal(app.bridge.deliveryOverride("root"), undefined)
     assert.equal(settings.sessions().root, undefined)
+    assert.equal(
+      (await applyPick(app, "root", "replies", "x", go().fn)).ok,
+      false,
+    )
   })
 
-  it("with chat.delivery steer, the first click goes to queue and is the override", async () => {
-    const { app, settings } = rig({ delivery: "steer" })
-    assert.equal(app.bridge.delivery("root"), "steer")
-    await activate(app, "root", "delivery")
-    assert.equal(app.bridge.delivery("root"), "queue")
-    assert.equal(settings.sessions().root.delivery, "queue")
-  })
-
-  it("open prompts of the session are counted", () => {
+  it("open prompts are listed oldest first, and a Waiting pick goes to its session", async () => {
     const { app, store } = rig()
     const base = {
       kind: "question" as const,
       requestID: "r",
       title: "t",
-      askedAt: 1,
-    }
-    store.put({
-      ...base,
-      id: "a",
-      sessionID: "root",
       rootSessionID: "root",
-      state: "pending",
-    })
-    store.put({
-      ...base,
-      id: "b",
-      sessionID: "x",
-      rootSessionID: "other",
-      state: "pending",
-    })
+      state: "pending" as const,
+    }
+    store.put({ ...base, id: "b", sessionID: "child", askedAt: 2 })
+    store.put({ ...base, id: "a", sessionID: "root", askedAt: 1 })
     store.put({
       ...base,
       id: "c",
       sessionID: "root",
-      rootSessionID: "root",
+      askedAt: 3,
       state: "answered" as never,
     })
-    assert.equal(sidebarState(app, "root").open, 1)
+    store.put({
+      ...base,
+      id: "x",
+      sessionID: "x",
+      askedAt: 1,
+      rootSessionID: "other",
+    })
+    const s = sidebarState(app, "root")
+    assert.deepEqual(
+      s.pending.map((p) => p.id),
+      ["a", "b"],
+    )
+    const g = go()
+    assert.equal((await applyPick(app, "root", "waiting", "b", g.fn)).ok, true)
+    assert.deepEqual(g.seen, ["child"])
+    assert.equal(
+      (await applyPick(app, "root", "waiting", "b", go(false).fn)).ok,
+      false,
+    )
+    assert.match(
+      (await applyPick(app, "root", "waiting", "gone", g.fn)).text,
+      /no longer open/,
+    )
   })
 })
 
 function fakeCtx() {
   const claims: Array<{
+    prepend?: string
     append?: string
     render: (i: { sessionID: string }) => unknown
   }> = []
   const toasts: Array<{ message: string; variant?: string }> = []
+  const dialogs: Array<{
+    title: string
+    current?: string
+    options: Array<{ title: string; value: string; disabled?: boolean }>
+  }> = []
+  const picks: Array<string | undefined> = []
+  const navigations: unknown[] = []
   let released = 0
   const ctx = {
-    data: { session: { root: (id: string) => (id === "child" ? "root" : id) } },
+    data: {
+      session: {
+        root: (id: string) => (id === "child" ? "root" : id),
+        get: (id: string) => (id === "gone" ? undefined : { id }),
+      },
+    },
     ui: {
       slot: (c: (typeof claims)[number]) => {
         claims.push(c)
@@ -279,6 +455,17 @@ function fakeCtx() {
       },
       toast: {
         show: (o: { message: string; variant?: string }) => toasts.push(o),
+      },
+      dialog: {
+        select: async (o: (typeof dialogs)[number]) => {
+          dialogs.push(o)
+          return picks.shift()
+        },
+        alert: async () => {},
+      },
+      router: {
+        current: () => ({ type: "session", sessionID: "root" }),
+        navigate: (r: unknown) => navigations.push(r),
       },
     },
     theme: {
@@ -289,7 +476,20 @@ function fakeCtx() {
       },
     },
   }
-  return { ctx: ctx as never, claims, toasts, released: () => released }
+  return {
+    ctx: ctx as never,
+    claims,
+    toasts,
+    dialogs,
+    picks,
+    navigations,
+    released: () => released,
+  }
+}
+
+const rowsOf = (v: Parameters<SidebarView>[0]) => {
+  const m = v.model()
+  return m.mode === "full" ? m.rows.map((r) => `${r.label}: ${r.value}`) : []
 }
 
 describe("registerSidebar with a fake slot registry", () => {
@@ -302,12 +502,13 @@ describe("registerSidebar with a fake slot registry", () => {
     return { seen, view }
   }
 
-  it("claims the end of sidebar.content, and draws what the view returns", () => {
+  it("claims the START of sidebar.content, so it renders first, and draws what the view returns", () => {
     const f = fakeCtx()
     const { view } = capture()
     registerSidebar(f.ctx, view)
     assert.equal(f.claims.length, 1)
-    assert.equal(f.claims[0].append, "sidebar.content")
+    assert.equal(f.claims[0].prepend, "sidebar.content")
+    assert.equal(f.claims[0].append, undefined)
     assert.deepEqual(f.claims[0].render({ sessionID: "root" }), { drawn: true })
   })
 
@@ -316,12 +517,26 @@ describe("registerSidebar with a fake slot registry", () => {
     const { view, seen } = capture()
     const sb = registerSidebar(f.ctx, view)
     f.claims[0].render({ sessionID: "child" })
-    assert.deepEqual(seen[0].lines(), [])
+    assert.deepEqual(seen[0].model(), { mode: "off" })
     sb.attach(rig({}).app)
-    assert.deepEqual(text(seen[0].lines()), [
-      "📡 all · auto",
-      "💬 chat: off · queue",
+    assert.deepEqual(rowsOf(seen[0]), [
+      "Notify: when away",
+      "Chat: off",
+      "Replies: after turn",
     ])
+  })
+
+  it("follows the sidebar setting: config default, then the TUI choice", () => {
+    const f = fakeCtx()
+    const { view, seen } = capture()
+    const sb = registerSidebar(f.ctx, view)
+    const r = rig({}, { sidebar: "compact" })
+    sb.attach(r.app)
+    f.claims[0].render({ sessionID: "root" })
+    assert.equal(seen[0].model().mode, "compact")
+    setSidebarMode(r.app, "off")
+    assert.equal(seen[0].model().mode, "off")
+    assert.equal(r.settings.sidebar(), "off")
   })
 
   it("tells the view when something changed, and stops after it unsubscribes", async () => {
@@ -347,46 +562,115 @@ describe("registerSidebar with a fake slot registry", () => {
       state: "pending",
     })
     assert.ok(n > after, "a new prompt")
-    assert.deepEqual(text(seen[0].lines()), [
-      "📡 all · on",
-      "💬 chat: on · queue",
-      "⏳ 1 open prompt",
+    assert.deepEqual(rowsOf(seen[0]), [
+      "Notify: on",
+      "Chat: on",
+      "Replies: after turn",
+      "Waiting: 1 question",
     ])
     const stop = n
     off()
     r.bridge.setDelivery("root", "steer")
     assert.equal(n, stop)
-    assert.equal(text(seen[0].lines())[1], "💬 chat: on · steer*")
+    assert.equal(rowsOf(seen[0])[2], "Replies: immediately")
   })
 
-  it("activate runs the click on the session in view and toasts the result", async () => {
+  it("a click opens the row's dialog with the current choice, and a pick applies and toasts", async () => {
+    const f = fakeCtx()
+    const { view, seen } = capture()
+    const sb = registerSidebar(f.ctx, view)
+    const r = rig()
+    sb.attach(r.app)
+    f.claims[0].render({ sessionID: "child" })
+    f.picks.push("on:telegram")
+    seen[0].open("notify")
+    await sleep(20)
+    assert.equal(f.dialogs[0].title, "Notify about this session")
+    assert.equal(f.dialogs[0].current, "auto")
+    assert.equal(r.router.mode("root"), "on")
+    assert.deepEqual(f.toasts.at(-1), {
+      message: "Notify on via telegram",
+      variant: "success",
+    })
+    assert.equal(rowsOf(seen[0])[0], "Notify: on")
+  })
+
+  it("a dismissed dialog changes nothing, and chat.deny shows its reason and refuses", async () => {
     const f = fakeCtx()
     const { view, seen } = capture()
     const sb = registerSidebar(f.ctx, view)
     const r = rig({ deny: [{ agent: "^coord$" }] })
     sb.attach(r.app)
-    f.claims[0].render({ sessionID: "child" })
-    seen[0].activate("route")
+    f.claims[0].render({ sessionID: "root" })
+    f.picks.push(undefined)
+    seen[0].open("notify")
     await sleep(20)
-    assert.equal(r.router.mode("root"), "on")
-    assert.deepEqual(f.toasts.at(-1), {
-      message: "Routing on via all",
-      variant: "success",
-    })
-    seen[0].activate("chat")
+    assert.equal(r.router.mode("root"), "auto")
+    assert.deepEqual(f.toasts, [])
+    f.picks.push("on")
+    seen[0].open("chat")
     await sleep(20)
+    assert.equal(f.dialogs[1].options[0].disabled, true)
     assert.equal(f.toasts.at(-1)!.variant, "warning")
     assert.match(f.toasts.at(-1)!.message, /agent \^coord\$/)
   })
 
-  it("an activation before the bridge exists does nothing", async () => {
+  it("a Waiting pick jumps to the session, and says so when it cannot", async () => {
+    const f = fakeCtx()
+    const { view, seen } = capture()
+    const sb = registerSidebar(f.ctx, view)
+    const r = rig()
+    sb.attach(r.app)
+    f.claims[0].render({ sessionID: "root" })
+    const put = (id: string, sessionID: string) =>
+      r.store.put({
+        id,
+        kind: "question",
+        requestID: id,
+        title: "t",
+        askedAt: 1,
+        sessionID,
+        rootSessionID: "root",
+        state: "pending",
+      })
+    put("a", "child")
+    f.picks.push("a")
+    seen[0].open("waiting")
+    await sleep(20)
+    assert.deepEqual(f.navigations, [{ type: "session", sessionID: "child" }])
+    put("b", "gone")
+    f.picks.push("b")
+    seen[0].open("waiting")
+    await sleep(20)
+    assert.equal(f.navigations.length, 1)
+    assert.equal(f.toasts.at(-1)!.variant, "warning")
+  })
+
+  it("a row with no options (nothing waits) opens no dialog; compact opens /oob", async () => {
+    const f = fakeCtx()
+    const { view, seen } = capture()
+    const sb = registerSidebar(f.ctx, view)
+    sb.attach(rig().app)
+    f.claims[0].render({ sessionID: "root" })
+    seen[0].open("waiting")
+    await sleep(20)
+    assert.equal(f.dialogs.length, 0)
+    f.picks.push(undefined)
+    seen[0].openMenu()
+    await sleep(20)
+    assert.equal(f.dialogs[0].title, "OOB - Remote access")
+  })
+
+  it("a click before the bridge exists does nothing", async () => {
     const f = fakeCtx()
     const { view, seen } = capture()
     registerSidebar(f.ctx, view)
     f.claims[0].render({ sessionID: "root" })
-    seen[0].activate("route")
+    seen[0].open("notify")
+    seen[0].openMenu()
     await sleep(20)
     assert.deepEqual(f.toasts, [])
+    assert.equal(f.dialogs.length, 0)
   })
 
   it("hands the view the theme's colours, reading { base } state sets", () => {
@@ -417,12 +701,12 @@ describe("registerSidebar with a fake slot registry", () => {
     assert.equal(n, 0)
   })
 
-  it("no chat line for a session whose channel cannot chat", () => {
+  it("no Chat or Replies row for a session whose channel cannot chat", () => {
     const f = fakeCtx()
     const { view, seen } = capture()
     const sb = registerSidebar(f.ctx, view)
     sb.attach(rig({}, { canChat: false }).app)
     f.claims[0].render({ sessionID: "root" })
-    assert.deepEqual(text(seen[0].lines()), ["📡 all · auto"])
+    assert.deepEqual(rowsOf(seen[0]), ["Notify: when away"])
   })
 })

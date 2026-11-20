@@ -2,7 +2,7 @@
 import type { Plugin } from "@opencode/plugin/tui"
 
 import type { Bridge } from "./bridge.ts"
-import type { Delivery } from "./config.ts"
+import { SIDEBAR_MODES, type Delivery, type SidebarMode } from "./config.ts"
 import type { Connector } from "./connectors/types.ts"
 import { renderQr } from "./qr.ts"
 import type { Router } from "./routing.ts"
@@ -17,7 +17,7 @@ export type App = {
 }
 
 const USAGE =
-  "Usage: /oob [on [<channel>|all]|off|auto|chat on|chat off|delivery queue|steer|default|status|test|pair <channel>]"
+  "Usage: /oob [on [<channel>|all]|off|auto|chat on|chat off|delivery queue|steer|default|sidebar full|compact|off|status|test|pair <channel>]"
 
 /** Connectors that can bind to a chat. */
 const pairable = (app: App) =>
@@ -66,6 +66,14 @@ export async function runCommand(
     extra.length === 0
   )
     return setDelivery(ctx, app, via === "default" ? undefined : via)
+  if (
+    word === "sidebar" &&
+    SIDEBAR_MODES.includes(via as SidebarMode) &&
+    extra.length === 0
+  ) {
+    setSidebarMode(app, via as SidebarMode)
+    return toast(ctx, `Sidebar block: ${via}`)
+  }
   if (arg === "status") return status(ctx, app)
   if (arg === "test") return test(ctx, app)
   if (word === "pair" && extra.length === 0) {
@@ -116,6 +124,37 @@ export function applyRouting(
 ): void {
   app.router.set(root, mode === "auto" ? undefined : mode === "on", channel)
   saveSession(app, root)
+}
+
+/** How big the sidebar block is: the TUI choice, else the config's. */
+export function sidebarMode(app: App): SidebarMode {
+  return app.settings.sidebar() ?? app.bridge.defaultSidebar()
+}
+
+export function setSidebarMode(app: App, mode: SidebarMode): void {
+  app.settings.setSidebar(mode)
+  app.bridge.notify()
+}
+
+async function sidebarChoice(ctx: Context, app: App): Promise<void> {
+  const pick = await ctx.ui.dialog.select<SidebarMode>({
+    title: "Sidebar block",
+    current: sidebarMode(app),
+    options: [
+      {
+        title: "full",
+        value: "full",
+        description: "a row each for routing, chat, delivery",
+      },
+      {
+        title: "compact",
+        value: "compact",
+        description: "one line; click it to open /oob",
+      },
+      { title: "off", value: "off", description: "no block" },
+    ],
+  })
+  if (pick) setSidebarMode(app, pick)
 }
 
 /** Keeps a session's routing and chat choices across restarts. */
@@ -172,7 +211,8 @@ async function menu(ctx: Context, app: App): Promise<void> {
     else if (choice.startsWith("pair:")) {
       const closed = await pair(ctx, app, find(app, choice.slice(5)))
       if (closed) await closed
-    } else if (choice === "test") await test(ctx, app)
+    } else if (choice === "sidebar") await sidebarChoice(ctx, app)
+    else if (choice === "test") await test(ctx, app)
     else if (choice === "status") await status(ctx, app)
   }
 }
@@ -181,7 +221,7 @@ function mainMenu(ctx: Context, app: App): Promise<string | undefined> {
   const root = sessionRoot(ctx)
   const channels = app.bridge.status().channels
   return ctx.ui.dialog.select({
-    title: "OOB bridge",
+    title: "OOB - Remote access",
     options: [
       {
         title: "This session",
@@ -200,6 +240,11 @@ function mainMenu(ctx: Context, app: App): Promise<string | undefined> {
         value: `pair:${c.id}`,
         description: undefined,
       })),
+      {
+        title: "Sidebar",
+        description: sidebarMode(app),
+        value: "sidebar",
+      },
       { title: "Send test push", value: "test", description: undefined },
       { title: "Status", value: "status", description: undefined },
     ],
@@ -294,7 +339,7 @@ async function status(ctx: Context, app: App): Promise<void> {
   lines.push(`Open prompts: ${st.pending}`)
   if (root) lines.push(`This session: ${describe(app, root)}`)
   await ctx.ui.dialog.alert({
-    title: "OOB bridge status",
+    title: "OOB - Remote access status",
     message: lines.join("\n"),
   })
 }

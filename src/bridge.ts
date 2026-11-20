@@ -19,7 +19,7 @@ import type {
   SendStats,
   SessionState,
 } from "./connectors/types.ts"
-import type { Config, Delivery } from "./config.ts"
+import type { Config, Delivery, SidebarMode } from "./config.ts"
 import { redact } from "./filter.ts"
 import {
   resolveAnswer,
@@ -946,15 +946,32 @@ export class Bridge {
     return this.targets(root).some((c) => c.capabilities.inboundPrompt)
   }
 
+  defaultChannel(): string {
+    return this.cfg.defaultChannel
+  }
+
+  awayMinutes(): number {
+    return this.cfg.away.minutes
+  }
+
+  defaultSidebar(): SidebarMode {
+    return this.cfg.sidebar
+  }
+
   defaultDelivery(): Delivery {
     return this.cfg.chat.delivery
   }
 
-  /** Prompts of the session that wait for an answer. */
-  openPrompts(root: string): number {
+  /** Prompts of the session that wait for an answer, oldest first. */
+  openPromptList(root: string): Pending[] {
     return this.store
       .list()
-      .filter((p) => p.state === "pending" && p.rootSessionID === root).length
+      .filter((p) => p.state === "pending" && p.rootSessionID === root)
+      .sort((a, b) => a.askedAt - b.askedAt)
+  }
+
+  openPrompts(root: string): number {
+    return this.openPromptList(root).length
   }
 
   /** The `chat.deny` rule that blocks chat, in words, or undefined. */
