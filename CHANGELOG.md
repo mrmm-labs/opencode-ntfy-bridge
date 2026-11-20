@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.7.0...v0.7.1) (2026-11-20)
+
+
+### Bug Fixes
+
+* chat replies are not cut by the prompt preview limit ([#22](https://github.com/mrmm-labs/opencode-oob-bridge/issues/22)) ([ad8e237](https://github.com/mrmm-labs/opencode-oob-bridge/commit/ad8e2373253c3ddcab7f669ff626ff0a69d0591e))
+
 ## [0.7.0](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.6.0...v0.7.0) (2026-11-20)
 
 
