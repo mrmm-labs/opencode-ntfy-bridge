@@ -144,7 +144,10 @@ describe("Ntfy.subscribe", () => {
     })
     const ac = new AbortController()
     const done = n.subscribe(() => {}, ac.signal, "1700000000")
-    await new Promise((r) => setTimeout(r, 200))
+    // Until the third try, not for a fixed time: a loaded machine is slower.
+    const end = Date.now() + 5000
+    while (calls < 3 && Date.now() < end)
+      await new Promise((r) => setTimeout(r, 10))
     ac.abort()
     await done
     assert.ok(calls >= 3, `reconnected ${calls} times`)

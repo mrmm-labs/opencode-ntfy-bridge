@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
 import { mkdtemp, readFile, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -279,12 +280,13 @@ describe("TelegramConnector inbound", () => {
     r.tg.message(CHAT, "#ab12 1")
     await r.tg.waitFor(() => r.got[0])
     assert.equal(r.channel.status().connected, true)
-    await r.tg.waitFor(async () => {
+    // waitFor takes a plain function: a promise would always count as done.
+    // The file may be seen half written, so wait until it parses.
+    const saved = await r.tg.waitFor(() => {
       try {
-        return JSON.parse(await readFile(join(r.dir, "offset.json"), "utf8"))
+        return JSON.parse(readFileSync(join(r.dir, "offset.json"), "utf8"))
       } catch {}
     })
-    const saved = JSON.parse(await readFile(join(r.dir, "offset.json"), "utf8"))
     assert.equal(typeof saved.offset, "number")
     r.ac.abort()
     await sleep(50)
@@ -801,6 +803,9 @@ describe("TelegramConnector forum topics", () => {
     const r = await rig()
     r.tg.forum = true
     r.tg.fail("createForumTopic", 400, { description: "not enough rights" })
+    // A poll that succeeds clears the last error: stop polling so only the send speaks.
+    r.ac.abort()
+    await sleep(30)
     const ref = await r.channel.send({ message: "a", session })
     assert.ok(ref)
     assert.equal(r.tg.of("sendMessage")[0].body.message_thread_id, undefined)

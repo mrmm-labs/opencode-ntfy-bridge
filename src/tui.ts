@@ -11,7 +11,8 @@ import { connectorTypes } from "./connectors/index.ts"
 import type { Connector } from "./connectors/types.ts"
 import { dataDir, loadConfig } from "./config.ts"
 import { log } from "./logger.ts"
-import { runCommand, saveSession, type App } from "./menu.ts"
+import { commandIndex, runCommand, saveSession, type App } from "./menu.ts"
+import { slashEntries } from "./subcommands.ts"
 import { registerSidebar, type SidebarView } from "./sidebar.ts"
 import { resolveOtel, Telemetry } from "./otel.ts"
 import { PendingStore } from "./pending.ts"
@@ -148,6 +149,8 @@ export async function setup(
     mode: "global",
     bindings: ["oob-bridge.route"],
     commands: [
+      // `/oob-chat` and the like: the host completes only slash names.
+      ...slashEntries(commandIndex(ctx), (line) => runCommand(ctx, app, line)),
       {
         id: "oob-bridge.route",
         title: "oob: settings, routing and channels",

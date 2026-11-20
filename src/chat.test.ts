@@ -847,6 +847,12 @@ describe("chat from Telegram: steering", () => {
   })
 })
 
+// A stream is `running` while one of its sends or edits is in flight.
+const streamOf = (c: TelegramConnector, id: string) =>
+  (c as unknown as { streams: Map<string, { running: boolean }> }).streams.get(
+    id,
+  )
+
 describe("chat from Telegram: faster streaming", () => {
   it("the first text of a turn is shown at once, not after a wait", async () => {
     const r = await chatRig()
@@ -874,8 +880,12 @@ describe("chat from Telegram: faster streaming", () => {
       now: () => clock.t,
     })
     const s = { id: "root", name: "shop · Fix", project: "shop" }
+    // The mock clock moves only once the connector has finished the call it
+    // is making: its next edit is counted from then.
+    const idle = () => tg.waitFor(() => !streamOf(c, s.id)?.running)
     c.stream(s, "a")
     await tg.waitFor(() => tg.of("sendMessage")[0])
+    await idle()
     clock.t += 900
     c.stream(s, "a b")
     await sleep(80)
@@ -884,10 +894,12 @@ describe("chat from Telegram: faster streaming", () => {
     c.stream(s, "a b c")
     await tg.waitFor(() => tg.of("editMessageText")[0])
     assert.equal(tg.of("editMessageText")[0].body.text, "a b c")
+    await idle()
     // A longer gap, as chat.streamMs sets it: counted from the edit it follows.
     clock.t += 1500
     c.stream(s, "a b c d", 3000)
     await tg.waitFor(() => tg.of("editMessageText")[1])
+    await idle()
     clock.t += 2000
     c.stream(s, "a b c d e", 3000)
     await sleep(80)

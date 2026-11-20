@@ -365,6 +365,12 @@ Typing is the fast path:
 - A wrong value (`/oob chat maybe`) says which values are valid and opens that list.
 - `/oob help` shows the table below inside the TUI.
 
+The host completes only slash names, so every sub-command is also its own slash entry:
+`/oob-on`, `/oob-off`, `/oob-auto`, `/oob-chat`, `/oob-delivery`, `/oob-channel`, `/oob-pair`,
+`/oob-test`, `/oob-sidebar`, `/oob-status` and `/oob-help` show up in the prompt's slash list with
+their usage. `/oob-chat on` does exactly what `/oob chat on` does, and `/oob-chat` alone asks for
+the value. Bare `/oob` (and `/ntfy`) stays the picker.
+
 | Command                                 | What it does                                                                                            |
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | `/oob on [<channel\|all>]`              | Push this session's questions and notices now, through one channel or all.                              |
@@ -557,6 +563,12 @@ docker is missing or `NTFY_E2E_SKIP` is set.
 A test run that did not point `OPENCODE_OOB_BRIDGE_LOG` or `OPENCODE_OOB_BRIDGE_DATA` somewhere of
 its own writes no log: the logger refuses the default path under `node --test`, so running one test
 file by hand cannot fill the real log.
+
+The test script runs with `--test-force-exit`, and the fake servers do not keep the process alive.
+Without that, a test that fails before it closes its server leaves a run that never ends and
+prints no summary, because `--test-timeout` only covers a test that is still running. Keep
+`--test-force-exit` before `--test-timeout` on the command line: in the other order Node 24 does
+not apply it to the test files.
 
 ## License
 

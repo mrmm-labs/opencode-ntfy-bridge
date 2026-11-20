@@ -370,6 +370,10 @@ export function buildCommands(ctx: Context, app: App): SubCommand[] {
   return cmds
 }
 
+/** Only names, titles and usage are read from this list: no session or app is needed. */
+export const commandIndex = (ctx: Context): SubCommand[] =>
+  buildCommands(ctx, undefined as unknown as App)
+
 const uiOf = (ctx: Context): Ui => ({
   select: (o) => ctx.ui.dialog.select(o as never),
   prompt: (o) => ctx.ui.dialog.prompt(o),

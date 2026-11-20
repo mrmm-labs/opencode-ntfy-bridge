@@ -115,6 +115,8 @@ export async function fakeTelegram(token = "123456:TESTTOKEN") {
     })
   })
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r))
+  // A test that fails before its `close()` must not keep the process alive.
+  server.unref()
   const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
 
   const wake = () => [...polls].forEach((f) => f())
