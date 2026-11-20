@@ -24,6 +24,7 @@ import {
 } from "../token.ts"
 import { isObject, sleep, truncate, URL_RE } from "../util.ts"
 import { globToRegExp } from "../routing.ts"
+import { closeFences, splitReply } from "./telegram-markdown.ts"
 import {
   esc,
   keycap,
@@ -53,6 +54,11 @@ const PAIR_TTL_MS = 10 * 60_000
 const TOAST_MAX = 190
 const TOPIC_RETRY_MS = 5 * 60_000
 const TOPIC_NOTICE_MS = 60 * 60_000
+const STREAM_GAP_MS = 1500
+// Streamed text moves to a new message past this many characters of HTML.
+const STREAM_CHARS = 3800
+const MAX_REPLY_MESSAGES = 3
+const SENT_KEEP = 1000
 const RENAME_GAP_MS = 60_000
 const CARD_GAP_MS = 10_000
 // The six colors Telegram allows for a topic icon.
@@ -90,7 +96,9 @@ export type TelegramOptions = {
   notify?: { finished?: boolean; failed?: boolean }
   /** `agent regex or project glob` to the emoji it picks for a topic icon. */
   icons?: Record<string, string>
-  /** Clock, for the topic and card limits. */
+  /** How often the typing indicator is renewed while a chat session works. */
+  typingMs?: number
+  /** Clock, for the topic, card and streaming limits. */
   now?: () => number
 }
 
@@ -124,6 +132,28 @@ const buttonable = (qs: Question[]) =>
   qs[0].options.length > 0 &&
   qs[0].options.length <= MAX_BUTTONS
 
+type Stream = {
+  session: NonNullable<Push["session"]>
+  /** The reply so far, in markdown. */
+  text: string
+  /** HTML last shown in each message, and its message id. */
+  shown: Array<{ id: number; html: string }>
+  /** No edit before this time. */
+  nextAt: number
+  timer?: ReturnType<typeof setTimeout>
+  chain: Promise<void>
+  running: boolean
+}
+
+/** A 429 the caller chose not to wait for. */
+class RateLimited extends Error {
+  readonly retryAfter: number
+  constructor(retryAfter: number) {
+    super(`telegram rate limited: retry in ${retryAfter}s`)
+    this.retryAfter = retryAfter
+  }
+}
+
 /** What is kept of a session's topic. A bare number is the older file format. */
 type Topic = {
   thread: number
@@ -156,8 +186,7 @@ export class TelegramConnector implements Connector {
     rich: true,
     threads: true,
     pairing: true,
-    // Sending prompts into sessions from a chat is not built yet.
-    inboundPrompt: false,
+    inboundPrompt: true,
   }
   readonly id: string
   readonly notify: { finished: boolean; failed: boolean }
@@ -192,6 +221,12 @@ export class TelegramConnector implements Connector {
   private topicNoticeAt = -Infinity
   /** Set while topic creation is refused for missing rights. */
   private topicWarning: string | undefined
+  /** Bot messages of a session by message id, so a reply to one finds its session. */
+  private readonly sent = new Map<string, string>()
+  /** Typing indicators running, by session. */
+  private readonly pulses = new Map<string, ReturnType<typeof setInterval>>()
+  /** Replies being streamed, by session. */
+  private readonly streams = new Map<string, Stream>()
   /** Force-reply prompts: message id to the pending prompt it collects a typed answer for. */
   private readonly typing = new Map<string, string>()
   private pairing:
@@ -232,6 +267,10 @@ export class TelegramConnector implements Connector {
     signal.addEventListener("abort", () => {
       for (const l of this.live.values()) clearTimeout(l.timer)
       this.live.clear()
+      for (const t of this.pulses.values()) clearInterval(t)
+      this.pulses.clear()
+      for (const st of this.streams.values()) clearTimeout(st.timer)
+      this.streams.clear()
     })
     this.poll()
   }
@@ -320,6 +359,7 @@ export class TelegramConnector implements Connector {
           const ref = String(m.message_id)
           const p = live && this.prompts.get(live.id)
           if (p) p.ref = ref
+          if (push.session) this.remember(ref, push.session.id)
           return ref
         } catch (err) {
           // The topic was deleted in Telegram: make a new one once.
@@ -338,6 +378,28 @@ export class TelegramConnector implements Connector {
       this.fail(err)
       return undefined
     }
+  }
+
+  private remember(ref: string | number, sessionID: string) {
+    this.sent.set(String(ref), sessionID)
+    if (this.sent.size > SENT_KEEP)
+      this.sent.delete(this.sent.keys().next().value!)
+  }
+
+  /** The session of a forum topic, or of a message of the bot's. */
+  private async sessionAt(
+    thread?: number,
+    replyTo?: string,
+  ): Promise<string | undefined> {
+    const via = replyTo === undefined ? undefined : this.sent.get(replyTo)
+    if (via) return via
+    if (thread === undefined || !this.chatId) return undefined
+    this.topics ??= await this.loadTopics()
+    const prefix = `${this.chatId}:`
+    for (const [k, t] of this.topics)
+      if (t.thread === thread && k.startsWith(prefix))
+        return k.slice(prefix.length)
+    return undefined
   }
 
   private topicKey(sessionID: string) {
@@ -522,19 +584,44 @@ export class TelegramConnector implements Connector {
         project: state.project,
         agent: state.agent,
       }
-      if ((await this.thread(session)) === undefined) return
+      const thread = await this.thread(session)
+      if (thread === undefined) return
+      this.pulse(state.id, thread, !!state.chat && state.state === "working")
       const key = this.topicKey(state.id)
       const live = this.live.get(key) ?? {
         want: state,
         renamedAt: -Infinity,
         editedAt: -Infinity,
       }
+      // The Stop button appears and goes away at once.
+      if (!!live.want.chat !== !!state.chat) live.editedAt = -Infinity
       live.want = state
       this.live.set(key, live)
       await this.flush(key)
     } catch (err) {
       this.fail(err)
     }
+  }
+
+  /** The typing indicator of a topic, renewed until it is switched off. */
+  private pulse(sessionID: string, thread: number, on: boolean): void {
+    const cur = this.pulses.get(sessionID)
+    if (!on) {
+      if (cur) clearInterval(cur)
+      this.pulses.delete(sessionID)
+      return
+    }
+    if (cur) return
+    const tick = () =>
+      void this.call("sendChatAction", {
+        chat_id: this.chatId,
+        message_thread_id: thread,
+        action: "typing",
+      }).catch(() => {})
+    tick()
+    const t = setInterval(tick, this.opts.typingMs ?? 5000)
+    t.unref?.()
+    this.pulses.set(sessionID, t)
   }
 
   private async flush(key: string): Promise<void> {
@@ -582,7 +669,7 @@ export class TelegramConnector implements Connector {
       const text = renderStatus(s, topic.icon)
       if (topic.cardText !== text && due(live.editedAt, CARD_GAP_MS)) {
         live.editedAt = now
-        await this.card(topic, text)
+        await this.card(topic, text, !!s.chat, s.id)
       }
     }
     if (wait < Infinity) {
@@ -592,7 +679,18 @@ export class TelegramConnector implements Connector {
   }
 
   /** Creates, pins or edits the status card of a topic. */
-  private async card(topic: Topic, text: string): Promise<void> {
+  private async card(
+    topic: Topic,
+    text: string,
+    chat: boolean,
+    sessionID: string,
+  ): Promise<void> {
+    // Always sent: an edit without it would keep the old button.
+    const reply_markup = {
+      inline_keyboard: chat
+        ? [[{ text: "🛑 Stop chat", callback_data: "chatoff" }]]
+        : [],
+    }
     try {
       if (topic.card === undefined) {
         const m = await this.call<{ message_id: number }>("sendMessage", {
@@ -601,8 +699,10 @@ export class TelegramConnector implements Connector {
           text,
           parse_mode: "HTML",
           disable_notification: true,
+          reply_markup,
         })
         topic.card = m.message_id
+        this.remember(m.message_id, sessionID)
         await this.saveTopics()
         // A card that cannot be pinned is still a card.
         await this.call("pinChatMessage", {
@@ -616,6 +716,7 @@ export class TelegramConnector implements Connector {
           message_id: topic.card,
           text,
           parse_mode: "HTML",
+          reply_markup,
         })
       }
       topic.cardText = text
@@ -763,6 +864,7 @@ export class TelegramConnector implements Connector {
     timeoutMs = 10_000,
     signal?: AbortSignal,
     stats?: SendStats,
+    retry = true,
   ): Promise<T> {
     const token = await this.opts.token()
     if (!token) throw new Error("no Telegram token")
@@ -787,6 +889,8 @@ export class TelegramConnector implements Connector {
         | undefined
       if (json?.ok) return json.result as T
       const wait = json?.parameters?.retry_after
+      if (res.status === 429 && wait !== undefined && !retry)
+        throw new RateLimited(wait)
       if (res.status === 429 && wait !== undefined && attempt < 2) {
         if (stats) stats.retries = attempt + 1
         await sleep(Math.min(wait, 60) * 1000, signal)
@@ -889,10 +993,6 @@ export class TelegramConnector implements Connector {
       kind: "answer",
       id: String(u.update_id),
       time: m.date,
-      sessionKey:
-        m.message_thread_id === undefined
-          ? undefined
-          : String(m.message_thread_id),
       from: { connector: this.id, chat: String(m.chat.id) },
     } as const
     // A reply to a "Type your answer" prompt is a free-text answer for its prompt.
@@ -915,15 +1015,45 @@ export class TelegramConnector implements Connector {
           : { ...base, pendingId: reply.id, text: reply.text },
       ))
     // In a topic, a plain message "replies" to the topic's first message.
-    if (
+    const to =
       m.reply_to_message &&
       m.reply_to_message.message_id !== m.message_thread_id
-    )
-      await this.onInbound?.({
-        ...base,
-        replyTo: String(m.reply_to_message.message_id),
-        text,
+        ? String(m.reply_to_message.message_id)
+        : undefined
+    const sessionKey = await this.sessionAt(m.message_thread_id, to)
+    // A reply is an answer if it replies to a question; the core decides, and
+    // takes anything else as text for the session.
+    const inbound: Inbound | undefined = to
+      ? { ...base, replyTo: to, sessionKey, text }
+      : sessionKey
+        ? { ...base, kind: "prompt", sessionKey, text }
+        : undefined
+    if (!inbound) return
+    const out = await this.onInbound?.(inbound)
+    if (out?.sent) await this.acknowledge(m, out.text)
+  }
+
+  /** A prompt reached its session: 👀 on the message, and a quiet line saying where. */
+  private async acknowledge(
+    m: NonNullable<Update["message"]>,
+    text: string,
+  ): Promise<void> {
+    try {
+      await this.call("setMessageReaction", {
+        chat_id: this.chatId,
+        message_id: m.message_id,
+        reaction: [{ type: "emoji", emoji: "👀" }],
       })
+      await this.call("sendMessage", {
+        chat_id: this.chatId,
+        message_thread_id: m.message_thread_id,
+        text: esc(text),
+        parse_mode: "HTML",
+        disable_notification: true,
+      })
+    } catch (err) {
+      this.fail(err)
+    }
   }
 
   /**
@@ -963,6 +1093,19 @@ export class TelegramConnector implements Connector {
     if (!cb.message || String(cb.message.chat.id) !== this.chatId) {
       this.rejected("callback")
       return log("telegram_ignored", { kind: "callback" })
+    }
+    if (cb.data === "chatoff") {
+      const sessionKey = await this.sessionAt(cb.message.message_thread_id)
+      if (!sessionKey) return this.toast(cb.id, "Unknown session.")
+      return this.answer(cb.id, {
+        kind: "control",
+        id: `cb${cb.id}`,
+        time: Math.floor(Date.now() / 1000),
+        sessionKey,
+        text: "chat off",
+        from: { connector: this.id, chat: String(cb.message.chat.id) },
+        inline: true,
+      })
     }
     const m = /^([A-Za-z0-9]+):(t?\d+|d|x)$/.exec(cb.data ?? "")
     if (!m) return this.toast(cb.id, "Unknown button.")
@@ -1047,6 +1190,232 @@ export class TelegramConnector implements Connector {
       out === "late" ? "Sending…" : (out?.text ?? "Done."),
     )
     await done
+  }
+
+  /** Multipart upload: a text file with a caption. */
+  private async upload(
+    method: string,
+    fields: Record<string, string | number | undefined>,
+    file: { field: string; name: string; data: string },
+  ): Promise<void> {
+    const token = await this.opts.token()
+    if (!token) throw new Error("no Telegram token")
+    const form = new FormData()
+    for (const [k, v] of Object.entries(fields))
+      if (v !== undefined) form.append(k, String(v))
+    form.append(
+      file.field,
+      new Blob([file.data], { type: "text/markdown" }),
+      file.name,
+    )
+    const base = this.opts.apiBase ?? "https://api.telegram.org"
+    const res = await this.fetch(`${base}/bot${token}/${method}`, {
+      method: "POST",
+      body: form,
+      keepalive: false,
+      signal: AbortSignal.timeout(30_000),
+    })
+    const json = (await res.json().catch(() => undefined)) as
+      | { ok?: boolean; description?: string }
+      | undefined
+    if (!json?.ok)
+      throw new Error(
+        `telegram ${method} failed: HTTP ${res.status} ${json?.description ?? ""}`.trim(),
+      )
+  }
+
+  /**
+   * Shows the reply being written, in one message that is edited as it grows
+   * (and in up to three). `text` is all of it so far, in markdown. Edits are
+   * at most one every STREAM_GAP_MS, and wait out a 429.
+   */
+  stream(session: NonNullable<Push["session"]>, text: string): void {
+    if (!this.chatId || !text.trim()) return
+    let st = this.streams.get(session.id)
+    if (!st) {
+      st = {
+        session,
+        text,
+        shown: [],
+        nextAt: 0,
+        chain: Promise.resolve(),
+        running: false,
+      }
+      this.streams.set(session.id, st)
+    }
+    st.text = text
+    this.pump(st)
+  }
+
+  private pump(st: Stream): void {
+    if (st.running) return
+    const wait = st.nextAt - this.now()
+    // The gap has passed (the timer has not fired yet): go now.
+    if (st.timer && wait <= 0) {
+      clearTimeout(st.timer)
+      st.timer = undefined
+    }
+    if (st.timer) return
+    if (wait > 0) {
+      this.opts.tel?.count("oob.stream.throttled", {
+        "connector.type": "telegram",
+      })
+      st.timer = setTimeout(() => {
+        st.timer = undefined
+        this.pump(st)
+      }, wait)
+      st.timer.unref?.()
+      return
+    }
+    st.running = true
+    st.chain = st.chain
+      .then(() => this.paint(st))
+      .catch((err) => this.fail(err))
+      .finally(() => {
+        st.running = false
+        // More text arrived while this edit was in flight.
+        if (this.streams.get(st.session.id) === st && this.dirty(st))
+          this.pump(st)
+      })
+  }
+
+  private shownText(st: Stream): string[] {
+    return splitReply(closeFences(st.text), MAX_REPLY_MESSAGES, STREAM_CHARS)
+      .messages
+  }
+
+  private dirty(st: Stream): boolean {
+    const now = this.shownText(st)
+    return now.some((h, i) => st.shown[i]?.html !== h)
+  }
+
+  /** Sends or edits the messages of a stream so they show its text. */
+  private async paint(st: Stream): Promise<void> {
+    const thread = await this.thread(st.session)
+    const html = this.shownText(st)
+    for (const [i, h] of html.entries()) {
+      if (!h.trim()) continue
+      const had = st.shown[i]
+      if (had?.html === h) continue
+      try {
+        if (had) {
+          await this.call(
+            "editMessageText",
+            {
+              chat_id: this.chatId,
+              message_id: had.id,
+              text: h,
+              parse_mode: "HTML",
+              link_preview_options: { is_disabled: true },
+            },
+            undefined,
+            undefined,
+            undefined,
+            false,
+          )
+          this.opts.tel?.count("oob.stream.edits", {
+            "connector.type": "telegram",
+          })
+          had.html = h
+        } else {
+          const m = await this.call<{ message_id: number }>("sendMessage", {
+            chat_id: this.chatId,
+            message_thread_id: thread,
+            text: h,
+            parse_mode: "HTML",
+            link_preview_options: { is_disabled: true },
+            disable_notification: true,
+          })
+          st.shown[i] = { id: m.message_id, html: h }
+          this.remember(m.message_id, st.session.id)
+          this.opts.tel?.count("oob.stream.edits", {
+            "connector.type": "telegram",
+          })
+        }
+      } catch (err) {
+        if (err instanceof RateLimited) {
+          // Back off for as long as Telegram asks, then carry on from the same text.
+          st.nextAt = this.now() + Math.min(err.retryAfter, 60) * 1000
+          this.opts.tel?.count("oob.stream.throttled", {
+            "connector.type": "telegram",
+          })
+          return
+        }
+        if (/not modified/i.test((err as Error).message) && had) had.html = h
+        else this.fail(err)
+      }
+    }
+    st.nextAt = this.now() + STREAM_GAP_MS
+  }
+
+  /**
+   * Posts the final text of a turn: up to three messages split between
+   * blocks, the rest as a markdown document. A stream's messages are edited
+   * into place, so nothing appears twice.
+   */
+  async reply(
+    session: NonNullable<Push["session"]>,
+    text: string,
+  ): Promise<{ parts: number; documents: number } | undefined> {
+    if (!this.chatId) return undefined
+    const st = this.streams.get(session.id)
+    this.streams.delete(session.id)
+    if (st) {
+      clearTimeout(st.timer)
+      await st.chain.catch(() => {})
+    }
+    try {
+      const thread = await this.thread(session)
+      const { messages, rest } = splitReply(text, MAX_REPLY_MESSAGES)
+      const shown = st?.shown ?? []
+      for (const [i, html] of messages.entries()) {
+        const had = shown[i]
+        if (had?.html === html) continue
+        if (had) {
+          try {
+            await this.call("editMessageText", {
+              chat_id: this.chatId,
+              message_id: had.id,
+              text: html,
+              parse_mode: "HTML",
+              link_preview_options: { is_disabled: true },
+            })
+            continue
+          } catch (err) {
+            if (/not modified/i.test((err as Error).message)) continue
+            this.fail(err)
+          }
+        }
+        const m = await this.call<{ message_id: number }>("sendMessage", {
+          chat_id: this.chatId,
+          message_thread_id: thread,
+          text: html,
+          parse_mode: "HTML",
+          link_preview_options: { is_disabled: true },
+        })
+        this.remember(m.message_id, session.id)
+      }
+      // Streamed text of an earlier step that the final text no longer needs.
+      for (const extra of shown.slice(messages.length))
+        await this.call("deleteMessage", {
+          chat_id: this.chatId,
+          message_id: extra.id,
+        }).catch((err) => this.fail(err))
+      if (rest)
+        await this.upload(
+          "sendDocument",
+          {
+            chat_id: this.chatId,
+            message_thread_id: thread,
+            caption: "📄 Full reply",
+          },
+          { field: "document", name: "reply.md", data: text },
+        )
+      return { parts: messages.length, documents: rest ? 1 : 0 }
+    } catch (err) {
+      this.fail(err)
+      return undefined
+    }
   }
 
   private async toast(callbackID: string, text?: string): Promise<void> {

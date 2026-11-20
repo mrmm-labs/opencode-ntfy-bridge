@@ -9,7 +9,7 @@ import type { ConnectorSettings } from "./connectors/types.ts"
 import { log } from "./logger.ts"
 
 /** A top-level session's routing choice. */
-export type SessionSetting = { on: boolean; channel?: string }
+export type SessionSetting = { on?: boolean; channel?: string; chat?: boolean }
 export type Settings = {
   channels?: Record<string, ConnectorSettings>
   sessions?: Record<string, SessionSetting>

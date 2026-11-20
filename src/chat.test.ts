@@ -1,0 +1,740 @@
+import assert from "node:assert/strict"
+import { mkdtemp } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { describe, it } from "node:test"
+
+import { Bridge, type BridgeEvent, type Host } from "./bridge.ts"
+import { parseConfig, type Config } from "./config.ts"
+import { fakeTelegram } from "./connectors/fake-telegram.test-util.ts"
+import {
+  TelegramConnector,
+  type TelegramOptions,
+} from "./connectors/telegram.ts"
+import { Telemetry } from "./otel.ts"
+import { PendingStore } from "./pending.ts"
+import { Router } from "./routing.ts"
+import { sleep } from "./util.ts"
+
+const CHAT = 4242
+const SECRET = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+
+type Rig = Awaited<ReturnType<typeof chatRig>>
+
+async function chatRig(
+  o: {
+    chat?: Record<string, unknown>
+    redact?: string
+    tg?: Partial<TelegramOptions>
+    busy?: boolean
+    directory?: string
+    posts?: string[]
+  } = {},
+) {
+  const tg = await fakeTelegram()
+  tg.forum = true
+  const dir = await mkdtemp(join(tmpdir(), "oobb-chat-"))
+  const tel = o.posts
+    ? new Telemetry(
+        { endpoint: "https://otel.example" },
+        async (_url, init) => {
+          o.posts!.push(String(init.body))
+          return new Response("{}", { status: 200 })
+        },
+        60_000,
+      )
+    : undefined
+  const channel = new TelegramConnector({
+    token: async () => tg.token,
+    chatId: String(CHAT),
+    apiBase: tg.url,
+    topicsFile: join(dir, "topics.json"),
+    offsetFile: join(dir, "offset.json"),
+    pollSeconds: 1,
+    backoff: { min: 10, max: 40 },
+    typingMs: 25,
+    tel,
+    ...o.tg,
+  })
+  const cfg = parseConfig({
+    channels: { telegram: { token: { env: "X" } } },
+    chat: o.chat,
+    redact: o.redact,
+  }) as Config
+  const prompts: Array<{ sessionID: string; text: string }> = []
+  const replies: unknown[] = []
+  const state = { busy: o.busy ?? false }
+  const host: Host = {
+    session: async (id) =>
+      id === "root"
+        ? {
+            id,
+            agent: "coord",
+            directory: o.directory ?? "/w/shop",
+            title: "Fix",
+          }
+        : undefined,
+    root: (id) => id,
+    replyForm: async (sessionID, formID, answer) => {
+      replies.push({ sessionID, formID, answer })
+    },
+    prompt: async (sessionID, text) => {
+      prompts.push({ sessionID, text })
+    },
+    busy: () => state.busy,
+  }
+  const router = new Router(cfg, async () => true)
+  const store = new PendingStore()
+  const bridge = new Bridge(cfg, host, [channel], store, router, Date.now, tel)
+  bridge.start()
+  const ev = (type: string, data: Record<string, unknown> = {}) =>
+    bridge.onEvent({
+      type,
+      data: { sessionID: "root", ...data },
+    } as unknown as BridgeEvent)
+  return {
+    tg,
+    router,
+    bridge,
+    store,
+    prompts,
+    replies,
+    state,
+    ev,
+    tel,
+    cfg,
+    channel,
+    sends: () => tg.of("sendMessage").map((c) => c.body),
+    async done() {
+      await bridge.stop()
+      await tg.close()
+    },
+  }
+}
+
+const chatOn = async (r: Rig) => {
+  const out = await r.bridge.setChat("root", true)
+  assert.equal(out.ok, true, out.text)
+  await r.tg.waitFor(() => r.tg.of("sendMessage")[0])
+}
+
+describe("chat from Telegram: access", () => {
+  it("is off by default: a message in the topic is not sent, and the hint comes once an hour", async () => {
+    const r = await chatRig()
+    r.router.set("root", true)
+    await r.ev("session.execution.started")
+    await r.tg.waitFor(() => r.tg.of("createForumTopic")[0])
+    r.tg.message(CHAT, "do the thing", undefined, 9001)
+    const hint = await r.tg.waitFor(() =>
+      r.sends().find((b) => /Chat is off for this session/.test(b.text)),
+    )
+    assert.match(hint.text, /run \/oob chat on in the TUI/)
+    assert.equal(hint.message_thread_id, 9001)
+    r.tg.message(CHAT, "again", undefined, 9001)
+    await sleep(150)
+    assert.equal(r.sends().filter((b) => /Chat is off/.test(b.text)).length, 1)
+    assert.deepEqual(r.prompts, [])
+    await r.done()
+  })
+
+  it("maps the topic to its session, acknowledges with 👀 and says where it went", async () => {
+    const r = await chatRig()
+    await chatOn(r)
+    r.tg.message(CHAT, "run the tests", undefined, 9001)
+    await r.tg.waitFor(() => r.prompts[0])
+    assert.deepEqual(r.prompts, [{ sessionID: "root", text: "run the tests" }])
+    const react = await r.tg.waitFor(() => r.tg.of("setMessageReaction")[0])
+    assert.deepEqual(react.body.reaction, [{ type: "emoji", emoji: "👀" }])
+    const line = await r.tg.waitFor(() =>
+      r.sends().find((b) => /→ sent to/.test(b.text)),
+    )
+    assert.equal(line.text, "→ sent to coord · shop")
+    assert.equal(line.message_thread_id, 9001)
+    assert.equal(line.disable_notification, true)
+    await r.done()
+  })
+
+  it("says queued when the session is busy", async () => {
+    const r = await chatRig({ busy: true })
+    await chatOn(r)
+    r.tg.message(CHAT, "and then this", undefined, 9001)
+    await r.tg.waitFor(() =>
+      r.sends().find((b) => /→ queued for coord · shop/.test(b.text)),
+    )
+    assert.equal(r.prompts.length, 1)
+    await r.done()
+  })
+
+  it("a reply to one of the session's bot messages is a prompt too, outside the topic", async () => {
+    const r = await chatRig()
+    await chatOn(r)
+    const card = Number(
+      (await r.tg.waitFor(() => r.tg.of("sendMessage")[0])).body && 501,
+    )
+    r.tg.message(CHAT, "via reply", card)
+    await r.tg.waitFor(() => r.prompts[0])
+    assert.equal(r.prompts[0].text, "via reply")
+    await r.done()
+  })
+
+  it("ignores another chat, an unknown topic, and a plain message outside any topic", async () => {
+    const r = await chatRig()
+    await chatOn(r)
+    r.tg.message(999, "intruder", undefined, 9001)
+    r.tg.message(CHAT, "nobody's topic", undefined, 4444)
+    r.tg.message(CHAT, "general chatter")
+    await sleep(200)
+    assert.deepEqual(r.prompts, [])
+    assert.equal(r.sends().length, 1, "only the card")
+    await r.done()
+  })
+
+  it("answers still answer: a reply to a question is the answer, not a prompt", async () => {
+    const r = await chatRig()
+    await chatOn(r)
+    await r.bridge.onEvent({
+      type: "form.created",
+      data: {
+        form: {
+          id: "frm_1",
+          sessionID: "root",
+          metadata: { kind: "question" },
+          fields: [
+            {
+              key: "q0",
+              type: "string",
+              description: "Go?",
+              options: [{ label: "Yes" }, { label: "No" }],
+            },
+          ],
+        },
+      },
+    } as unknown as BridgeEvent)
+    const q = await r.tg.waitFor(() =>
+      r.sends().find((b) => /Go\?/.test(b.text)),
+    )
+    assert.ok(q)
+    const ref = Number(r.store.list()[0].refs!.telegram)
+    r.tg.message(CHAT, "2", ref, 9001)
+    await r.tg.waitFor(() => r.replies[0])
+    assert.deepEqual((r.replies[0] as { answer: unknown }).answer, { q0: "No" })
+    assert.deepEqual(r.prompts, [])
+    // A plain message in the same topic is a prompt.
+    r.tg.message(CHAT, "next step", undefined, 9001)
+    await r.tg.waitFor(() => r.prompts[0])
+    await r.done()
+  })
+
+  it("permissions are never answered from a chat", async () => {
+    const r = await chatRig()
+    await chatOn(r)
+    await r.bridge.onEvent({
+      type: "permission.asked",
+      data: {
+        id: "per_1",
+        sessionID: "root",
+        action: "bash",
+        resources: ["rm x"],
+      },
+    } as unknown as BridgeEvent)
+    const p = await r.tg.waitFor(() =>
+      r.sends().find((b) => /needs permission/.test(b.text)),
+    )
+    assert.equal(p.reply_markup, undefined)
+    const ref = Number(r.store.list()[0].refs!.telegram)
+    r.tg.message(CHAT, "1", ref, 9001)
+    await r.tg.waitFor(() =>
+      r
+        .sends()
+        .find((b) => /only be answered in the OpenCode TUI/.test(b.text)),
+    )
+    assert.deepEqual(r.replies, [])
+    assert.deepEqual(r.prompts, [])
+    await r.done()
+  })
+})
+
+describe("chat from Telegram: deny list and the Stop button", () => {
+  it("chat.deny blocks /oob chat on and explains why", async () => {
+    const r = await chatRig({ chat: { deny: [{ directory: "**/shop" }] } })
+    const out = await r.bridge.setChat("root", true)
+    assert.equal(out.ok, false)
+    assert.match(out.text, /blocked .* chat\.deny/)
+    assert.equal(r.bridge.chatEnabled("root"), false)
+    await r.done()
+  })
+
+  it("chat.deny also blocks a session whose chat was restored from settings", async () => {
+    const r = await chatRig({ chat: { deny: [{ agent: "^coord$" }] } })
+    r.bridge.restoreChat("root")
+    r.router.set("root", true)
+    await r.ev("session.execution.started")
+    await r.tg.waitFor(() => r.tg.of("createForumTopic")[0])
+    r.tg.message(CHAT, "sneak", undefined, 9001)
+    await r.tg.waitFor(() =>
+      r
+        .sends()
+        .find((b) => /blocked for this session by chat\.deny/.test(b.text)),
+    )
+    assert.deepEqual(r.prompts, [])
+    await r.done()
+  })
+
+  it("the card carries a Stop chat button while chat is on; tapping it turns chat off and removes the button", async () => {
+    const r = await chatRig()
+    await chatOn(r)
+    const card = r.sends()[0]
+    assert.deepEqual(card.reply_markup, {
+      inline_keyboard: [[{ text: "🛑 Stop chat", callback_data: "chatoff" }]],
+    })
+    assert.match(card.text, /💬 Chat on/)
+    r.tg.callback(CHAT, 501, "chatoff", 9001)
+    await r.tg.waitFor(() => r.tg.of("answerCallbackQuery")[0])
+    assert.equal(r.bridge.chatEnabled("root"), false)
+    assert.match(r.tg.of("answerCallbackQuery")[0].body.text, /Chat is off/)
+    r.tg.message(CHAT, "hello?", undefined, 9001)
+    await r.tg.waitFor(() =>
+      r.sends().find((b) => /Chat is off for this session/.test(b.text)),
+    )
+    assert.deepEqual(r.prompts, [])
+    await r.done()
+  })
+
+  it("no chat without a channel that can chat selected", async () => {
+    const r = await chatRig()
+    r.bridge.setEnabled("telegram", false)
+    const out = await r.bridge.setChat("root", true)
+    assert.equal(out.ok, false)
+    assert.match(out.text, /No channel that can chat/)
+    await r.done()
+  })
+})
+
+describe("chat from Telegram: replies", () => {
+  const turn = async (r: Rig, text: string, id = "m1") => {
+    await r.ev("session.execution.started")
+    await r.ev("session.text.started", { assistantMessageID: id, ordinal: 0 })
+    await r.ev("session.text.ended", {
+      assistantMessageID: id,
+      ordinal: 0,
+      text,
+    })
+    await r.ev("session.execution.succeeded")
+  }
+
+  it("posts the final text of a turn as formatted HTML, escaped, in the topic", async () => {
+    const r = await chatRig({ chat: { stream: false } })
+    await chatOn(r)
+    await turn(r, "Done: **ok** <b>& `x<y`\n\n```html\n<p>a & b</p>\n```")
+    const m = await r.tg.waitFor(() =>
+      r.sends().find((b) => /Done:/.test(b.text)),
+    )
+    assert.equal(m.parse_mode, "HTML")
+    assert.equal(m.message_thread_id, 9001)
+    assert.equal(
+      m.text,
+      'Done: <b>ok</b> &lt;b&gt;&amp; <code>x&lt;y</code>\n<pre><code class="language-html">&lt;p&gt;a &amp; b&lt;/p&gt;</code></pre>',
+    )
+    await r.done()
+  })
+
+  it("only the last assistant message of the turn counts, and secrets are filtered", async () => {
+    const r = await chatRig({ chat: { stream: false } })
+    await chatOn(r)
+    await r.ev("session.execution.started")
+    await r.ev("session.text.ended", {
+      assistantMessageID: "m1",
+      ordinal: 0,
+      text: "step one, thinking aloud",
+    })
+    await r.ev("session.text.ended", {
+      assistantMessageID: "m2",
+      ordinal: 0,
+      text: `final answer ${SECRET}`,
+    })
+    await r.ev("session.execution.succeeded")
+    const m = await r.tg.waitFor(() =>
+      r.sends().find((b) => /final answer/.test(b.text)),
+    )
+    assert.doesNotMatch(m.text, /ghp_/)
+    assert.equal(r.sends().filter((b) => /step one/.test(b.text)).length, 0)
+    await r.done()
+  })
+
+  it("redact title hides the reply text", async () => {
+    const r = await chatRig({ chat: { stream: false }, redact: "title" })
+    await chatOn(r)
+    await turn(r, "secret plan")
+    const m = await r.tg.waitFor(() =>
+      r.sends().find((b) => /details hidden/.test(b.text)),
+    )
+    assert.doesNotMatch(m.text, /secret plan/)
+    await r.done()
+  })
+
+  it("splits a long reply on paragraphs into at most 3 messages, then a document for the rest", async () => {
+    const r = await chatRig({ chat: { stream: false } })
+    await chatOn(r)
+    const text = Array.from(
+      { length: 200 },
+      (_, i) => `Paragraph ${i} ${"word ".repeat(40)}`,
+    ).join("\n\n")
+    await turn(r, text)
+    const doc = await r.tg.waitFor(() => r.tg.of("sendDocument")[0])
+    assert.equal(doc.body.multipart, true)
+    assert.equal(doc.body.fields.caption, "📄 Full reply")
+    assert.equal(doc.body.fields.message_thread_id, "9001")
+    assert.equal(doc.body.fields.document, text.trim())
+    const parts = r.sends().filter((b) => b.text.startsWith("Paragraph"))
+    assert.equal(parts.length, 3)
+    for (const p of parts) assert.ok(p.text.length <= 4096)
+    await r.done()
+  })
+
+  it("a reply that fits in three messages sends no document", async () => {
+    const r = await chatRig({ chat: { stream: false } })
+    await chatOn(r)
+    await turn(
+      r,
+      Array.from({ length: 50 }, (_, i) => `P${i} ${"word ".repeat(40)}`).join(
+        "\n\n",
+      ),
+    )
+    await r.tg.waitFor(
+      () => r.sends().filter((b) => /^P\d/.test(b.text)).length >= 2,
+    )
+    await sleep(100)
+    assert.equal(r.tg.of("sendDocument").length, 0)
+    await r.done()
+  })
+
+  it("mirrors a reply to a turn started from the TUI by default, and not under remote-only", async () => {
+    const a = await chatRig({ chat: { stream: false } })
+    await chatOn(a)
+    await turn(a, "from the tui")
+    await a.tg.waitFor(() => a.sends().find((b) => /from the tui/.test(b.text)))
+    await a.done()
+
+    const b = await chatRig({ chat: { stream: false, mirror: "remote-only" } })
+    await chatOn(b)
+    await turn(b, "tui turn, not mirrored")
+    await sleep(150)
+    assert.equal(b.sends().filter((x) => /not mirrored/.test(x.text)).length, 0)
+    b.tg.message(CHAT, "from the phone", undefined, 9001)
+    await b.tg.waitFor(() => b.prompts[0])
+    await turn(b, "phone turn, mirrored", "m9")
+    await b.tg.waitFor(() =>
+      b.sends().find((x) => /phone turn, mirrored/.test(x.text)),
+    )
+    await b.done()
+  })
+
+  it("posts nothing for a session with chat off", async () => {
+    const r = await chatRig({ chat: { stream: false } })
+    await r.ev("session.execution.started")
+    await r.ev("session.text.ended", {
+      assistantMessageID: "m1",
+      ordinal: 0,
+      text: "hi",
+    })
+    await r.ev("session.execution.succeeded")
+    await sleep(100)
+    assert.equal(r.sends().filter((b) => b.text === "hi").length, 0)
+    await r.done()
+  })
+
+  it("a failed turn posts no reply", async () => {
+    const r = await chatRig({ chat: { stream: false } })
+    await chatOn(r)
+    await r.ev("session.execution.started")
+    await r.ev("session.text.ended", {
+      assistantMessageID: "m1",
+      ordinal: 0,
+      text: "half done",
+    })
+    await r.ev("session.execution.failed")
+    await sleep(100)
+    assert.equal(r.sends().filter((b) => /half done/.test(b.text)).length, 0)
+    await r.done()
+  })
+})
+
+describe("chat from Telegram: typing indicator", () => {
+  it("starts when the session works and stops when it goes idle", async () => {
+    const r = await chatRig()
+    await chatOn(r)
+    await r.ev("session.execution.started")
+    const first = await r.tg.waitFor(() => r.tg.of("sendChatAction")[0])
+    assert.deepEqual(first.body, {
+      chat_id: String(CHAT),
+      message_thread_id: 9001,
+      action: "typing",
+    })
+    await r.tg.waitFor(() => r.tg.of("sendChatAction").length >= 3)
+    await r.ev("session.execution.succeeded")
+    const n = r.tg.of("sendChatAction").length
+    await sleep(120)
+    assert.equal(r.tg.of("sendChatAction").length, n, "stopped")
+    await r.done()
+  })
+
+  it("is not sent for a session with chat off", async () => {
+    const r = await chatRig()
+    r.router.set("root", true)
+    await r.ev("session.execution.started")
+    await r.tg.waitFor(() => r.tg.of("sendMessage")[0])
+    await sleep(100)
+    assert.equal(r.tg.of("sendChatAction").length, 0)
+    await r.done()
+  })
+})
+
+describe("chat from Telegram: streaming", () => {
+  const session = { id: "root", name: "shop · Fix", project: "shop" }
+  const rigWithClock = async () => {
+    const clock = { t: 1_000_000 }
+    const tg = await fakeTelegram()
+    tg.forum = true
+    const c = new TelegramConnector({
+      token: async () => tg.token,
+      chatId: String(CHAT),
+      apiBase: tg.url,
+      now: () => clock.t,
+    })
+    return { tg, c, clock }
+  }
+  // Until the fake has heard nothing new for a moment.
+  const settle = async (tg: { calls: unknown[] }) => {
+    let n = -1
+    while (tg.calls.length !== n) {
+      n = tg.calls.length
+      await sleep(50)
+    }
+  }
+
+  it("sends on the first text, then edits at most once every 1.5 s", async () => {
+    const { tg, c, clock } = await rigWithClock()
+    c.stream(session, "Hel")
+    await settle(tg)
+    assert.equal(tg.of("sendMessage").length, 1)
+    assert.equal(tg.of("sendMessage")[0].body.text, "Hel")
+
+    c.stream(session, "Hello wor")
+    c.stream(session, "Hello world")
+    await settle(tg)
+    assert.equal(tg.of("editMessageText").length, 0, "within the gap")
+
+    clock.t += 1600
+    c.stream(session, "Hello world!")
+    await settle(tg)
+    const edits = tg.of("editMessageText")
+    assert.equal(edits.length, 1)
+    assert.equal(edits[0].body.text, "Hello world!")
+    assert.equal(edits[0].body.message_id, 501)
+    await tg.close()
+  })
+
+  it("a change that came too soon is applied later by a timer, not lost", async () => {
+    const tg = await fakeTelegram()
+    tg.forum = true
+    const c = new TelegramConnector({
+      token: async () => tg.token,
+      chatId: String(CHAT),
+      apiBase: tg.url,
+    })
+    c.stream(session, "a")
+    await tg.waitFor(() => tg.of("sendMessage")[0])
+    c.stream(session, "a b")
+    const e = await tg.waitFor(() => tg.of("editMessageText")[0], 4000)
+    assert.equal(e.body.text, "a b")
+    await tg.close()
+  })
+
+  it("closes an open code fence in the partial render and escapes the text", async () => {
+    const { tg, c } = await rigWithClock()
+    c.stream(session, "Look:\n```js\nif (a < b && c) {")
+    await settle(tg)
+    assert.equal(
+      tg.of("sendMessage")[0].body.text,
+      'Look:\n<pre><code class="language-js">if (a &lt; b &amp;&amp; c) {</code></pre>',
+    )
+    await tg.close()
+  })
+
+  it("passes about 3,800 characters: freezes that message and continues in a new one, at most 3", async () => {
+    const { tg, c, clock } = await rigWithClock()
+    const para = (i: number) => `Paragraph ${i} ${"word ".repeat(40)}`
+    let text = ""
+    for (let i = 0; i < 100; i++) {
+      text += `${i ? "\n\n" : ""}${para(i)}`
+      if (i % 5 === 0) {
+        c.stream(session, text)
+        clock.t += 1600
+        await settle(tg)
+      }
+    }
+    c.stream(session, text)
+    clock.t += 1600
+    await settle(tg)
+    const sent = tg.of("sendMessage")
+    assert.equal(sent.length, 3, "three messages at most")
+    assert.ok(sent[0].body.text.length <= 3800)
+    // The first message was frozen: it is not edited after the second exists.
+    const firstEdits = tg
+      .of("editMessageText")
+      .filter((e) => e.body.message_id === 501)
+    const secondAt = tg.calls.findIndex(
+      (x) => x.method === "sendMessage" && x.body.text !== sent[0].body.text,
+    )
+    const lastFirstEdit = tg.calls.findLastIndex(
+      (x) => x.method === "editMessageText" && x.body.message_id === 501,
+    )
+    assert.ok(firstEdits.length === 0 || lastFirstEdit < secondAt + 1)
+    await tg.close()
+  })
+
+  it("honours 429 retry_after: no edit before it, then the same text goes through", async () => {
+    const { tg, c, clock } = await rigWithClock()
+    c.stream(session, "one")
+    await settle(tg)
+    clock.t += 1600
+    tg.fail("editMessageText", 429, { parameters: { retry_after: 5 } })
+    c.stream(session, "one two")
+    await settle(tg)
+    assert.equal(tg.of("editMessageText").length, 1, "the rejected try")
+    clock.t += 2000
+    c.stream(session, "one two three")
+    await settle(tg)
+    assert.equal(tg.of("editMessageText").length, 1, "still backing off")
+    clock.t += 4000
+    c.stream(session, "one two three")
+    await tg.waitFor(() => tg.of("editMessageText")[1])
+    assert.equal(tg.of("editMessageText")[1].body.text, "one two three")
+    await tg.close()
+  })
+
+  it("through the bridge: streams while the turn runs and ends with the full text in the same message", async () => {
+    const r = await chatRig()
+    await chatOn(r)
+    await r.ev("session.execution.started")
+    await r.ev("session.text.started", { assistantMessageID: "m1", ordinal: 0 })
+    await r.ev("session.text.delta", {
+      assistantMessageID: "m1",
+      ordinal: 0,
+      delta: "Working on ",
+    })
+    const first = await r.tg.waitFor(() =>
+      r.sends().find((b) => b.text === "Working on"),
+    )
+    assert.ok(first)
+    await r.ev("session.text.delta", {
+      assistantMessageID: "m1",
+      ordinal: 0,
+      delta: "**it**",
+    })
+    await r.ev("session.text.ended", {
+      assistantMessageID: "m1",
+      ordinal: 0,
+      text: "Working on **it**",
+    })
+    await r.ev("session.execution.succeeded")
+    const edit = await r.tg.waitFor(() =>
+      r.tg
+        .of("editMessageText")
+        .find((e) => e.body.text === "Working on <b>it</b>"),
+    )
+    assert.equal(edit.body.message_id, 502)
+    assert.equal(
+      r.sends().filter((b) => /Working on/.test(b.text)).length,
+      1,
+      "one message, not two",
+    )
+    await r.done()
+  })
+
+  it("chat.stream false: only the final reply, once", async () => {
+    const r = await chatRig({ chat: { stream: false } })
+    await chatOn(r)
+    await r.ev("session.execution.started")
+    await r.ev("session.text.delta", {
+      assistantMessageID: "m1",
+      ordinal: 0,
+      delta: "partial",
+    })
+    await sleep(350)
+    assert.equal(r.sends().filter((b) => /partial/.test(b.text)).length, 0)
+    await r.ev("session.text.ended", {
+      assistantMessageID: "m1",
+      ordinal: 0,
+      text: "partial and done",
+    })
+    await r.ev("session.execution.succeeded")
+    await r.tg.waitFor(() =>
+      r.sends().find((b) => b.text === "partial and done"),
+    )
+    await r.done()
+  })
+})
+
+describe("chat from Telegram: telemetry carries no text", () => {
+  it("records prompts, outcomes, replies and stream edits as counts and kinds only", async () => {
+    const posts: string[] = []
+    const r = await chatRig({ posts })
+    await chatOn(r)
+    const PROMPT = "please rotate the quarterly payroll keys"
+    const REPLY = "rotated the payroll keys"
+    r.tg.message(CHAT, PROMPT, undefined, 9001)
+    await r.tg.waitFor(() => r.prompts[0])
+    await r.ev("session.execution.started")
+    await r.ev("session.text.delta", {
+      assistantMessageID: "m1",
+      ordinal: 0,
+      delta: REPLY,
+    })
+    await sleep(350)
+    await r.ev("session.text.ended", {
+      assistantMessageID: "m1",
+      ordinal: 0,
+      text: REPLY,
+    })
+    await r.ev("session.execution.succeeded")
+    await r.tg.waitFor(() => r.sends().find((b) => /rotated/.test(b.text)))
+    await sleep(100)
+    await r.tel!.flush()
+    const dump = posts.join("\n")
+    for (const bad of [
+      PROMPT,
+      REPLY,
+      "payroll",
+      "quarterly",
+      "/w/shop",
+      SECRET,
+    ])
+      assert.ok(!dump.includes(bad), `exported ${bad}`)
+    assert.match(dump, /oob\.prompts/)
+    assert.match(dump, /oob\.replies/)
+    assert.match(dump, /oob\.reply/)
+    assert.match(dump, /"stringValue":"prompt"/)
+    assert.match(dump, /"stringValue":"sent"/)
+    assert.match(dump, /oob\.stream\.edits/)
+    await r.done()
+  })
+
+  it("counts denied, off and queued prompts by outcome", async () => {
+    const posts: string[] = []
+    const r = await chatRig({ posts, busy: true })
+    r.router.set("root", true)
+    await r.ev("session.execution.started")
+    await r.tg.waitFor(() => r.tg.of("createForumTopic")[0])
+    r.tg.message(CHAT, "off one", undefined, 9001)
+    await r.tg.waitFor(() => r.sends().find((b) => /Chat is off/.test(b.text)))
+    await chatOn(r)
+    r.tg.message(CHAT, "queued one", undefined, 9001)
+    await r.tg.waitFor(() => r.prompts[0])
+    await r.tel!.flush()
+    const dump = posts.join("\n")
+    assert.match(dump, /"stringValue":"off"/)
+    assert.match(dump, /"stringValue":"queued"/)
+    await r.done()
+  })
+})

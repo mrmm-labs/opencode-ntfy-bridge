@@ -232,6 +232,60 @@ sends. Before pointing a sensitive project at it, use `redact: "title"` (no ques
 `profiles` entry that blanks its messages, or `rules`/`/oob on ntfy` to keep that session off
 Telegram. Known secret shapes are masked in every message either way.
 
+## Chat from Telegram
+
+With chat on, a session can be talked to from its Telegram topic. You write in the topic, the
+message goes to the session as a prompt, and the session's answer is posted back, so the topic
+is a mirror of the conversation. This needs the Telegram channel in a forum group (see above).
+
+```
+/oob chat on      turn it on for the session you are looking at
+/oob chat off     turn it off (the 🛑 Stop chat button on the status card does the same)
+```
+
+How it behaves:
+
+- **A prompt** is any plain message in the session's topic, or a reply to one of that session's
+  bot messages. The bot puts 👀 on it and says `→ sent to <agent> · <project>`, or `→ queued` when
+  the session is busy. A prompt sent to a busy session waits its turn: it never interrupts a step.
+- **Answers come first.** A reply to a question, or a tap on a button, still answers that question.
+  Only a message that answers nothing is a prompt.
+- **While the session works**, the topic shows "typing…". The assistant text appears in one message
+  that is edited as it grows (about every 1.5 s), moves to a new message past about 3,800
+  characters, and gets its final formatting when the turn ends. At most three messages: anything
+  longer is also attached as `reply.md` ("📄 Full reply"). Only the assistant's text is posted,
+  never tool calls or reasoning. Markdown becomes Telegram HTML (code blocks, inline code, bold,
+  italic, links, lists), with everything else escaped.
+- **`redact` applies** to what is posted, and known secret shapes are masked.
+
+```jsonc
+"chat": {
+  "stream": true,         // edit one message while the reply is written
+  "mirror": "replies",    // "replies": post every final reply; "remote-only": only turns you started from Telegram
+  "deny": [ { "directory": "**/payroll" }, { "agent": "^ops$" } ]
+}
+```
+
+**Security model.**
+
+- **Off by default**, and only switched on for one session at a time, in the TUI. Nothing in
+  Telegram can switch it on: the 🛑 button and the topic hint can only turn it off or explain.
+- **Paired chat only.** A message from any other chat is dropped unread and logged without its
+  content.
+- **Topic or reply only.** A message counts only inside the topic of a chat-enabled session, or
+  as a reply to one of that session's bot messages. Everything else is ignored. A message in the
+  topic of a session whose chat is off gets one hint an hour ("Chat is off for this session").
+- **`chat.deny`** blocks sessions by agent or directory glob even after `/oob chat on`, and the
+  toggle says why.
+- **Permissions are never answered remotely**, from any channel.
+- **ntfy never chats.** Only a channel with the `inboundPrompt` capability can, and ntfy does not
+  have it.
+- **Telegram is not end-to-end encrypted.** Whoever controls the paired chat, or the bot's token,
+  can talk to the session, and Telegram can read the conversation. A prompt is an instruction
+  to an agent that may run commands in your project: keep the group private, keep chat off for
+  sensitive projects, and put them in `chat.deny`. Use `redact: "title"` if replies must not
+  leave the machine.
+
 ## Telemetry
 
 The plugin can export OpenTelemetry traces and metrics over OTLP/HTTP JSON, using only `fetch`
@@ -253,17 +307,22 @@ telemetry, so these spans join the session's trace.
 | `oob.push`      | One push of a kind, with a child `oob.send` or `oob.update` per connector (type, ok, HTTP status, retries).                                                        |
 | `oob.inbound`   | An answer or prompt from a chat: kind, connector type, outcome (`applied`, `expired`, `duplicate`, `unreadable`, `permission-refused`, `failed`, `rejected-chat`). |
 | `oob.pair`      | Pairing, until paired or expired.                                                                                                                                  |
+| `oob.reply`     | A reply posted to a chat: parts, characters, documents (never the text).                                                                                           |
 | `oob.reconnect` | A connector's poll or subscription reconnecting.                                                                                                                   |
 
-| Metrics                 | Kind      | Labels                                              |
-| ----------------------- | --------- | --------------------------------------------------- |
-| `oob.pushes`            | counter   | `connector.type`, `push.kind`                       |
-| `oob.push.errors`       | counter   | `connector.type`, `push.kind`                       |
-| `oob.answers`           | counter   | `connector.type`, `answered_by` (`phone`, `tui`)    |
-| `oob.inbound.rejected`  | counter   | `connector.type`, `reason`                          |
-| `oob.reconnects`        | counter   | `connector.type`                                    |
-| `oob.answer.latency_ms` | histogram | `connector.type`, `answered_by` (asked to answered) |
-| `oob.pending`           | gauge     | none (open prompts)                                 |
+| Metrics                 | Kind      | Labels                                                                    |
+| ----------------------- | --------- | ------------------------------------------------------------------------- |
+| `oob.pushes`            | counter   | `connector.type`, `push.kind`                                             |
+| `oob.push.errors`       | counter   | `connector.type`, `push.kind`                                             |
+| `oob.answers`           | counter   | `connector.type`, `answered_by` (`phone`, `tui`)                          |
+| `oob.prompts`           | counter   | `connector.type`, `outcome` (`sent`, `queued`, `off`, `denied`, `failed`) |
+| `oob.replies`           | counter   | `connector.type`                                                          |
+| `oob.stream.edits`      | counter   | `connector.type`                                                          |
+| `oob.stream.throttled`  | counter   | `connector.type`                                                          |
+| `oob.inbound.rejected`  | counter   | `connector.type`, `reason`                                                |
+| `oob.reconnects`        | counter   | `connector.type`                                                          |
+| `oob.answer.latency_ms` | histogram | `connector.type`, `answered_by` (asked to answered)                       |
+| `oob.pending`           | gauge     | none (open prompts)                                                       |
 
 Attributes are ids, kinds, counts and timings only. Message text, titles, answers, tokens, chat
 ids and URLs are never exported. Data is batched every few seconds in a bounded queue (the oldest

@@ -57,6 +57,16 @@
     // { "command": ["/usr/local/bin/should-notify"] },
   ],
 
+  // Chat with a session from its Telegram topic: off until you run
+  // /oob chat on in the TUI, per session. Permissions are never answered
+  // from a chat. Telegram is not end-to-end encrypted.
+  // "chat": {
+  //   "stream": true,
+  //   "mirror": "replies", // or "remote-only"
+  //   // Never chat with these, even after /oob chat on.
+  //   "deny": [{ "directory": "**/payroll" }, { "agent": "^ops$" }],
+  // },
+
   // "full", "head:<n>" (first n characters) or "title" (no body).
   // Known secret shapes are masked in every case.
   "redact": "head:300",

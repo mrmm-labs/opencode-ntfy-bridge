@@ -161,7 +161,7 @@ describe("capabilities", () => {
     assert.equal(connectorTypes.ntfy.create.length, 2)
   })
 
-  it("capabilities: ntfy has no pairing, threads or inbound prompt; telegram has pairing", () => {
+  it("capabilities: ntfy has no pairing, threads or inbound prompt; telegram has pairing and chat", () => {
     const env = {
       name: "n",
       dir: "/nonexistent",
@@ -190,6 +190,6 @@ describe("capabilities", () => {
       connectorTypes.telegram.parse({ token: { env: "X" } }, ""),
     ) as Connector
     assert.equal(t.capabilities.pairing, true)
-    assert.equal(t.capabilities.inboundPrompt, false)
+    assert.equal(t.capabilities.inboundPrompt, true)
   })
 })

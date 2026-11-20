@@ -411,6 +411,52 @@ describe("/oob menu and channels", () => {
     await tg.close()
   })
 
+  it("/oob chat on turns chat on for the session, keeps it across a restart, and the menu offers it", async () => {
+    const tg = await fakeTelegram()
+    const { f, dir, cmd, cleanup } = await started({
+      telegram: { token: { env: "OOBB_TG" }, chatId: 7, apiBase: tg.url },
+    })
+    await cmd.run("chat on")
+    assert.match(f.toasts.at(-1)!, /Chat is on for this session/)
+    await cleanup()
+    const saved = await readJson(join(dir, "settings.json"))
+    assert.equal(saved.sessions.root.chat, true)
+    assert.equal(saved.sessions.root.on, true)
+
+    const again = await started(
+      { telegram: { token: { env: "OOBB_TG" }, chatId: 7, apiBase: tg.url } },
+      {},
+      undefined,
+      dir,
+    )
+    await again.cmd.run()
+    assert.equal(
+      again.f.dialogs.at(-1)!.options![0].description,
+      "now: on, chat on",
+    )
+    again.f.picks.push("routing", "chat")
+    await again.cmd.run()
+    const menu = again.f.dialogs.find((d) => d.title === "This session")!
+    assert.ok(menu.options!.some((o) => o.title === "Chat from Telegram: on"))
+    assert.match(again.f.toasts.at(-1)!, /Chat is off/)
+    await again.cleanup()
+    const off = await readJson(join(dir, "settings.json"))
+    assert.equal(off.sessions.root.chat, undefined)
+    await tg.close()
+  })
+
+  it("/oob chat on says why when the config denies the session", async () => {
+    const tg = await fakeTelegram()
+    const { f, cmd, cleanup } = await started(
+      { telegram: { token: { env: "OOBB_TG" }, chatId: 7, apiBase: tg.url } },
+      { chat: { deny: [{ directory: "**/shop" }] } },
+    )
+    await cmd.run("chat on")
+    assert.match(f.toasts.at(-1)!, /blocked .* chat\.deny/)
+    await cleanup()
+    await tg.close()
+  })
+
   it("pairs Telegram from a one-time code and stores the chat in the settings", async () => {
     const tg = await fakeTelegram()
     const { f, dir, cmd, cleanup } = await started({
@@ -533,7 +579,7 @@ describe("/oob menu and channels", () => {
     assert.equal(r.current, "on:telegram")
     assert.deepEqual(
       r.options!.map((o) => o.value),
-      ["on", "on:ntfy", "on:telegram", "on:all", "off", "auto", "back"],
+      ["on", "on:ntfy", "on:telegram", "on:all", "off", "auto", "chat", "back"],
     )
     assert.equal(again.f.toasts.at(-1), "oob routing: auto")
     await again.cleanup()

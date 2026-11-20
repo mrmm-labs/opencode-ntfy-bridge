@@ -28,6 +28,16 @@ export type ChannelConfig = {
   options: unknown
 }
 
+/** Chat from a connector into a session. */
+export type ChatConfig = {
+  /** Sessions where chat stays off even after `/oob chat on`. */
+  deny: Array<{ agent?: RegExp; directory?: string }>
+  /** `replies`: every final reply of a chat-enabled session is posted; `remote-only`: only the turns started from the connector. */
+  mirror: "replies" | "remote-only"
+  /** Show a reply being written, in one message edited as it grows. */
+  stream: boolean
+}
+
 export type Config = {
   /** By instance name. */
   channels: Record<string, ChannelConfig>
@@ -36,6 +46,7 @@ export type Config = {
   away: { minutes: number }
   rules: Rule[]
   redact: Redact
+  chat: ChatConfig
   messages: Formats
   profiles: Profile[]
   /** Set when `otel.endpoint` is; the environment may still turn telemetry on. */
@@ -88,6 +99,34 @@ function parseChannels(
   if (Object.keys(out).length === 0)
     return { error: "configure a channel under channels" }
   return { channels: out }
+}
+
+function parseChat(raw: unknown): ChatConfig | { error: string } {
+  if (raw === undefined) return { deny: [], mirror: "replies", stream: true }
+  if (!isObject(raw)) return { error: "chat must be an object" }
+  const mirror = raw.mirror ?? "replies"
+  if (mirror !== "replies" && mirror !== "remote-only")
+    return { error: 'chat.mirror must be "replies" or "remote-only"' }
+  const stream = raw.stream ?? true
+  if (typeof stream !== "boolean")
+    return { error: "chat.stream must be true or false" }
+  const deny: ChatConfig["deny"] = []
+  if (raw.deny !== undefined && !Array.isArray(raw.deny))
+    return { error: "chat.deny must be a list" }
+  for (const d of (raw.deny as unknown[] | undefined) ?? []) {
+    if (!isObject(d)) return { error: "each chat.deny entry must be an object" }
+    const rule: ChatConfig["deny"][number] = {}
+    try {
+      if (typeof d.agent === "string") rule.agent = new RegExp(d.agent)
+    } catch {
+      return { error: `invalid chat.deny agent pattern ${d.agent}` }
+    }
+    if (typeof d.directory === "string") rule.directory = d.directory
+    if (!rule.agent && !rule.directory)
+      return { error: "a chat.deny entry needs agent or directory" }
+    deny.push(rule)
+  }
+  return { deny, mirror, stream }
 }
 
 /** Validates a parsed config file. Returns the config or the first problem. */
@@ -157,6 +196,9 @@ export function parseConfig(raw: unknown): Config | { error: string } {
     }
   }
 
+  const chat = parseChat(raw.chat)
+  if ("error" in chat) return chat
+
   const messages = parseFormats(raw.messages, "messages")
   if (typeof messages === "string") return { error: messages }
   const profiles = parseProfiles(raw.profiles)
@@ -168,6 +210,7 @@ export function parseConfig(raw: unknown): Config | { error: string } {
     away: { minutes },
     rules,
     redact,
+    chat,
     messages,
     profiles,
     otel,

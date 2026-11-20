@@ -167,6 +167,7 @@ export function renderStatus(s: SessionState, icon?: string): string {
     ...(agent ? [`🤖 ${fit(clean(agent), 120)}`] : []),
     `📁 ${fit(clean(s.project), 80)}`,
     `🆔 <code>${esc(s.id.slice(-6))}</code>`,
+    ...(s.chat ? ["💬 Chat on"] : []),
     `🕐 ${at}`,
   ].join("\n")
 }
