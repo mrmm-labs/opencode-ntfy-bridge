@@ -199,7 +199,12 @@ export interface Connector {
   /** Which of the session-end pushes this connector wants. Both when unset. */
   readonly notify?: { finished: boolean; failed: boolean }
   /** Shows the reply being written: all of its text so far. Only with `inboundPrompt`; never throws. */
-  stream?(session: NonNullable<Push["session"]>, text: string): void
+  stream?(
+    session: NonNullable<Push["session"]>,
+    text: string,
+    /** Shortest time between two edits, in ms. */
+    gapMs?: number,
+  ): void
   /** Posts the final text of a turn to the session's thread. Only with `inboundPrompt`; never throws. */
   reply?(
     session: NonNullable<Push["session"]>,

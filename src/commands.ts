@@ -25,6 +25,7 @@ const SESSION_COMMANDS = [
   "chat",
   "compact",
   "rename",
+  "steer",
 ] as const
 const GENERAL_COMMANDS = ["new", "sessions", "projects"] as const
 const ALIASES: Record<string, string> = { effort: "variant", start: "help" }
@@ -182,6 +183,7 @@ export class Commands {
           "/variant (/effort): pick the model's effort variant",
           "/status: redraw and pin the status card",
           "/stop: stop the running turn",
+          "/steer <text>: inject a message into the running turn (or start with !)",
           "/compact: compact the session",
           "/rename <title>: rename the session",
           "/chat off: stop chatting with this session",
@@ -194,7 +196,7 @@ export class Commands {
         "/new [project] [prompt]: start a session in a listed project",
         "/sessions: sessions that are mirrored here",
         "/projects: the projects /new can use",
-        "Inside a session's topic: /model, /agent, /variant, /status, /stop, /compact, /rename, /chat off.",
+        "Inside a session's topic: /model, /agent, /variant, /status, /stop, /steer, /compact, /rename, /chat off.",
       ].join("\n"),
     )
   }
@@ -301,6 +303,17 @@ export class Commands {
         info,
         "applied",
         yes(stopped ? "⏹ Stopped the running turn." : "Nothing is running."),
+      )
+    }
+    if (name === "steer") {
+      if (!args) return this.done(info, "invalid", no("Usage: /steer <text>"))
+      const busy = this.d.host.busy(root)
+      await this.d.host.prompt(root, args, "steer")
+      this.d.remote(root)
+      return this.done(
+        info,
+        busy ? "steered" : "sent",
+        yes(busy ? "⚡ steered in" : "→ sent"),
       )
     }
     if (name === "compact") {
@@ -676,7 +689,7 @@ export class Commands {
         model: model ? parseRef(model) : undefined,
       })
       this.d.startChat(id, ch)
-      await this.d.host.prompt(id, o.text)
+      await this.d.host.prompt(id, o.text, "queue")
       this.d.remote(id)
       await this.d.show(id, true)
       return end("applied", {

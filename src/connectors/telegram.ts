@@ -20,6 +20,9 @@ import {
   lazyToken,
   parseTokenSource,
   TOKEN_ERROR,
+  tokenWaitText,
+  TokenUnavailable,
+  type TokenFn,
   type TokenSource,
 } from "../token.ts"
 import { isObject, sleep, truncate, URL_RE } from "../util.ts"
@@ -55,7 +58,7 @@ const PAIR_TTL_MS = 10 * 60_000
 const TOAST_MAX = 190
 const TOPIC_RETRY_MS = 5 * 60_000
 const TOPIC_NOTICE_MS = 60 * 60_000
-const STREAM_GAP_MS = 1500
+const STREAM_GAP_MS = 1000
 // Streamed text moves to a new message past this many characters of HTML.
 const STREAM_CHARS = 3800
 const MAX_REPLY_MESSAGES = 3
@@ -78,6 +81,7 @@ const COMMANDS = [
   { command: "variant", description: "Pick the model's effort variant" },
   { command: "status", description: "Refresh and pin the status card" },
   { command: "stop", description: "Stop the running turn" },
+  { command: "steer", description: "Inject a message into the running turn" },
   { command: "compact", description: "Compact this session" },
   { command: "rename", description: "Rename this session" },
   { command: "chat", description: "/chat off stops chatting with it" },
@@ -92,7 +96,7 @@ export type TelegramOptions = {
   /** Instance name; defaults to "telegram". */
   name?: string
   tel?: Telemetry
-  token: () => Promise<string | undefined>
+  token: TokenFn
   /** The paired chat. Unset until `pair()` completes. */
   chatId?: string
   apiBase?: string
@@ -159,6 +163,7 @@ type Stream = {
   shown: Array<{ id: number; html: string }>
   /** No edit before this time. */
   nextAt: number
+  gapMs: number
   timer?: ReturnType<typeof setTimeout>
   chain: Promise<void>
   running: boolean
@@ -332,9 +337,13 @@ export class TelegramConnector implements Connector {
   }
 
   status(): ConnectorStatus {
+    const retryAt = this.opts.token.retryAt?.()
     return {
       connected: this.connected,
-      lastError: this.lastError ?? (this.chatId ? undefined : "not paired"),
+      lastError:
+        (retryAt === undefined ? undefined : tokenWaitText(retryAt)) ??
+        this.lastError ??
+        (this.chatId ? undefined : "not paired"),
       warning: this.topicWarning,
     }
   }
@@ -877,6 +886,8 @@ export class TelegramConnector implements Connector {
   }
 
   private fail(err: unknown): void {
+    // Logged once, by the token, when its retry step began.
+    if (err instanceof TokenUnavailable) return
     this.lastError = filterSecrets((err as Error).message)
     log("telegram_error", { message: this.lastError })
   }
@@ -989,6 +1000,11 @@ export class TelegramConnector implements Connector {
       } catch (err) {
         if (signal.aborted) return
         this.connected = false
+        if (err instanceof TokenUnavailable) {
+          // No fast retries: wait for the time the token will be asked for again.
+          await sleep(Math.max(0, err.retryAt - Date.now()), signal)
+          continue
+        }
         this.fail(err)
         this.opts.tel?.count("oob.reconnects", { "connector.type": "telegram" })
         this.opts.tel
@@ -1487,9 +1503,13 @@ export class TelegramConnector implements Connector {
   /**
    * Shows the reply being written, in one message that is edited as it grows
    * (and in up to three). `text` is all of it so far, in markdown. Edits are
-   * at most one every STREAM_GAP_MS, and wait out a 429.
+   * at most one every `gapMs`, and wait out a 429. The first message goes out at once.
    */
-  stream(session: NonNullable<Push["session"]>, text: string): void {
+  stream(
+    session: NonNullable<Push["session"]>,
+    text: string,
+    gapMs = STREAM_GAP_MS,
+  ): void {
     if (!this.chatId || !text.trim()) return
     let st = this.streams.get(session.id)
     if (!st) {
@@ -1498,12 +1518,14 @@ export class TelegramConnector implements Connector {
         text,
         shown: [],
         nextAt: 0,
+        gapMs,
         chain: Promise.resolve(),
         running: false,
       }
       this.streams.set(session.id, st)
     }
     st.text = text
+    st.gapMs = gapMs
     this.pump(st)
   }
 
@@ -1605,7 +1627,7 @@ export class TelegramConnector implements Connector {
         else this.fail(err)
       }
     }
-    st.nextAt = this.now() + STREAM_GAP_MS
+    st.nextAt = this.now() + st.gapMs
   }
 
   /**

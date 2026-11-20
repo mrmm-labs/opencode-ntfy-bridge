@@ -70,6 +70,7 @@ async function rig(
   const log = {
     created: [] as Array<Record<string, unknown>>,
     prompts: [] as Array<{ sessionID: string; text: string }>,
+    deliveries: [] as string[],
     models: [] as Array<{ sessionID: string; model: unknown }>,
     agents: [] as Array<{ sessionID: string; agent: string }>,
     interrupts: [] as string[],
@@ -100,10 +101,11 @@ async function rig(
         : undefined,
     root: (id) => id,
     replyForm: async () => {},
-    prompt: async (sessionID, text) => {
+    prompt: async (sessionID, text, delivery) => {
+      log.deliveries.push(delivery)
       log.prompts.push({ sessionID, text })
     },
-    busy: () => false,
+    busy: () => state.running,
     createSession: async (c) => {
       log.created.push(c)
       return { id: `new_${++state.seq}` }
@@ -208,6 +210,7 @@ describe("commands: registration and parsing", () => {
       "variant",
       "status",
       "stop",
+      "steer",
       "compact",
       "rename",
       "chat",
@@ -326,6 +329,32 @@ describe("commands: in a session topic", () => {
     r.say("/stop", THREAD)
     await r.answered(/Stopped the running turn/)
     assert.deepEqual(r.log.interrupts, ["root", "root"])
+    await r.done()
+  })
+
+  it("/steer injects into a running turn, and needs text", async () => {
+    const r = await rig()
+    r.state.running = true
+    r.say("/steer use the other table", THREAD)
+    await r.answered(/⚡ steered in/)
+    assert.deepEqual(r.log.prompts, [
+      { sessionID: "root", text: "use the other table" },
+    ])
+    assert.deepEqual(r.log.deliveries, ["steer"])
+    r.state.running = false
+    r.say("/steer and now this", THREAD)
+    await r.answered(/→ sent/)
+    r.say("/steer", THREAD)
+    await r.answered(/Usage: \/steer/)
+    assert.equal(r.log.prompts.length, 2)
+    await r.done()
+  })
+
+  it("/steer is refused where chat is off", async () => {
+    const r = await rig({ chatOn: false })
+    r.say("/steer hi", THREAD)
+    await r.answered(/Chat is off for this session/)
+    assert.deepEqual(r.log.prompts, [])
     await r.done()
   })
 

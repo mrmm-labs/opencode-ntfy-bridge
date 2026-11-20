@@ -2,6 +2,7 @@
 import type { Plugin } from "@opencode/plugin/tui"
 
 import type { Bridge } from "./bridge.ts"
+import type { Delivery } from "./config.ts"
 import type { Connector } from "./connectors/types.ts"
 import { renderQr } from "./qr.ts"
 import type { Router } from "./routing.ts"
@@ -16,7 +17,7 @@ export type App = {
 }
 
 const USAGE =
-  "Usage: /oob [on [<channel>|all]|off|auto|chat on|chat off|status|test|pair <channel>]"
+  "Usage: /oob [on [<channel>|all]|off|auto|chat on|chat off|delivery queue|steer|default|status|test|pair <channel>]"
 
 /** Connectors that can bind to a chat. */
 const pairable = (app: App) =>
@@ -59,6 +60,12 @@ export async function runCommand(
     return setRouting(ctx, app, word)
   if (word === "chat" && (via === "on" || via === "off") && extra.length === 0)
     return setChat(ctx, app, via === "on")
+  if (
+    word === "delivery" &&
+    (via === "queue" || via === "steer" || via === "default") &&
+    extra.length === 0
+  )
+    return setDelivery(ctx, app, via === "default" ? undefined : via)
   if (arg === "status") return status(ctx, app)
   if (arg === "test") return test(ctx, app)
   if (word === "pair" && extra.length === 0) {
@@ -96,25 +103,45 @@ function setRouting(
       )
     channel = c.id
   }
+  applyRouting(app, root, mode, channel)
+  toast(ctx, `oob routing: ${describe(app, root)}`)
+}
+
+/** Sets the routing of a session and keeps it. */
+export function applyRouting(
+  app: App,
+  root: string,
+  mode: "on" | "off" | "auto",
+  channel?: string,
+): void {
   app.router.set(root, mode === "auto" ? undefined : mode === "on", channel)
   saveSession(app, root)
-  toast(ctx, `oob routing: ${describe(app, root)}`)
 }
 
 /** Keeps a session's routing and chat choices across restarts. */
 export function saveSession(app: App, root: string): void {
   const mode = app.router.mode(root)
   const chat = app.bridge.chatEnabled(root)
+  const delivery = app.bridge.deliveryOverride(root)
   app.settings.setSession(
     root,
-    mode === "auto" && !chat
+    mode === "auto" && !chat && !delivery
       ? undefined
       : {
           on: mode === "auto" ? undefined : mode === "on",
           channel: app.router.channel(root),
           chat: chat || undefined,
+          delivery,
         },
   )
+  app.bridge.notify()
+}
+
+function setDelivery(ctx: Context, app: App, d: Delivery | undefined) {
+  const root = sessionRoot(ctx)
+  if (!root) return toast(ctx, "Open a session first", "warning")
+  app.bridge.setDelivery(root, d)
+  toast(ctx, `Delivery for this session: ${app.bridge.delivery(root)}`)
 }
 
 async function setChat(ctx: Context, app: App, on: boolean): Promise<void> {

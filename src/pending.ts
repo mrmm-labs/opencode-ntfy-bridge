@@ -36,6 +36,8 @@ export class PendingStore {
   private chain: Promise<void> = Promise.resolve()
 
   private readonly file?: string
+  /** Called after an entry is added or changed. */
+  onChange?: () => void
 
   constructor(file?: string) {
     this.file = file
@@ -96,6 +98,7 @@ export class PendingStore {
   put(p: Pending): Pending {
     this.items.set(p.id, p)
     this.persist(p)
+    this.onChange?.()
     return p
   }
 
@@ -104,6 +107,7 @@ export class PendingStore {
     if (!p) return undefined
     Object.assign(p, patch)
     this.persist(p)
+    this.onChange?.()
     return p
   }
 

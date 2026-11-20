@@ -19,7 +19,7 @@ import type {
   SendStats,
   SessionState,
 } from "./connectors/types.ts"
-import type { Config } from "./config.ts"
+import type { Config, Delivery } from "./config.ts"
 import { redact } from "./filter.ts"
 import {
   resolveAnswer,
@@ -58,10 +58,16 @@ export interface Host {
   session(id: string): Promise<SessionInfo | undefined>
   root(id: string): string
   replyForm(sessionID: string, formID: string, answer: Answer): Promise<void>
-  /** Sends a user prompt into a session; it is queued behind a running turn, never refused for being busy. */
-  prompt(sessionID: string, text: string): Promise<void>
+  /**
+   * Sends a user prompt into a session; never refused for being busy. `queue`
+   * waits behind a running turn. `steer` is injected into the running turn:
+   * the types describe a steered prompt as part of the turn it joined.
+   */
+  prompt(sessionID: string, text: string, delivery: Delivery): Promise<void>
   /** Whether a turn is running in the session. */
   busy(sessionID: string): boolean
+  /** What is known of a session right now, without asking: for views that must not wait. */
+  peek?(sessionID: string): { agent?: string; directory?: string } | undefined
   /** Starts a session in a folder; the caller has checked the folder against the allowlist. */
   createSession(o: {
     directory: string
@@ -264,7 +270,7 @@ type Patch = {
 type Routed = NonNullable<Awaited<ReturnType<Bridge["routed"]>>>
 
 const HINT_EVERY_MS = 60 * 60_000
-const FEED_MS = 200
+const FEED_MS = 100
 
 export class Bridge {
   private readonly controllers = new Map<string, AbortController>()
@@ -291,9 +297,17 @@ export class Bridge {
   /** Where a running turn is shown, and the pending stream update. */
   private readonly feeds = new Map<
     string,
-    { r?: Routed; timer?: ReturnType<typeof setTimeout>; streamed?: boolean }
+    {
+      r?: Routed
+      timer?: ReturnType<typeof setTimeout>
+      streamed?: boolean
+      began?: boolean
+    }
   >()
+  /** Per session: how prompts are delivered, when it differs from `chat.delivery`. */
+  private readonly deliveries = new Map<string, Delivery>()
   private chatListener: ((root: string) => void) | undefined
+  private readonly listeners = new Set<() => void>()
   /** What a chat command chose, until OpenCode's own copy of the session catches up. */
   private readonly chosen = new Map<
     string,
@@ -321,6 +335,7 @@ export class Bridge {
     this.store = store
     this.router = router
     this.now = now
+    store.onChange = () => this.notify()
     this.commands = new Commands({
       cfg,
       host,
@@ -369,7 +384,7 @@ export class Bridge {
   private startChat(root: string, ch: Connector) {
     this.router.set(root, true, ch.id)
     this.chat.add(root)
-    this.chatListener?.(root)
+    this.changed(root)
   }
 
   /** Every connector, enabled or not. */
@@ -872,18 +887,101 @@ export class Bridge {
     this.chatListener = fn
   }
 
+  /** How a prompt from a connector reaches the session: its own choice, or `chat.delivery`. */
+  delivery(root: string): Delivery {
+    return this.deliveries.get(root) ?? this.cfg.chat.delivery
+  }
+
+  /** The session's own choice, if it has one. */
+  deliveryOverride(root: string): Delivery | undefined {
+    return this.deliveries.get(root)
+  }
+
+  /** `undefined` goes back to `chat.delivery`. */
+  setDelivery(root: string, d: Delivery | undefined): void {
+    if (d === undefined) this.deliveries.delete(root)
+    else this.deliveries.set(root, d)
+    void this.onState(root)
+    this.changed(root)
+  }
+
+  restoreDelivery(root: string, d: Delivery): void {
+    this.deliveries.set(root, d)
+  }
+
   /** Puts chat back on for a session from the stored settings. Whether it is allowed is checked at each prompt. */
   restoreChat(root: string): void {
     this.chat.add(root)
   }
 
-  private denied(facts: { agent?: string; directory?: string } | undefined) {
-    return this.cfg.chat.deny.some(
-      (d) =>
+  /** A choice for the session changed: stored by the listener, and shown by the views. */
+  private changed(root: string): void {
+    this.chatListener?.(root)
+    this.notify()
+  }
+
+  /** Calls `fn` when what a view of a session shows may have changed. Returns the way to stop. */
+  subscribe(fn: () => void): () => void {
+    this.listeners.add(fn)
+    return () => void this.listeners.delete(fn)
+  }
+
+  notify(): void {
+    for (const fn of this.listeners) {
+      try {
+        fn()
+      } catch (err) {
+        log("listener_error", { message: (err as Error).message })
+      }
+    }
+  }
+
+  /** The channel a session mirrors through: its own choice, or the default. */
+  channelOf(root: string): string {
+    return this.router.channel(root) ?? this.cfg.defaultChannel
+  }
+
+  /** Whether a channel that can carry a chat is selected for the session. */
+  canChat(root: string): boolean {
+    return this.targets(root).some((c) => c.capabilities.inboundPrompt)
+  }
+
+  defaultDelivery(): Delivery {
+    return this.cfg.chat.delivery
+  }
+
+  /** Prompts of the session that wait for an answer. */
+  openPrompts(root: string): number {
+    return this.store
+      .list()
+      .filter((p) => p.state === "pending" && p.rootSessionID === root).length
+  }
+
+  /** The `chat.deny` rule that blocks chat, in words, or undefined. */
+  private denial(
+    facts: { agent?: string; directory?: string } | undefined,
+  ): string | undefined {
+    for (const d of this.cfg.chat.deny)
+      if (
         (!d.agent || d.agent.test(facts?.agent ?? "")) &&
-        (!d.directory ||
-          globToRegExp(d.directory).test(facts?.directory ?? "")),
-    )
+        (!d.directory || globToRegExp(d.directory).test(facts?.directory ?? ""))
+      )
+        return [
+          d.agent && `agent ${d.agent.source}`,
+          d.directory && `directory ${d.directory}`,
+        ]
+          .filter(Boolean)
+          .join(" and ")
+    return undefined
+  }
+
+  private denied(facts: { agent?: string; directory?: string } | undefined) {
+    return this.denial(facts) !== undefined
+  }
+
+  /** Why chat is blocked for the session by `chat.deny`, from what is known without asking. */
+  chatBlocked(root: string): string | undefined {
+    return this.denial(this.host.peek?.(root))
   }
 
   /** Switches chat from a connector on or off for a top-level session. */
@@ -891,11 +989,14 @@ export class Bridge {
     if (!on) {
       this.chat.delete(root)
       await this.onState(root)
-      this.chatListener?.(root)
+      this.changed(root)
       return { ok: true, text: "Chat is off for this session." }
     }
-    if (this.denied(await this.host.session(root)))
-      return no("Chat is blocked for this session by chat.deny in the config.")
+    const why = this.denial(await this.host.session(root))
+    if (why)
+      return no(
+        `Chat is blocked for this session by chat.deny in the config (${why}).`,
+      )
     if (!this.targets(root).some((c) => c.capabilities.inboundPrompt))
       return no(
         "No channel that can chat is selected for this session: use /oob on telegram first.",
@@ -905,7 +1006,7 @@ export class Bridge {
     this.router.set(root, true, this.router.channel(root))
     this.chat.add(root)
     await this.onState(root)
-    this.chatListener?.(root)
+    this.changed(root)
     return {
       ok: true,
       text: mirrored
@@ -947,6 +1048,12 @@ export class Bridge {
     if (this.cfg.chat.mirror === "remote-only" && !this.remote.has(root)) return
     const feed = this.feeds.get(root) ?? {}
     this.feeds.set(root, feed)
+    // The first text of a turn is shown at once; later text is coalesced briefly.
+    if (!feed.began) {
+      feed.began = true
+      void this.feed(root)
+      return
+    }
     if (feed.timer) return
     feed.timer = setTimeout(() => {
       feed.timer = undefined
@@ -965,7 +1072,8 @@ export class Bridge {
       feed.streamed = true
       const clean = redact(text, this.cfg.chat.redact)
       for (const c of r.to)
-        if (c.capabilities.inboundPrompt && c.stream) c.stream(r.session, clean)
+        if (c.capabilities.inboundPrompt && c.stream)
+          c.stream(r.session, clean, this.cfg.chat.streamMs)
     } catch (err) {
       log("stream_error", { message: (err as Error).message })
     }
@@ -1171,7 +1279,9 @@ export class Bridge {
         })
       if (
         kind !== "command" &&
-        !["applied", "ignored", "sent", "queued"].includes(info.outcome)
+        !["applied", "ignored", "sent", "queued", "steered"].includes(
+          info.outcome,
+        )
       )
         this.tel.count("oob.inbound.rejected", {
           "connector.type": ch.type,
@@ -1218,7 +1328,10 @@ export class Bridge {
     info: { outcome: string; root?: string },
   ): Promise<Outcome | undefined> {
     const root = m.sessionKey
-    const text = m.text.trim()
+    let text = m.text.trim()
+    // "!text" is always steered into the running turn.
+    const bang = text.startsWith("!")
+    if (bang) text = text.slice(1).trim()
     if (
       !ch.capabilities.inboundPrompt ||
       !root ||
@@ -1242,20 +1355,28 @@ export class Bridge {
       return this.hint(root, "Chat is blocked for this session by chat.deny.")
     }
     const busy = this.host.busy(root)
+    // "!" always steers. The configured default steers only a running turn;
+    // an idle session takes the plain path.
+    const delivery: Delivery =
+      bang || (busy && this.delivery(root) === "steer") ? "steer" : "queue"
     try {
-      await this.host.prompt(root, text)
+      await this.host.prompt(root, text, delivery)
     } catch (err) {
       log("prompt_error", { message: (err as Error).message })
       info.outcome = "failed"
       return no("Could not send that to the session.")
     }
     this.remote.add(root)
-    info.outcome = busy ? "queued" : "sent"
     const where = `${facts?.agent ?? "agent"} · ${facts?.directory ? basename(facts.directory) : "opencode"}`
+    info.outcome = !busy ? "sent" : delivery === "steer" ? "steered" : "queued"
     return {
       ok: true,
       sent: true,
-      text: busy ? `→ queued for ${where} (busy)` : `→ sent to ${where}`,
+      text: !busy
+        ? `→ sent to ${where}`
+        : delivery === "steer"
+          ? `⚡ steered in · ${where}`
+          : `→ queued for ${where} (busy)`,
     }
   }
 
