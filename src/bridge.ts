@@ -27,6 +27,7 @@ import {
   type Question,
   type Reply,
 } from "./inbound.ts"
+import { Commands } from "./commands.ts"
 import { log } from "./logger.ts"
 import { format, isCustomized, type Kind, type Vars } from "./messages.ts"
 import { noTelemetry, type Telemetry } from "./otel.ts"
@@ -41,6 +42,15 @@ export type SessionInfo = {
   directory?: string
   title?: string
   model?: string
+  modelRef?: { providerID: string; id: string; variant?: string }
+}
+
+/** A model a chat may pick. */
+export type ModelOption = {
+  /** `provider/model`. */
+  ref: string
+  name: string
+  variants: string[]
 }
 
 /** What the bridge needs from OpenCode. */
@@ -52,6 +62,26 @@ export interface Host {
   prompt(sessionID: string, text: string): Promise<void>
   /** Whether a turn is running in the session. */
   busy(sessionID: string): boolean
+  /** Starts a session in a folder; the caller has checked the folder against the allowlist. */
+  createSession(o: {
+    directory: string
+    agent?: string
+    model?: { providerID: string; id: string }
+  }): Promise<{ id: string }>
+  /** Changes what the session's next prompts use. */
+  switchModel(
+    sessionID: string,
+    model: { providerID: string; id: string; variant?: string },
+  ): Promise<void>
+  switchAgent(sessionID: string, agent: string): Promise<void>
+  /** Whether a turn was running and has been stopped. */
+  interrupt(sessionID: string): Promise<boolean>
+  compact(sessionID: string): Promise<void>
+  rename(sessionID: string, title: string): Promise<void>
+  /** Primary agents the session can switch to. */
+  agents(): Promise<string[]>
+  /** Chat models of the configured providers. */
+  models(): Promise<ModelOption[]>
 }
 
 type FormOption =
@@ -143,7 +173,11 @@ export type BridgeEvent =
     }
   | {
       type: "session.model.selected"
-      data: { sessionID: string; model: { id: string } }
+      data: { sessionID: string; model: { id: string; variant?: string } }
+    }
+  | {
+      type: "session.agent.selected"
+      data: { sessionID: string; agent: string }
     }
 
 const DETAIL_MAX = 60
@@ -219,6 +253,14 @@ export type BridgeStatus = {
   pending: number
 }
 
+type Patch = {
+  title?: string
+  model?: string
+  /** "" when the variant was cleared. */
+  variant?: string
+  agent?: string
+}
+
 type Routed = NonNullable<Awaited<ReturnType<Bridge["routed"]>>>
 
 const HINT_EVERY_MS = 60 * 60_000
@@ -252,6 +294,12 @@ export class Bridge {
     { r?: Routed; timer?: ReturnType<typeof setTimeout>; streamed?: boolean }
   >()
   private chatListener: ((root: string) => void) | undefined
+  /** What a chat command chose, until OpenCode's own copy of the session catches up. */
+  private readonly chosen = new Map<
+    string,
+    { model?: string; variant?: string; agent?: string }
+  >()
+  private readonly commands: Commands
   private readonly states = new Map<
     string,
     { state: SessionState["state"]; at: number; started?: number }
@@ -273,6 +321,55 @@ export class Bridge {
     this.store = store
     this.router = router
     this.now = now
+    this.commands = new Commands({
+      cfg,
+      host,
+      tel: this.tel,
+      now,
+      chatEnabled: (root) => this.chat.has(root),
+      denied: (facts) => this.denied(facts),
+      setChat: (root, on) => this.setChat(root, on),
+      startChat: (root, ch) => this.startChat(root, ch),
+      show: (root, working) =>
+        this.onState(root, working ? "working" : undefined),
+      sessions: () => this.activeSessions(),
+      remote: (root) => void this.remote.add(root),
+    })
+  }
+
+  /** Mirrored sessions the plugin knows of: chat-enabled, or routed and seen working. */
+  private async activeSessions(): Promise<
+    Array<{ id: string; label: string }>
+  > {
+    const ids = new Set([
+      ...this.chat,
+      ...[...this.states.keys()].filter((id) => this.router.mode(id) === "on"),
+    ])
+    const out: Array<{ id: string; label: string }> = []
+    for (const id of ids) {
+      const s = await this.host.session(id)
+      if (!s) continue
+      const where = s.directory ? basename(s.directory) : "opencode"
+      const title = this.cfg.redact.mode === "title" ? undefined : s.title
+      out.push({
+        id,
+        label: truncate(
+          redact(
+            [where, title ?? s.agent].filter(Boolean).join(" · "),
+            this.cfg.redact,
+          ),
+          80,
+        ),
+      })
+    }
+    return out
+  }
+
+  /** A session started from a chat: mirrored to that channel, with chat on. */
+  private startChat(root: string, ch: Connector) {
+    this.router.set(root, true, ch.id)
+    this.chat.add(root)
+    this.chatListener?.(root)
   }
 
   /** Every connector, enabled or not. */
@@ -404,6 +501,11 @@ export class Bridge {
         case "session.model.selected":
           return await this.onState(e.data.sessionID, undefined, {
             model: e.data.model.id,
+            variant: e.data.model.variant ?? "",
+          })
+        case "session.agent.selected":
+          return await this.onState(e.data.sessionID, undefined, {
+            agent: e.data.agent,
           })
       }
     } catch (err) {
@@ -722,7 +824,7 @@ export class Bridge {
   private async track(
     r: NonNullable<Awaited<ReturnType<Bridge["routed"]>>>,
     state: SessionState["state"] | undefined,
-    patch: { title?: string; model?: string } = {},
+    patch: Patch = {},
   ) {
     const prev = this.states.get(r.rootID)
     const now = this.now()
@@ -732,6 +834,9 @@ export class Bridge {
       started: state === "working" ? now : prev?.started,
     }
     this.states.set(r.rootID, next)
+    const { title: _title, ...chose } = patch
+    const pick = { ...this.chosen.get(r.rootID), ...chose }
+    if (Object.keys(chose).length) this.chosen.set(r.rootID, pick)
     const title =
       patch.title === undefined
         ? r.title
@@ -743,8 +848,9 @@ export class Bridge {
       name: title ? `${r.project} · ${title}` : r.session.name,
       project: r.project,
       title,
-      agent: r.root?.agent,
-      model: patch.model ?? r.root?.model,
+      agent: pick.agent ?? r.root?.agent,
+      model: pick.model ?? r.root?.model,
+      variant: (pick.variant ?? r.root?.modelRef?.variant) || undefined,
       state: next.state,
       at: next.at,
       chat: this.chat.has(r.rootID),
@@ -913,7 +1019,7 @@ export class Bridge {
   private async onState(
     sessionID: string,
     state?: SessionState["state"],
-    patch?: { title?: string; model?: string },
+    patch?: Patch,
   ) {
     if (this.host.root(sessionID) !== sessionID) return
     const r = await this.routed(sessionID)
@@ -1035,7 +1141,8 @@ export class Bridge {
     }
     try {
       const out = await this.apply(ch, m, info)
-      if (out && !out.ok && !m.inline) {
+      // A connector answers its own commands.
+      if (out && !out.ok && !m.inline && m.kind !== "command") {
         const f = this.fmt("notice", { text: out.text })
         await this.dispatch(
           "notice",
@@ -1062,7 +1169,10 @@ export class Bridge {
           "connector.type": ch.type,
           outcome: info.outcome,
         })
-      if (!["applied", "ignored", "sent", "queued"].includes(info.outcome))
+      if (
+        kind !== "command" &&
+        !["applied", "ignored", "sent", "queued"].includes(info.outcome)
+      )
         this.tel.count("oob.inbound.rejected", {
           "connector.type": ch.type,
           reason: info.outcome,
@@ -1168,6 +1278,7 @@ export class Bridge {
     m: Inbound,
     info: { outcome: string; pending?: Pending; root?: string },
   ): Promise<Outcome | undefined> {
+    if (m.kind === "command") return this.commands.run(ch, m, info)
     if (m.kind === "control") return this.control(ch, m, info)
     if (m.kind === "prompt") return this.prompt(ch, m, info)
     if (m.kind !== "answer") {

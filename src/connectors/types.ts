@@ -84,6 +84,8 @@ export type SessionState = {
   title?: string
   agent?: string
   model?: string
+  /** The model's effort variant, when it has one chosen. */
+  variant?: string
   state: "working" | "idle" | "failed"
   /** Epoch ms of the last change. */
   at: number
@@ -113,9 +115,10 @@ export type Push = {
 export type Inbound = {
   /**
    * `answer` replies to a pending question; `prompt` is text for a session;
-   * `control` is a button of the connector's own (`text` is "chat off").
+   * `control` is a button of the connector's own (`text` is "chat off");
+   * `command` is a slash command, or the pick of a menu or the reply to a question asked for one.
    */
-  kind: "answer" | "prompt" | "control"
+  kind: "answer" | "prompt" | "control" | "command"
   /** Transport message id, to tell a replay from a second answer. */
   id: string
   /** Seconds since the epoch. */
@@ -135,11 +138,25 @@ export type Inbound = {
   inline?: boolean
   /** `text` is a free-text answer: a number is not an option selector. */
   literal?: boolean
+  /** For `command`: the name without the slash, and the rest of the line. `pick` and `reply` are not typed: `token` names the menu or question they answer. */
+  command?: { name: string; args: string }
+  token?: string
+}
+
+/** Choices to tap. The connector pages them; what comes back is always one of `choices`. */
+export type Menu = {
+  id: string
+  choices: Array<{ label: string; value: string; current?: boolean }>
 }
 
 export type Outcome = {
   ok: boolean
+  /** May hold `{topic:<session id>}`, which the connector turns into a link to that session's topic. */
   text: string
+  /** Show these choices; the tap comes back as a `pick` command with this id. */
+  menu?: Menu
+  /** Ask for text; the reply comes back as a `reply` command with this id. */
+  ask?: { id: string }
   /** The text of a message was sent to a session: the connector may acknowledge it. */
   sent?: boolean
 }
@@ -188,6 +205,10 @@ export interface Connector {
     session: NonNullable<Push["session"]>,
     text: string,
   ): Promise<{ parts: number; documents: number } | undefined>
+  /** A link that opens the session's topic, when it has one. */
+  topicLink?(sessionID: string): string | undefined
+  /** Redraws the session's status card now and pins it again. Never throws. */
+  refresh?(sessionID: string): Promise<boolean>
   /** Keeps a live view of a session (a status card, a topic title). Never throws. */
   track?(state: SessionState): Promise<void>
   /** Returns a reference to the sent message; never throws. */

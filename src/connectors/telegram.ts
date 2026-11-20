@@ -38,6 +38,7 @@ import type {
   ConnectorStatus,
   ConnectorType,
   Inbound,
+  Menu,
   OnInbound,
   Outcome,
   Pairing,
@@ -65,6 +66,24 @@ const CARD_GAP_MS = 10_000
 const COLORS = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047]
 // Sessions of one project draw their icon from this many neighbours.
 const FAMILY = 4
+const MENU_PAGE = 6
+const MAX_MENUS = 50
+// What Telegram shows after "/": lowercase names, short descriptions.
+const COMMANDS = [
+  { command: "new", description: "Start a session in a listed project" },
+  { command: "sessions", description: "Sessions mirrored here, with links" },
+  { command: "projects", description: "Projects a new session can use" },
+  { command: "model", description: "Pick the model of this session" },
+  { command: "agent", description: "Pick the agent of this session" },
+  { command: "variant", description: "Pick the model's effort variant" },
+  { command: "status", description: "Refresh and pin the status card" },
+  { command: "stop", description: "Stop the running turn" },
+  { command: "compact", description: "Compact this session" },
+  { command: "rename", description: "Rename this session" },
+  { command: "chat", description: "/chat off stops chatting with it" },
+  { command: "help", description: "What the commands do here" },
+]
+const COMMAND_RE = /^\/([A-Za-z_]+)(?:@(\w+))?(?:\s+([\s\S]*))?$/
 const RIGHTS = /not enough rights|admin/i
 const RIGHTS_NOTICE =
   "⚠️ I need the Manage Topics admin right to give each session its own topic. Posting in General until then."
@@ -227,6 +246,15 @@ export class TelegramConnector implements Connector {
   private readonly pulses = new Map<string, ReturnType<typeof setInterval>>()
   /** Replies being streamed, by session. */
   private readonly streams = new Map<string, Stream>()
+  /** Menus on screen: the choices and the page shown. */
+  private readonly menus = new Map<
+    string,
+    { choices: Menu["choices"]; page: number }
+  >()
+  /** Force-reply questions of a command: message id to the question's id. */
+  private readonly asks = new Map<string, string>()
+  private botName: string | undefined
+  private commandsFor: string | undefined
   /** Force-reply prompts: message id to the pending prompt it collects a typed answer for. */
   private readonly typing = new Map<string, string>()
   private pairing:
@@ -272,7 +300,24 @@ export class TelegramConnector implements Connector {
       for (const st of this.streams.values()) clearTimeout(st.timer)
       this.streams.clear()
     })
+    void this.register()
     this.poll()
+  }
+
+  /** Makes Telegram offer the commands after "/" in the paired chat. */
+  private async register(): Promise<void> {
+    const chat = this.chatId
+    if (!chat || this.commandsFor === chat) return
+    this.commandsFor = chat
+    try {
+      await this.call("setMyCommands", {
+        commands: COMMANDS,
+        scope: { type: "chat", chat_id: chat },
+      })
+    } catch (err) {
+      this.commandsFor = undefined
+      this.fail(err)
+    }
   }
 
   paired(): boolean {
@@ -283,6 +328,7 @@ export class TelegramConnector implements Connector {
   setChat(chatId: string | undefined): void {
     this.chatId = chatId
     this.forum = undefined
+    if (this.onInbound) void this.register()
   }
 
   status(): ConnectorStatus {
@@ -1006,6 +1052,24 @@ export class TelegramConnector implements Connector {
         text,
         literal: true,
       }))
+    // The reply to a question a command asked, such as the prompt of /new.
+    const ask = m.reply_to_message
+      ? this.asks.get(String(m.reply_to_message.message_id))
+      : undefined
+    if (ask) {
+      const out = await this.onInbound?.({
+        ...base,
+        kind: "command",
+        text,
+        token: ask,
+        command: { name: "reply", args: text },
+      })
+      if (out?.ok) this.asks.delete(String(m.reply_to_message!.message_id))
+      if (out) await this.deliver(m.message_thread_id, out)
+      return
+    }
+    const cmd = COMMAND_RE.exec(text)
+    if (cmd) return this.command(m, base, cmd[1], cmd[2], cmd[3] ?? "")
     // An explicit "#id answer" wins over the message replied to.
     const reply = parseReply(text)
     if (reply)
@@ -1072,6 +1136,7 @@ export class TelegramConnector implements Connector {
     this.forum = chat.is_forum === true ? true : undefined
     this.opts.onPaired?.(id)
     pr.finish(id)
+    void this.register()
     const what = chat.title
       ? `Paired with ${esc(chat.title)}.${chat.is_forum ? " One topic per session." : ""}`
       : "Paired. Questions and notices of your OpenCode sessions arrive here."
@@ -1107,6 +1172,8 @@ export class TelegramConnector implements Connector {
         inline: true,
       })
     }
+    const menu = /^m:([A-Za-z0-9]+):(p?\d+|n)$/.exec(cb.data ?? "")
+    if (menu) return this.onMenu(cb, menu[1], menu[2])
     const m = /^([A-Za-z0-9]+):(t?\d+|d|x)$/.exec(cb.data ?? "")
     if (!m) return this.toast(cb.id, "Unknown button.")
     const [, id, act] = m
@@ -1176,6 +1243,199 @@ export class TelegramConnector implements Connector {
     } catch (err) {
       this.fail(err)
     }
+  }
+
+  /** A slash command, from a topic (acts on its session) or from General. */
+  private async command(
+    m: NonNullable<Update["message"]>,
+    base: { id: string; time: number; from: Inbound["from"] },
+    name: string,
+    to: string | undefined,
+    args: string,
+  ): Promise<void> {
+    // "/cmd@otherbot" is for another bot sharing the group.
+    if (to && !(await this.isMe(to))) return
+    const sessionKey = await this.sessionAt(m.message_thread_id)
+    const out = await this.onInbound?.({
+      ...base,
+      kind: "command",
+      sessionKey,
+      text: m.text ?? "",
+      command: { name, args },
+    })
+    if (out) await this.deliver(m.message_thread_id, out)
+  }
+
+  private async isMe(name: string): Promise<boolean> {
+    try {
+      this.botName ??= (
+        await this.call<{ username?: string }>("getMe", {})
+      ).username
+    } catch (err) {
+      this.fail(err)
+    }
+    return !this.botName || this.botName.toLowerCase() === name.toLowerCase()
+  }
+
+  /** A link that opens a session's topic, in a supergroup. */
+  topicLink(sessionID: string): string | undefined {
+    const topic = this.topics?.get(this.topicKey(sessionID))
+    const m = /^-100(\d+)$/.exec(this.chatId ?? "")
+    return topic && m ? `https://t.me/c/${m[1]}/${topic.thread}` : undefined
+  }
+
+  /** Redraws a session's status card and pins it again. */
+  async refresh(sessionID: string): Promise<boolean> {
+    try {
+      const key = this.topicKey(sessionID)
+      const topic = this.topics?.get(key)
+      const live = this.live.get(key)
+      if (!topic || !live || this.opts.statusCard === false) return false
+      const text = renderStatus(live.want, topic.icon)
+      topic.cardText = undefined
+      live.editedAt = this.now()
+      await this.card(topic, text, !!live.want.chat, sessionID)
+      // A card gone from Telegram was made again, and pinned, by the call above.
+      if (topic.card === undefined)
+        await this.card(topic, text, !!live.want.chat, sessionID)
+      else
+        await this.call("pinChatMessage", {
+          chat_id: this.chatId,
+          message_id: topic.card,
+          disable_notification: true,
+        }).catch((err) => this.fail(err))
+      return topic.card !== undefined
+    } catch (err) {
+      this.fail(err)
+      return false
+    }
+  }
+
+  private bound(map: Map<string, unknown>): void {
+    while (map.size >= MAX_MENUS) map.delete(map.keys().next().value!)
+  }
+
+  /** The text of an outcome, with `{topic:<id>}` turned into a link. */
+  private rich(text: string): string {
+    return esc(text).replace(/\{topic:([^}]+)\}/g, (_, id: string) => {
+      const link = this.topicLink(id)
+      return link ? `<a href="${link}">topic</a>` : "topic"
+    })
+  }
+
+  private menuKeyboard(id: string, choices: Menu["choices"], page: number) {
+    const pages = Math.ceil(choices.length / MENU_PAGE)
+    const rows = choices
+      .map((c, i) => ({ c, i }))
+      .slice(page * MENU_PAGE, (page + 1) * MENU_PAGE)
+      .map(({ c, i }) => [
+        {
+          text: truncate(`${c.current ? "✓ " : ""}${c.label}`, LABEL_MAX),
+          callback_data: `m:${id}:${i}`,
+        },
+      ])
+    if (pages > 1)
+      rows.push([
+        ...(page > 0
+          ? [{ text: "‹ Prev", callback_data: `m:${id}:p${page - 1}` }]
+          : []),
+        { text: `${page + 1}/${pages}`, callback_data: `m:${id}:n` },
+        ...(page < pages - 1
+          ? [{ text: "Next ›", callback_data: `m:${id}:p${page + 1}` }]
+          : []),
+      ])
+    return { inline_keyboard: rows }
+  }
+
+  /** What a command answered: text, a menu to tap, or a question to reply to. */
+  private async deliver(
+    thread: number | undefined,
+    out: Outcome,
+  ): Promise<void> {
+    try {
+      this.topics ??= await this.loadTopics()
+      const msg = {
+        chat_id: this.chatId,
+        // Telegram's General topic is thread 1: it is addressed by leaving it out.
+        message_thread_id: thread === 1 ? undefined : thread,
+        text: this.rich(out.text),
+        parse_mode: "HTML",
+        disable_notification: true,
+        link_preview_options: { is_disabled: true },
+      }
+      if (out.menu) {
+        this.bound(this.menus)
+        this.menus.set(out.menu.id, { choices: out.menu.choices, page: 0 })
+        await this.call("sendMessage", {
+          ...msg,
+          reply_markup: this.menuKeyboard(out.menu.id, out.menu.choices, 0),
+        })
+      } else if (out.ask) {
+        const sent = await this.call<{ message_id: number }>("sendMessage", {
+          ...msg,
+          reply_markup: {
+            force_reply: true,
+            input_field_placeholder: "Your prompt",
+          },
+        })
+        this.bound(this.asks)
+        this.asks.set(String(sent.message_id), out.ask.id)
+      } else await this.call("sendMessage", msg)
+    } catch (err) {
+      this.fail(err)
+    }
+  }
+
+  /** A tap in a menu: a page change, or a choice (always one of those offered). */
+  private async onMenu(
+    cb: NonNullable<Update["callback_query"]>,
+    id: string,
+    act: string,
+  ): Promise<void> {
+    const message = cb.message!
+    const menu = this.menus.get(id)
+    const clear = () =>
+      this.call("editMessageReplyMarkup", {
+        chat_id: this.chatId,
+        message_id: message.message_id,
+        reply_markup: { inline_keyboard: [] },
+      }).catch((err) => this.fail(err))
+    if (!menu) {
+      await this.toast(cb.id, "That menu expired: send the command again.")
+      await clear()
+      return
+    }
+    if (act === "n") return this.toast(cb.id)
+    if (act.startsWith("p")) {
+      const page = Number(act.slice(1))
+      if (page < 0 || page * MENU_PAGE >= menu.choices.length)
+        return this.toast(cb.id, "Unknown button.")
+      menu.page = page
+      await this.toast(cb.id)
+      await this.call("editMessageReplyMarkup", {
+        chat_id: this.chatId,
+        message_id: message.message_id,
+        reply_markup: this.menuKeyboard(id, menu.choices, page),
+      }).catch((err) => this.fail(err))
+      return
+    }
+    const choice = menu.choices[Number(act)]
+    if (!choice) return this.toast(cb.id, "Unknown button.")
+    this.menus.delete(id)
+    await this.toast(cb.id)
+    await clear()
+    const out = await this.onInbound?.({
+      kind: "command",
+      id: `cb${cb.id}`,
+      time: Math.floor(Date.now() / 1000),
+      sessionKey: await this.sessionAt(message.message_thread_id),
+      text: choice.label,
+      token: id,
+      command: { name: "pick", args: choice.value },
+      from: { connector: this.id, chat: String(message.chat.id) },
+      inline: true,
+    })
+    if (out) await this.deliver(message.message_thread_id, out)
   }
 
   /** Applies a tap, and clears the button's spinner with the outcome. */

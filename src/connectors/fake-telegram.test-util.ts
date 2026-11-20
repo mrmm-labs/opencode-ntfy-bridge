@@ -123,6 +123,10 @@ export async function fakeTelegram(token = "123456:TESTTOKEN") {
     url,
     token,
     calls,
+    /** The id the last message got, sent or received. */
+    get lastMessageId() {
+      return messageSeq
+    },
     of: (method: string) => calls.filter((c) => c.method === method),
     set forum(v: boolean) {
       forum = v

@@ -1,0 +1,691 @@
+/**
+ * Slash commands from a chat. The connector parses them and draws the menus;
+ * this decides what they do. Two scopes: a session's topic (the command acts on
+ * that session) and General or a private chat (the command acts on the plugin).
+ *
+ * Nothing typed in a chat is ever used as a folder or a model: a folder is a
+ * key of `chat.projects`, a model is one of the listed ones, and a tap is
+ * checked again against the choices that were offered.
+ */
+import { randomBytes } from "node:crypto"
+import { basename } from "node:path"
+
+import type { Host, ModelOption } from "./bridge.ts"
+import type { Config } from "./config.ts"
+import type { Connector, Inbound, Outcome } from "./connectors/types.ts"
+import { log } from "./logger.ts"
+import type { Telemetry } from "./otel.ts"
+
+const SESSION_COMMANDS = [
+  "model",
+  "agent",
+  "variant",
+  "status",
+  "stop",
+  "chat",
+  "compact",
+  "rename",
+] as const
+const GENERAL_COMMANDS = ["new", "sessions", "projects"] as const
+const ALIASES: Record<string, string> = { effort: "variant", start: "help" }
+const KNOWN = new Set<string>([
+  ...SESSION_COMMANDS,
+  ...GENERAL_COMMANDS,
+  "help",
+  "pick",
+  "reply",
+])
+
+const MAX_MODELS = 12
+const MAX_NEW_PER_HOUR = 5
+const HOUR_MS = 60 * 60_000
+const FLOW_TTL_MS = 10 * 60_000
+const MAX_FLOWS = 100
+const MAX_TITLE = 100
+const DEFAULT = "default"
+
+/** What the commands need of the bridge. */
+export type CommandDeps = {
+  cfg: Config
+  host: Host
+  tel: Telemetry
+  now: () => number
+  chatEnabled(root: string): boolean
+  denied(facts: { agent?: string; directory?: string } | undefined): boolean
+  setChat(root: string, on: boolean): Promise<Outcome>
+  /** Routes a new session to the connector, with chat on. */
+  startChat(root: string, ch: Connector): void
+  /** Makes the session's topic and status card if they do not exist, and brings them up to date. */
+  show(root: string, working?: boolean): Promise<void>
+  /** Mirrored sessions known to the plugin, for /sessions. */
+  sessions(): Promise<Array<{ id: string; label: string }>>
+  /** A prompt was sent from a chat, so its turn is a remote one. */
+  remote(root: string): void
+}
+
+type Flow = {
+  kind:
+    | "model"
+    | "agent"
+    | "variant"
+    | "project"
+    | "new-agent"
+    | "new-model"
+    | "prompt"
+  exp: number
+  /** The session a model, agent or variant pick is for. */
+  root?: string
+  /** The values that were offered; a pick is one of them. */
+  values: string[]
+  project?: string
+  agent?: string
+  model?: string
+}
+
+type Info = { outcome: string; root?: string }
+
+const no = (text: string): Outcome => ({ ok: false, text })
+const yes = (text: string): Outcome => ({ ok: true, text })
+
+/** Splits "provider/model" at the first slash. */
+export function parseRef(ref: string): { providerID: string; id: string } {
+  const i = ref.indexOf("/")
+  return { providerID: ref.slice(0, i), id: ref.slice(i + 1) }
+}
+
+export class Commands {
+  private readonly d: CommandDeps
+  private readonly flows = new Map<string, Flow>()
+  private readonly created: number[] = []
+
+  constructor(deps: CommandDeps) {
+    this.d = deps
+  }
+
+  async run(
+    ch: Connector,
+    m: Inbound,
+    info: Info,
+  ): Promise<Outcome | undefined> {
+    if (!ch.capabilities.inboundPrompt || !m.command) return undefined
+    const typed = m.command.name.toLowerCase()
+    const name = ALIASES[typed] ?? typed
+    const span = this.d.tel.begin("oob.command", {
+      session: m.sessionKey,
+      attrs: {
+        name: KNOWN.has(name) ? name : "unknown",
+        "connector.type": ch.type,
+      },
+    })
+    try {
+      const out = await this.route(ch, m, name, info)
+      span.end({ outcome: info.outcome }, out.ok ? undefined : info.outcome)
+      return out
+    } catch (err) {
+      log("command_error", { name, message: (err as Error).message })
+      info.outcome = "failed"
+      span.end({ outcome: "failed" }, "error")
+      return no("That did not work: see the log.")
+    }
+  }
+
+  private done(info: Info, outcome: string, out: Outcome): Outcome {
+    info.outcome = outcome
+    return out
+  }
+
+  private async route(
+    ch: Connector,
+    m: Inbound,
+    name: string,
+    info: Info,
+  ): Promise<Outcome> {
+    const args = (m.command?.args ?? "").trim()
+    if (name === "pick") return this.pick(ch, m, info)
+    if (name === "reply") return this.reply(ch, m, info)
+    info.root = m.sessionKey
+    if (name === "help") return this.done(info, "applied", this.help(m))
+    const inSession = m.sessionKey !== undefined
+    if ((SESSION_COMMANDS as readonly string[]).includes(name)) {
+      if (!inSession)
+        return this.done(
+          info,
+          "scope",
+          no(
+            `/${name} acts on a session: send it in that session's topic. ` +
+              "In General, /new, /sessions and /projects work; /help lists them.",
+          ),
+        )
+      return this.session(ch, m, name, args, info)
+    }
+    if ((GENERAL_COMMANDS as readonly string[]).includes(name)) {
+      if (inSession)
+        return this.done(
+          info,
+          "scope",
+          no(
+            `/${name} works in the General topic or a private chat, not in a session's topic.`,
+          ),
+        )
+      return this.general(ch, m, name, args, info)
+    }
+    return this.done(info, "unknown", no("Unknown command. /help lists them."))
+  }
+
+  private help(m: Inbound): Outcome {
+    if (m.sessionKey)
+      return yes(
+        [
+          "In this session's topic:",
+          "/model: pick the model for the next prompts",
+          "/agent: pick the agent",
+          "/variant (/effort): pick the model's effort variant",
+          "/status: redraw and pin the status card",
+          "/stop: stop the running turn",
+          "/compact: compact the session",
+          "/rename <title>: rename the session",
+          "/chat off: stop chatting with this session",
+          "Chat is switched on in the TUI: /oob chat on.",
+        ].join("\n"),
+      )
+    return yes(
+      [
+        "In General or a private chat:",
+        "/new [project] [prompt]: start a session in a listed project",
+        "/sessions: sessions that are mirrored here",
+        "/projects: the projects /new can use",
+        "Inside a session's topic: /model, /agent, /variant, /status, /stop, /compact, /rename, /chat off.",
+      ].join("\n"),
+    )
+  }
+
+  private async gate(root: string, info: Info): Promise<Outcome | undefined> {
+    if (!this.d.chatEnabled(root))
+      return this.done(
+        info,
+        "off",
+        no("Chat is off for this session: run /oob chat on in the TUI."),
+      )
+    if (this.d.denied(await this.d.host.session(root)))
+      return this.done(
+        info,
+        "denied",
+        no("Chat is blocked for this session by chat.deny."),
+      )
+    return undefined
+  }
+
+  private menu(
+    kind: Flow["kind"],
+    title: string,
+    choices: Array<{ label: string; value: string; current?: boolean }>,
+    extra: Partial<Flow> = {},
+  ): Outcome {
+    const id = this.flow({
+      kind,
+      values: choices.map((c) => c.value),
+      ...extra,
+    })
+    return { ok: true, text: title, menu: { id, choices } }
+  }
+
+  private flow(f: Omit<Flow, "exp">): string {
+    const now = this.d.now()
+    for (const [k, v] of this.flows) if (v.exp < now) this.flows.delete(k)
+    while (this.flows.size >= MAX_FLOWS)
+      this.flows.delete(this.flows.keys().next().value!)
+    const id = randomBytes(3).toString("hex")
+    this.flows.set(id, { ...f, exp: now + FLOW_TTL_MS })
+    return id
+  }
+
+  private async models(): Promise<ModelOption[]> {
+    const all = await this.d.host.models().catch(() => [] as ModelOption[])
+    const wanted = this.d.cfg.chat.models
+    if (wanted.length)
+      return wanted
+        .map((ref) => all.find((x) => x.ref === ref))
+        .filter((x): x is ModelOption => x !== undefined)
+    return all.slice(0, MAX_MODELS)
+  }
+
+  /** A menu, or a refusal that still shows the menu when something was typed that is not in it. */
+  private offer(info: Info, typed: string, out: Outcome): Outcome {
+    return this.done(
+      info,
+      typed ? "invalid" : "applied",
+      typed ? { ...out, ok: false } : out,
+    )
+  }
+
+  private async session(
+    ch: Connector,
+    m: Inbound,
+    name: string,
+    args: string,
+    info: Info,
+  ): Promise<Outcome> {
+    const root = m.sessionKey!
+    info.root = root
+    if (name === "chat") {
+      if (args.toLowerCase() === "off")
+        return this.done(info, "applied", await this.d.setChat(root, false))
+      return this.done(
+        info,
+        "invalid",
+        no(
+          args.toLowerCase() === "on"
+            ? "Chat is switched on in the TUI: /oob chat on."
+            : "Usage: /chat off",
+        ),
+      )
+    }
+    if (name === "status") {
+      await this.d.show(root)
+      const ok = (await ch.refresh?.(root)) === true
+      return this.done(
+        info,
+        ok ? "applied" : "invalid",
+        ok
+          ? yes("Status card refreshed.")
+          : no("This session has no status card yet."),
+      )
+    }
+    const blocked = await this.gate(root, info)
+    if (blocked) return blocked
+    const facts = await this.d.host.session(root)
+
+    if (name === "stop") {
+      const stopped = await this.d.host.interrupt(root)
+      return this.done(
+        info,
+        "applied",
+        yes(stopped ? "⏹ Stopped the running turn." : "Nothing is running."),
+      )
+    }
+    if (name === "compact") {
+      await this.d.host.compact(root)
+      return this.done(info, "applied", yes("Compacting the session…"))
+    }
+    if (name === "rename") {
+      if (!args || args.length > MAX_TITLE)
+        return this.done(
+          info,
+          "invalid",
+          no(`Usage: /rename <title> (up to ${MAX_TITLE} characters)`),
+        )
+      await this.d.host.rename(root, args)
+      return this.done(info, "applied", yes("Renamed."))
+    }
+    if (name === "agent") {
+      const agents = await this.d.host.agents().catch(() => [] as string[])
+      if (agents.length === 0)
+        return this.done(
+          info,
+          "invalid",
+          no("OpenCode lists no agents to choose from."),
+        )
+      if (args && agents.includes(args))
+        return this.applyAgent(root, args, info)
+      return this.offer(
+        info,
+        args,
+        this.menu(
+          "agent",
+          args
+            ? "Not an agent I can use. Pick one:"
+            : "Agent for this session:",
+          agents.map((a) => ({
+            label: a,
+            value: a,
+            current: a === facts?.agent,
+          })),
+          { root },
+        ),
+      )
+    }
+    if (name === "model") {
+      const list = await this.models()
+      if (list.length === 0)
+        return this.done(
+          info,
+          "invalid",
+          no("OpenCode lists no models to choose from."),
+        )
+      const now = facts?.modelRef
+        ? `${facts.modelRef.providerID}/${facts.modelRef.id}`
+        : undefined
+      const hit = args ? list.find((x) => x.ref === args) : undefined
+      if (hit) return this.applyModel(root, hit, undefined, info)
+      return this.offer(
+        info,
+        args,
+        this.menu(
+          "model",
+          args
+            ? "Not an allowed model. Pick one:"
+            : "Model for the next prompts:",
+          list.map((x) => ({
+            label: x.name,
+            value: x.ref,
+            current: x.ref === now,
+          })),
+          { root },
+        ),
+      )
+    }
+    // variant
+    const ref = facts?.modelRef
+    const model = ref
+      ? (await this.d.host.models().catch(() => [] as ModelOption[])).find(
+          (x) => x.ref === `${ref.providerID}/${ref.id}`,
+        )
+      : undefined
+    if (!ref || !model || model.variants.length === 0)
+      return this.done(info, "invalid", no("This model has no variants."))
+    const options = [DEFAULT, ...model.variants]
+    if (args && options.includes(args))
+      return this.applyModel(
+        root,
+        model,
+        args === DEFAULT ? undefined : args,
+        info,
+      )
+    return this.offer(
+      info,
+      args,
+      this.menu(
+        "variant",
+        args
+          ? `Not a variant of ${model.name}. Pick one:`
+          : `Variant of ${model.name}:`,
+        options.map((v) => ({
+          label: v,
+          value: v,
+          current: (ref.variant ?? DEFAULT) === v,
+        })),
+        { root },
+      ),
+    )
+  }
+
+  private async applyAgent(
+    root: string,
+    agent: string,
+    info: Info,
+  ): Promise<Outcome> {
+    await this.d.host.switchAgent(root, agent)
+    return this.done(
+      info,
+      "applied",
+      yes(`Agent: ${agent}. It applies to the next prompts.`),
+    )
+  }
+
+  private async applyModel(
+    root: string,
+    model: ModelOption,
+    variant: string | undefined,
+    info: Info,
+  ): Promise<Outcome> {
+    await this.d.host.switchModel(root, { ...parseRef(model.ref), variant })
+    return this.done(
+      info,
+      "applied",
+      yes(
+        `Model: ${model.name}${variant ? ` (${variant})` : ""}. It applies to the next prompts.`,
+      ),
+    )
+  }
+
+  private async general(
+    ch: Connector,
+    m: Inbound,
+    name: string,
+    args: string,
+    info: Info,
+  ): Promise<Outcome> {
+    const projects = this.d.cfg.chat.projects
+    const names = Object.keys(projects)
+    if (name === "sessions") {
+      const list = await this.d.sessions()
+      return this.done(
+        info,
+        "applied",
+        yes(
+          list.length
+            ? list
+                .slice(0, 20)
+                .map((s) => `• ${s.label} {topic:${s.id}}`)
+                .join("\n")
+            : "No session is mirrored here right now.",
+        ),
+      )
+    }
+    if (names.length === 0)
+      return this.done(
+        info,
+        "off",
+        no(
+          "Starting sessions from a chat is off: list projects under chat.projects in the config.",
+        ),
+      )
+    if (name === "projects")
+      return this.done(
+        info,
+        "applied",
+        yes(
+          names
+            .map((n) => {
+              const p = projects[n]
+              const bits = [basename(p.directory), p.agent, p.model].filter(
+                Boolean,
+              )
+              return `• ${n} (${bits.join(" · ")})`
+            })
+            .join("\n"),
+        ),
+      )
+    // /new
+    const parsed = /^(\S+)\s*([\s\S]*)$/.exec(args)
+    if (!parsed)
+      return this.done(
+        info,
+        "applied",
+        this.menu(
+          "project",
+          "Start a session in which project?",
+          names.map((n) => ({ label: n, value: n })),
+        ),
+      )
+    const [, project, prompt] = parsed
+    if (!Object.hasOwn(projects, project))
+      return this.done(
+        info,
+        "invalid",
+        no(`No project "${project}". The projects are: ${names.join(", ")}.`),
+      )
+    if (prompt.trim())
+      return this.create(ch, { project, text: prompt.trim() }, info)
+    return this.chooseAgent(project, info)
+  }
+
+  private async chooseAgent(project: string, info: Info): Promise<Outcome> {
+    const agents = await this.d.host.agents().catch(() => [] as string[])
+    const own = this.d.cfg.chat.projects[project].agent ?? "OpenCode's own"
+    return this.done(
+      info,
+      "applied",
+      this.menu(
+        "new-agent",
+        `Agent for ${project}?`,
+        [
+          { label: `${DEFAULT} (${own})`, value: DEFAULT },
+          ...agents.map((a) => ({ label: a, value: a })),
+        ],
+        { project },
+      ),
+    )
+  }
+
+  private async pick(ch: Connector, m: Inbound, info: Info): Promise<Outcome> {
+    const f = m.token ? this.flows.get(m.token) : undefined
+    const value = m.command?.args ?? ""
+    if (!f || f.exp < this.d.now())
+      return this.done(
+        info,
+        "invalid",
+        no("That menu expired: send the command again."),
+      )
+    // One of what was offered, nothing else.
+    if (!f.values.includes(value))
+      return this.done(info, "invalid", no("That is not one of the choices."))
+    this.flows.delete(m.token!)
+
+    if (f.root) {
+      info.root = f.root
+      const blocked = await this.gate(f.root, info)
+      if (blocked) return blocked
+      if (f.kind === "agent") return this.applyAgent(f.root, value, info)
+      if (f.kind === "model") {
+        const hit = (await this.models()).find((x) => x.ref === value)
+        return hit
+          ? this.applyModel(f.root, hit, undefined, info)
+          : this.done(info, "invalid", no("That model is not available."))
+      }
+      const ref = (await this.d.host.session(f.root))?.modelRef
+      const hit = ref
+        ? (await this.d.host.models()).find(
+            (x) => x.ref === `${ref.providerID}/${ref.id}`,
+          )
+        : undefined
+      return hit
+        ? this.applyModel(
+            f.root,
+            hit,
+            value === DEFAULT ? undefined : value,
+            info,
+          )
+        : this.done(info, "invalid", no("This model has no variants."))
+    }
+
+    if (f.kind === "project") return this.chooseAgent(value, info)
+    if (f.kind === "new-agent") {
+      const own = this.d.cfg.chat.projects[f.project!].model ?? "OpenCode's own"
+      return this.done(
+        info,
+        "applied",
+        this.menu(
+          "new-model",
+          `Model for ${f.project}?`,
+          [
+            { label: `${DEFAULT} (${own})`, value: DEFAULT },
+            ...(await this.models()).map((x) => ({
+              label: x.name,
+              value: x.ref,
+            })),
+          ],
+          { project: f.project, agent: value === DEFAULT ? undefined : value },
+        ),
+      )
+    }
+    // new-model: ask for the prompt.
+    const id = this.flow({
+      kind: "prompt",
+      values: [],
+      project: f.project,
+      agent: f.agent,
+      model: value === DEFAULT ? undefined : value,
+    })
+    return this.done(info, "applied", {
+      ok: true,
+      text: `Reply to this message with the prompt for ${f.project}.`,
+      ask: { id },
+    })
+  }
+
+  private async reply(ch: Connector, m: Inbound, info: Info): Promise<Outcome> {
+    const f = m.token ? this.flows.get(m.token) : undefined
+    const text = (m.command?.args ?? "").trim()
+    if (!f || f.kind !== "prompt" || f.exp < this.d.now())
+      return this.done(
+        info,
+        "invalid",
+        no("That question expired: send /new again."),
+      )
+    if (!text)
+      return this.done(
+        info,
+        "invalid",
+        no("The prompt is empty: reply with some text."),
+      )
+    this.flows.delete(m.token!)
+    return this.create(
+      ch,
+      { project: f.project!, agent: f.agent, model: f.model, text },
+      info,
+    )
+  }
+
+  /** Starts a session in a listed project, routed here with chat on, and sends it the prompt. */
+  private async create(
+    ch: Connector,
+    o: { project: string; agent?: string; model?: string; text: string },
+    info: Info,
+  ): Promise<Outcome> {
+    const span = this.d.tel.begin("oob.session.create", {
+      attrs: { "connector.type": ch.type },
+    })
+    const end = (outcome: string, out: Outcome) => {
+      span.end({ outcome }, out.ok ? undefined : outcome)
+      log("session_create", { outcome, project: o.project })
+      return this.done(info, outcome, out)
+    }
+    const projects = this.d.cfg.chat.projects
+    if (!Object.hasOwn(projects, o.project))
+      return end("invalid", no("Unknown project."))
+    const p = projects[o.project]
+    const agent = o.agent ?? p.agent
+    const model = o.model ?? p.model
+    if (this.d.denied({ agent, directory: p.directory }))
+      return end(
+        "denied",
+        no("Starting a session there is blocked by chat.deny."),
+      )
+    const now = this.d.now()
+    while (this.created.length && now - this.created[0] > HOUR_MS)
+      this.created.shift()
+    if (this.created.length >= MAX_NEW_PER_HOUR)
+      return end(
+        "limited",
+        no(
+          `At most ${MAX_NEW_PER_HOUR} new sessions an hour: try again later.`,
+        ),
+      )
+    // A model picked in a chat must be on the list; the project's own comes from the config.
+    if (
+      o.model !== undefined &&
+      !(await this.models()).some((x) => x.ref === o.model)
+    )
+      return end("invalid", no("That model is not available."))
+    this.created.push(now)
+    try {
+      const { id } = await this.d.host.createSession({
+        directory: p.directory,
+        agent,
+        model: model ? parseRef(model) : undefined,
+      })
+      this.d.startChat(id, ch)
+      await this.d.host.prompt(id, o.text)
+      this.d.remote(id)
+      await this.d.show(id, true)
+      return end("applied", {
+        ok: true,
+        text: `🆕 Started ${o.project} · ${agent ?? "default agent"} → {topic:${id}}`,
+      })
+    } catch (err) {
+      log("session_create_error", { message: (err as Error).message })
+      return end("failed", no("Could not start the session: see the log."))
+    }
+  }
+}

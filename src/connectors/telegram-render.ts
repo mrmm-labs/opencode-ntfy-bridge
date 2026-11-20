@@ -160,7 +160,8 @@ export function renderStatus(s: SessionState, icon?: string): string {
       : s.state === "idle"
         ? `💤 <b>Idle</b> since ${at}`
         : `❌ <b>Failed</b> ${at}`
-  const agent = [s.agent, s.model].filter(Boolean).join(" · ")
+  const model = s.model && s.variant ? `${s.model} (${s.variant})` : s.model
+  const agent = [s.agent, model].filter(Boolean).join(" · ")
   return [
     `${icon ? `${icon} ` : ""}${state}`,
     ...(s.title ? [`📌 ${fit(clean(s.title), 200)}`] : []),

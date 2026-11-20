@@ -36,6 +36,13 @@ export type ChatConfig = {
   mirror: "replies" | "remote-only"
   /** Show a reply being written, in one message edited as it grows. */
   stream: boolean
+  /** The folders a session can be started in from a chat, by name. Empty: starting sessions from a chat is off. */
+  projects: Record<
+    string,
+    { directory: string; agent?: string; model?: string }
+  >
+  /** `provider/model` ids offered by /model. Empty: the models OpenCode lists, a dozen at most. */
+  models: string[]
 }
 
 export type Config = {
@@ -101,8 +108,64 @@ function parseChannels(
   return { channels: out }
 }
 
+const PROJECT_NAME = /^[A-Za-z0-9][-_.A-Za-z0-9]{0,31}$/
+const MODEL_REF = /^[^/\s]+\/\S+$/
+const ABSOLUTE = /^(\/|[A-Za-z]:[\\/])/
+
+function parseModels(raw: unknown, at: string): string[] | string {
+  if (raw === undefined) return []
+  if (!Array.isArray(raw) || raw.length > 50)
+    return `${at} must be a list of provider/model ids (50 at most)`
+  for (const m of raw)
+    if (typeof m !== "string" || !MODEL_REF.test(m))
+      return `${at}: ${String(m)} is not a provider/model id`
+  return raw as string[]
+}
+
+/** The allowlist of folders. A folder is only ever one of these: never text from a chat. */
+function parseProjects(
+  raw: unknown,
+): { projects: ChatConfig["projects"] } | { error: string } {
+  if (raw === undefined) return { projects: {} }
+  if (!isObject(raw)) return { error: "chat.projects must be an object" }
+  const projects: ChatConfig["projects"] = {}
+  for (const [name, p] of Object.entries(raw)) {
+    const at = `chat.projects.${name}`
+    if (!PROJECT_NAME.test(name))
+      return { error: `${at}: use letters, digits, - _ . (32 at most)` }
+    if (!isObject(p)) return { error: `${at} must be an object` }
+    if (
+      typeof p.directory !== "string" ||
+      !ABSOLUTE.test(p.directory) ||
+      p.directory.includes("\0") ||
+      p.directory.split(/[\\/]/).includes("..")
+    )
+      return { error: `${at}.directory must be an absolute path without ..` }
+    if (p.agent !== undefined && (typeof p.agent !== "string" || !p.agent))
+      return { error: `${at}.agent must be an agent name` }
+    if (
+      p.model !== undefined &&
+      (typeof p.model !== "string" || !MODEL_REF.test(p.model))
+    )
+      return { error: `${at}.model must be a provider/model id` }
+    projects[name] = {
+      directory: p.directory,
+      agent: p.agent as string | undefined,
+      model: p.model as string | undefined,
+    }
+  }
+  return { projects }
+}
+
 function parseChat(raw: unknown): ChatConfig | { error: string } {
-  if (raw === undefined) return { deny: [], mirror: "replies", stream: true }
+  if (raw === undefined)
+    return {
+      deny: [],
+      mirror: "replies",
+      stream: true,
+      projects: {},
+      models: [],
+    }
   if (!isObject(raw)) return { error: "chat must be an object" }
   const mirror = raw.mirror ?? "replies"
   if (mirror !== "replies" && mirror !== "remote-only")
@@ -126,7 +189,11 @@ function parseChat(raw: unknown): ChatConfig | { error: string } {
       return { error: "a chat.deny entry needs agent or directory" }
     deny.push(rule)
   }
-  return { deny, mirror, stream }
+  const projects = parseProjects(raw.projects)
+  if ("error" in projects) return projects
+  const models = parseModels(raw.models, "chat.models")
+  if (typeof models === "string") return { error: models }
+  return { deny, mirror, stream, projects: projects.projects, models }
 }
 
 /** Validates a parsed config file. Returns the config or the first problem. */

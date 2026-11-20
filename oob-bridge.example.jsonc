@@ -65,6 +65,14 @@
   //   "mirror": "replies", // or "remote-only"
   //   // Never chat with these, even after /oob chat on.
   //   "deny": [{ "directory": "**/payroll" }, { "agent": "^ops$" }],
+  //   // /new starts sessions only in these folders (absolute paths). Without
+  //   // this, starting sessions from a chat is off.
+  //   "projects": {
+  //     "shop": { "directory": "/home/me/code/shop", "agent": "build" },
+  //   },
+  //   // Models /model offers, as provider/model. Default: the models OpenCode
+  //   // lists for your providers, twelve at most.
+  //   "models": ["anthropic/claude-sonnet-4-5"],
   // },
 
   // "full", "head:<n>" (first n characters) or "title" (no body).

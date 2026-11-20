@@ -286,6 +286,54 @@ How it behaves:
   sensitive projects, and put them in `chat.deny`. Use `redact: "title"` if replies must not
   leave the machine.
 
+### Commands
+
+The bot registers its commands for the paired chat, so Telegram shows them after `/`. A command
+for another bot (`/cmd@other_bot`) is left alone.
+
+In a session's topic (they act on that session, and need chat on):
+
+| Command               | What it does                                                                                                                                     |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/model`              | Buttons with the allowed models, the current one marked ✓. The pick is set on the session, so the next prompts use it, from Telegram or the TUI. |
+| `/agent`              | The same for the primary agents OpenCode lists.                                                                                                  |
+| `/variant`, `/effort` | The model's effort variants (and `default`), when it has any.                                                                                    |
+| `/status`             | Redraws the status card and pins it again. The card shows agent, model and variant.                                                              |
+| `/stop`               | Stops the running turn.                                                                                                                          |
+| `/compact`            | Compacts the session.                                                                                                                            |
+| `/rename <title>`     | Renames the session.                                                                                                                             |
+| `/chat off`           | Turns chat off. Chat is only switched on in the TUI.                                                                                             |
+| `/help`               | Lists these.                                                                                                                                     |
+
+In General, or a private chat:
+
+| Command                   | What it does                                                                                                        |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `/new <project> <prompt>` | Starts a session in a listed project.                                                                               |
+| `/new [project]`          | Buttons for project, then agent, then model (each with `default`), then asks for the prompt: reply to that message. |
+| `/sessions`               | The mirrored sessions, with a link to each topic.                                                                   |
+| `/projects`               | The projects `/new` can use.                                                                                        |
+| `/help`                   | Lists these.                                                                                                        |
+
+A session command sent in General, or a General command sent in a topic, gets a hint and does
+nothing.
+
+**Starting sessions** is off until `chat.projects` lists the folders it may use. A folder is only
+ever one of those entries: a path typed in Telegram is never accepted, and a model is only ever
+one of the listed ones (`chat.models`, or the models OpenCode lists for your providers, twelve at
+most, six to a page). A new session is routed to Telegram with chat on, gets its topic and card,
+and is subject to `chat.deny`. At most five are started an hour. Each one is logged and traced.
+
+```jsonc
+"chat": {
+  "projects": {
+    "shop": { "directory": "/home/me/code/shop", "agent": "build", "model": "anthropic/claude-sonnet-4-5" },
+    "docs": { "directory": "/home/me/code/docs" }
+  },
+  "models": ["anthropic/claude-sonnet-4-5", "openai/gpt-5"]
+}
+```
+
 ## Telemetry
 
 The plugin can export OpenTelemetry traces and metrics over OTLP/HTTP JSON, using only `fetch`
@@ -301,14 +349,16 @@ Service `opencode/oob-bridge`, scope `opencode-oob-bridge`. The trace id is the 
 characters of `sha256(<top-level session id>)`, as in the other OpenCode plugins that export
 telemetry, so these spans join the session's trace.
 
-| Spans           | What                                                                                                                                                               |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `oob.route`     | A routing decision: mode, reason, channel chosen, number of targets.                                                                                               |
-| `oob.push`      | One push of a kind, with a child `oob.send` or `oob.update` per connector (type, ok, HTTP status, retries).                                                        |
-| `oob.inbound`   | An answer or prompt from a chat: kind, connector type, outcome (`applied`, `expired`, `duplicate`, `unreadable`, `permission-refused`, `failed`, `rejected-chat`). |
-| `oob.pair`      | Pairing, until paired or expired.                                                                                                                                  |
-| `oob.reply`     | A reply posted to a chat: parts, characters, documents (never the text).                                                                                           |
-| `oob.reconnect` | A connector's poll or subscription reconnecting.                                                                                                                   |
+| Spans                | What                                                                                                                                                               |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `oob.route`          | A routing decision: mode, reason, channel chosen, number of targets.                                                                                               |
+| `oob.push`           | One push of a kind, with a child `oob.send` or `oob.update` per connector (type, ok, HTTP status, retries).                                                        |
+| `oob.inbound`        | An answer or prompt from a chat: kind, connector type, outcome (`applied`, `expired`, `duplicate`, `unreadable`, `permission-refused`, `failed`, `rejected-chat`). |
+| `oob.pair`           | Pairing, until paired or expired.                                                                                                                                  |
+| `oob.command`        | A slash command or menu pick: name and outcome (never the arguments).                                                                                              |
+| `oob.session.create` | A session started from a chat: outcome only.                                                                                                                       |
+| `oob.reply`          | A reply posted to a chat: parts, characters, documents (never the text).                                                                                           |
+| `oob.reconnect`      | A connector's poll or subscription reconnecting.                                                                                                                   |
 
 | Metrics                 | Kind      | Labels                                                                    |
 | ----------------------- | --------- | ------------------------------------------------------------------------- |
