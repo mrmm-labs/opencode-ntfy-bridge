@@ -7,6 +7,7 @@ import {
   renderCard,
   renderStatus,
   starred,
+  topicName,
 } from "./telegram-render.ts"
 import type { Card } from "./types.ts"
 
@@ -110,11 +111,52 @@ describe("telegram render", () => {
     }
     assert.equal(
       renderStatus(base, "🎯"),
-      "🎯 💤 <b>Idle</b> since 09:05\n📌 Fix\n📁 shop &lt;x&gt;\n🆔 <code>123456</code>\n🕐 09:05",
+      "🎯 💤 <b>Idle</b> since 09:05\n📌 Fix\n📁 shop &lt;x&gt;\n🆔 <code>123456</code>\n💬 Chat off\n🕐 09:05",
     )
+    assert.match(renderStatus({ ...base, chat: true }), /\n💬 Chat on\n🕐/)
     assert.match(
       renderStatus({ ...base, state: "failed" }),
       /^❌ <b>Failed<\/b> 09:05/,
     )
+  })
+
+  it("says how the session is watched on the card and in the topic name", () => {
+    const base = {
+      id: "s",
+      name: "shop · Fix",
+      project: "shop",
+      state: "idle" as const,
+      at: new Date(2026, 0, 1, 9, 5).getTime(),
+    }
+    const on = { mode: "on" as const, channel: "telegram", minutes: 10 }
+    const auto = { mode: "auto" as const, channel: "all", minutes: 15 }
+    const off = { mode: "off" as const, channel: "all", minutes: 10 }
+    assert.match(
+      renderStatus({ ...base, watch: on }),
+      /\n👁 <b>Watched<\/b>: on via telegram\n💬 Chat off\n/,
+    )
+    assert.match(
+      renderStatus({ ...base, watch: auto }),
+      /\n⏱ <b>Watched<\/b>: auto, after 15 min away\n/,
+    )
+    assert.match(
+      renderStatus({ ...base, watch: off }),
+      /\n🔕 <b>Not watched<\/b>\n/,
+    )
+    assert.equal(
+      topicName({ ...base, watch: on }),
+      "👁 on·telegram · shop · Fix",
+    )
+    assert.equal(
+      topicName({ ...base, watch: on, chat: true }),
+      "👁 on·telegram 💬 · shop · Fix",
+    )
+    assert.equal(topicName({ ...base, watch: auto }), "⏱ auto · shop · Fix")
+    assert.equal(topicName({ ...base, watch: off }), "🔕 off · shop · Fix")
+    assert.equal(
+      topicName({ ...base, watch: off, chat: true }),
+      "🔕 off 💬 · shop · Fix",
+    )
+    assert.equal(topicName(base), "shop · Fix", "no watch state, no tag")
   })
 })

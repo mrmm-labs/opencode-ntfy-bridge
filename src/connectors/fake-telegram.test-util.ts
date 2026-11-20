@@ -36,12 +36,23 @@ export async function fakeTelegram(token = "123456:TESTTOKEN") {
     "🧭",
   ].map((emoji, i) => ({ emoji, custom_emoji_id: `e${i}` }))
   let pollLimit = Infinity
+  // Files a test put on the server, by file_id, and which were fetched.
+  const files = new Map<string, Uint8Array>()
+  const downloads: string[] = []
   const polls = new Set<() => void>()
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     let data = ""
     req.on("data", (c) => (data += c))
     req.on("end", async () => {
+      const dl = /^\/file\/bot([^/]+)\/files\/(.+)$/.exec(req.url ?? "")
+      if (req.method === "GET" && dl) {
+        downloads.push(dl[2])
+        const bytes = files.get(dl[2])
+        if (dl[1] !== token || !bytes) return void res.writeHead(404).end()
+        res.writeHead(200, { "Content-Type": "application/octet-stream" })
+        return void res.end(Buffer.from(bytes))
+      }
       const m = /^\/bot([^/]+)\/(\w+)$/.exec(req.url ?? "")
       if (req.method !== "POST" || !m) return void res.writeHead(404).end()
       // A file upload is multipart: its fields and the file text are kept as they came.
@@ -97,6 +108,22 @@ export async function fakeTelegram(token = "123456:TESTTOKEN") {
       calls.push(call)
       if (m[2] === "sendMessage")
         return send(200, { ok: true, result: { message_id: ++messageSeq } })
+      if (m[2] === "getFile") {
+        const bytes = files.get(body.file_id)
+        if (!bytes)
+          return send(400, {
+            ok: false,
+            description: "Bad Request: wrong file_id",
+          })
+        return send(200, {
+          ok: true,
+          result: {
+            file_id: body.file_id,
+            file_path: `files/${body.file_id}`,
+            file_size: bytes.length,
+          },
+        })
+      }
       if (m[2] === "getChat")
         return send(200, {
           ok: true,
@@ -159,6 +186,36 @@ export async function fakeTelegram(token = "123456:TESTTOKEN") {
           chat: { id: chat, ...chatExtra },
           message_thread_id: thread,
           reply_to_message: replyTo ? { message_id: replyTo } : undefined,
+        },
+      })
+      wake()
+    },
+    /** Puts a file on the server; `fileId` is what a message names. */
+    file(fileId: string, bytes: Uint8Array | string) {
+      files.set(
+        fileId,
+        typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes,
+      )
+    },
+    downloads,
+    /** A message with media fields (`photo`, `document`, `voice`, ...) and an optional caption. */
+    media(
+      chat: number,
+      fields: Record<string, unknown>,
+      caption?: string,
+      thread?: number,
+      replyTo?: number,
+    ) {
+      updates.push({
+        update_id: ++updateSeq,
+        message: {
+          message_id: ++messageSeq,
+          date: Math.floor(Date.now() / 1000),
+          caption,
+          chat: { id: chat },
+          message_thread_id: thread,
+          reply_to_message: replyTo ? { message_id: replyTo } : undefined,
+          ...fields,
         },
       })
       wake()

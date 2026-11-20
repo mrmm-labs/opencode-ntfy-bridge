@@ -91,6 +91,8 @@ export type SessionState = {
   at: number
   /** Chatting with this session from the connector is on. */
   chat?: boolean
+  /** Whether the session is mirrored: forced on through a channel, by the away rule, or off. */
+  watch?: { mode: "on" | "off" | "auto"; channel: string; minutes: number }
 }
 
 /** Filled in by the connector during `send`/`update`, for the trace. */
@@ -110,6 +112,9 @@ export type Push = {
   /** The connector may record transport facts here; it is never shown to anyone. */
   stats?: SendStats
 }
+
+/** A file a person sent: base64 bytes, a checked mime type, and the name to show. */
+export type InboundFile = { name: string; mime: string; data: string }
 
 /** Something a person sent through a connector. */
 export type Inbound = {
@@ -138,6 +143,8 @@ export type Inbound = {
   inline?: boolean
   /** `text` is a free-text answer: a number is not an option selector. */
   literal?: boolean
+  /** Files sent with the message (`prompt` only), already downloaded and checked by the connector. */
+  files?: InboundFile[]
   /** For `command`: the name without the slash, and the rest of the line. `pick` and `reply` are not typed: `token` names the menu or question they answer. */
   command?: { name: string; args: string }
   token?: string
@@ -159,6 +166,8 @@ export type Outcome = {
   ask?: { id: string }
   /** The text of a message was sent to a session: the connector may acknowledge it. */
   sent?: boolean
+  /** With `sent`: which agent got it, and whether it went in at once, waited or was steered in. */
+  delivered?: { agent?: string; how: "sent" | "queued" | "steered" }
 }
 
 /** Resolves undefined for input that is silently ignored. */

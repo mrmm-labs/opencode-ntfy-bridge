@@ -151,6 +151,37 @@ export function renderPlain(push: Push): string {
 export const renderPush = (push: Push, o: RenderOptions = {}) =>
   push.card ? renderCard(push.card, o) : renderPlain(push)
 
+/**
+ * How a session is watched, short enough to lead a topic name:
+ * `👁 on·telegram` (forced on), `⏱ auto`, `🔕 off`, then `💬` when chat is on.
+ */
+export function watchTag(s: SessionState): string {
+  const w = s.watch
+  if (!w) return s.chat ? "💬" : ""
+  const mode =
+    w.mode === "on"
+      ? w.channel === "all"
+        ? "👁 on"
+        : `👁 on·${w.channel}`
+      : w.mode === "auto"
+        ? "⏱ auto"
+        : "🔕 off"
+  return s.chat ? `${mode} 💬` : mode
+}
+
+/** The topic name: the watch tag, then the session's name. */
+export const topicName = (s: SessionState): string =>
+  [watchTag(s), s.name].filter(Boolean).join(" · ")
+
+const watchLine = (w: NonNullable<SessionState["watch"]>): string =>
+  w.mode === "on"
+    ? w.channel === "all"
+      ? "👁 <b>Watched</b>: on"
+      : `👁 <b>Watched</b>: on via ${esc(w.channel)}`
+    : w.mode === "auto"
+      ? `⏱ <b>Watched</b>: auto, after ${w.minutes} min away`
+      : "🔕 <b>Not watched</b>"
+
 /** The pinned status card of a session topic. `icon` is the topic's emoji, so card and topic match. */
 export function renderStatus(s: SessionState, icon?: string): string {
   const at = clock(s.at)
@@ -168,7 +199,8 @@ export function renderStatus(s: SessionState, icon?: string): string {
     ...(agent ? [`🤖 ${fit(clean(agent), 120)}`] : []),
     `📁 ${fit(clean(s.project), 80)}`,
     `🆔 <code>${esc(s.id.slice(-6))}</code>`,
-    ...(s.chat ? ["💬 Chat on"] : []),
+    ...(s.watch ? [watchLine(s.watch)] : []),
+    s.chat ? "💬 Chat on" : "💬 Chat off",
     `🕐 ${at}`,
   ].join("\n")
 }

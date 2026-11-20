@@ -74,8 +74,18 @@ export function host(ctx: Context): Host {
     replyForm: (sessionID, formID, answer) =>
       ctx.data.session.form.reply({ sessionID, formID, answer }),
     // Queued behind a running turn, so a message sent while the agent works never interrupts a step.
-    prompt: async (sessionID, text, delivery) => {
-      await ctx.client.session.prompt({ sessionID, text, delivery })
+    prompt: async (sessionID, text, delivery, files) => {
+      await ctx.client.session.prompt({
+        sessionID,
+        text,
+        delivery,
+        // Inline data: the bytes travel with the prompt; no file is left on disk.
+        files: files?.map((f) => ({
+          uri: `data:${f.mime};base64,${f.data}`,
+          source: { type: "inline" as const },
+          name: f.name,
+        })),
+      })
     },
     busy: (id) => ctx.data.session.status(id) === "running",
     createSession: async ({ directory, agent, model }) => {

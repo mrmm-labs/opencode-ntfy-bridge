@@ -34,13 +34,33 @@ import {
   renderPush,
   renderStatus,
   starred,
+  topicName,
 } from "./telegram-render.ts"
+import {
+  checkAnnounced,
+  DEFAULT_MEDIA,
+  download,
+  fileName,
+  mediaOf,
+  MediaRejected,
+  parseMedia,
+  verify,
+  type MediaConfig,
+  type MediaMessage,
+  type MediaRef,
+} from "./telegram-media.ts"
+import {
+  parseReactions,
+  reactionFor,
+  type ReactionsConfig,
+} from "./telegram-reactions.ts"
 import type {
   Capabilities,
   Connector,
   ConnectorStatus,
   ConnectorType,
   Inbound,
+  InboundFile,
   Menu,
   OnInbound,
   Outcome,
@@ -119,22 +139,29 @@ export type TelegramOptions = {
   notify?: { finished?: boolean; failed?: boolean }
   /** `agent regex or project glob` to the emoji it picks for a topic icon. */
   icons?: Record<string, string>
+  /** The emoji a prompt gets as its acknowledgement; see `reactionFor`. */
+  reactions?: ReactionsConfig
+  /** Files accepted from the chat. */
+  media?: MediaConfig
   /** How often the typing indicator is renewed while a chat session works. */
   typingMs?: number
   /** Clock, for the topic, card and streaming limits. */
   now?: () => number
 }
 
+type Message = MediaMessage & {
+  message_id: number
+  date: number
+  text?: string
+  caption?: string
+  chat: { id: number; title?: string; is_forum?: boolean }
+  message_thread_id?: number
+  reply_to_message?: { message_id: number }
+}
+
 type Update = {
   update_id: number
-  message?: {
-    message_id: number
-    date: number
-    text?: string
-    chat: { id: number; title?: string; is_forum?: boolean }
-    message_thread_id?: number
-    reply_to_message?: { message_id: number }
-  }
+  message?: Message
   callback_query?: {
     id: string
     data?: string
@@ -635,9 +662,14 @@ export class TelegramConnector implements Connector {
     try {
       const session = {
         id: state.id,
-        name: state.name,
+        name: truncate(filterSecrets(topicName(state)), 128),
         project: state.project,
         agent: state.agent,
+      }
+      // Switching a session off does not open a topic for it.
+      if (state.watch?.mode === "off") {
+        this.topics ??= await this.loadTopics()
+        if (!this.topics.has(this.topicKey(state.id))) return
       }
       const thread = await this.thread(session)
       if (thread === undefined) return
@@ -685,7 +717,7 @@ export class TelegramConnector implements Connector {
     if (!live || !topic || !this.chatId) return
     clearTimeout(live.timer)
     const s = live.want
-    const name = truncate(filterSecrets(s.name), 128)
+    const name = truncate(filterSecrets(topicName(s)), 128)
     const now = this.now()
     let wait = Infinity
     const due = (last: number, gap: number) => {
@@ -1044,8 +1076,11 @@ export class TelegramConnector implements Connector {
   private async onUpdate(u: Update): Promise<void> {
     if (u.callback_query) return this.onCallback(u.callback_query)
     const m = u.message
-    const text = m?.text?.trim()
-    if (!m || !text) return
+    if (!m) return
+    const media = mediaOf(m)
+    if (media) return this.onMedia(u, m, media)
+    const text = m.text?.trim()
+    if (!text) return
     if (await this.tryPair(m.chat, text)) return
     if (String(m.chat.id) !== this.chatId) {
       this.rejected("message")
@@ -1110,29 +1145,106 @@ export class TelegramConnector implements Connector {
         : undefined
     if (!inbound) return
     const out = await this.onInbound?.(inbound)
-    if (out?.sent) await this.acknowledge(m, out.text)
+    if (out?.sent) await this.acknowledge(m, out)
   }
 
-  /** A prompt reached its session: 👀 on the message, and a quiet line saying where. */
-  private async acknowledge(
-    m: NonNullable<Update["message"]>,
-    text: string,
-  ): Promise<void> {
+  /**
+   * A prompt reached its session: one reaction on the message, which agent
+   * got it, or that it waited or was steered in. If the reaction cannot be set,
+   * the old line says it instead, so the sender still learns where it went.
+   */
+  private async acknowledge(m: Message, out: Outcome): Promise<void> {
+    const emoji = reactionFor(this.opts.reactions, out.delivered, (bad) =>
+      this.warnReaction(bad),
+    )
     try {
       await this.call("setMessageReaction", {
         chat_id: this.chatId,
         message_id: m.message_id,
-        reaction: [{ type: "emoji", emoji: "👀" }],
-      })
-      await this.call("sendMessage", {
-        chat_id: this.chatId,
-        message_thread_id: m.message_thread_id,
-        text: esc(text),
-        parse_mode: "HTML",
-        disable_notification: true,
+        reaction: [{ type: "emoji", emoji }],
       })
     } catch (err) {
       this.fail(err)
+      await this.deliver(m.message_thread_id, { ok: true, text: out.text })
+    }
+  }
+
+  private badReactions = new Set<string>()
+
+  private warnReaction(emoji: string): void {
+    if (this.badReactions.has(emoji)) return
+    this.badReactions.add(emoji)
+    log("telegram_reaction_invalid", { emoji })
+  }
+
+  /** A photo or document, with its caption as the prompt; voice and video are turned away. */
+  private async onMedia(u: Update, m: Message, ref: MediaRef): Promise<void> {
+    if (String(m.chat.id) !== this.chatId) {
+      this.rejected("message")
+      return log("telegram_ignored", { kind: "media" })
+    }
+    const to =
+      m.reply_to_message &&
+      m.reply_to_message.message_id !== m.message_thread_id
+        ? String(m.reply_to_message.message_id)
+        : undefined
+    const sessionKey = await this.sessionAt(m.message_thread_id, to)
+    if (!sessionKey) return
+    const notice = (text: string) =>
+      this.deliver(m.message_thread_id, { ok: false, text })
+    if (ref.kind === "unsupported")
+      return notice(
+        "Voice and video messages are not supported. Send text, a photo or a document.",
+      )
+    const cfg = this.opts.media ?? DEFAULT_MEDIA
+    let file: InboundFile
+    try {
+      file = await this.fetchMedia(u, ref, cfg)
+    } catch (err) {
+      if (err instanceof MediaRejected) return notice(err.message)
+      this.fail(err)
+      return notice("Could not download that file from Telegram.")
+    }
+    const out = await this.onInbound?.({
+      kind: "prompt",
+      id: String(u.update_id),
+      time: m.date,
+      from: { connector: this.id, chat: String(m.chat.id) },
+      sessionKey,
+      text: (m.caption ?? "").trim(),
+      files: [file],
+    })
+    if (out?.sent) await this.acknowledge(m, out)
+  }
+
+  private async fetchMedia(
+    u: Update,
+    ref: Extract<MediaRef, { kind: "photo" | "document" }>,
+    cfg: MediaConfig,
+  ): Promise<InboundFile> {
+    checkAnnounced(ref, cfg)
+    const info = await this.call<{ file_path?: string; file_size?: number }>(
+      "getFile",
+      { file_id: ref.fileId },
+    )
+    if (!info.file_path) throw new Error("telegram getFile gave no path")
+    if (info.file_size !== undefined && info.file_size > cfg.maxBytes)
+      checkAnnounced({ ...ref, size: info.file_size }, cfg)
+    const token = await this.opts.token()
+    if (!token) throw new Error("no Telegram token")
+    const bytes = await download({
+      fetch: this.fetch,
+      base: this.opts.apiBase ?? "https://api.telegram.org",
+      token,
+      filePath: info.file_path,
+      maxBytes: cfg.maxBytes,
+      signal: this.signal,
+    })
+    const mime = verify(ref, bytes, cfg)
+    return {
+      name: fileName(ref, mime, String(u.update_id)),
+      mime,
+      data: Buffer.from(bytes).toString("base64"),
     }
   }
 
@@ -1720,6 +1832,8 @@ export type TelegramConfig = {
   statusCard: boolean
   notify: { finished?: boolean; failed?: boolean }
   icons: Record<string, string>
+  reactions: ReactionsConfig
+  media: MediaConfig
 }
 
 export const telegramType: ConnectorType<TelegramConfig> = {
@@ -1768,6 +1882,11 @@ export const telegramType: ConnectorType<TelegramConfig> = {
       }
     }
 
+    const reactions = parseReactions(raw.reactions, at)
+    if ("error" in reactions) return reactions
+    const media = parseMedia(raw.media, at)
+    if ("error" in media) return media
+
     return {
       token,
       chatId,
@@ -1775,6 +1894,8 @@ export const telegramType: ConnectorType<TelegramConfig> = {
       statusCard,
       notify,
       icons,
+      reactions: reactions.reactions,
+      media: media.media,
     }
   },
 
@@ -1790,6 +1911,8 @@ export const telegramType: ConnectorType<TelegramConfig> = {
       statusCard: o.statusCard,
       notify: o.notify,
       icons: o.icons,
+      reactions: o.reactions,
+      media: o.media,
       offsetFile: join(env.dir, `${env.name}-offset.json`),
       topicsFile: join(env.dir, `${env.name}-topics.json`),
       onPaired: (chatId) => env.settings.set({ chatId }),

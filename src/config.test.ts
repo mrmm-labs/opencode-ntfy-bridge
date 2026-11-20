@@ -11,6 +11,7 @@ import {
   parseConfig,
   type Config,
 } from "./config.ts"
+import { DEFAULT_MEDIA_MIMES } from "./connectors/telegram-media.ts"
 
 /** The options a connector type parsed for one channel. */
 const opts = (c: Config, name: string) =>
@@ -112,6 +113,8 @@ describe("parseConfig channels", () => {
       statusCard: true,
       notify: {},
       icons: {},
+      reactions: {},
+      media: { maxBytes: 10 * 1024 * 1024, mimes: DEFAULT_MEDIA_MIMES },
     })
     const d = parseConfig({
       channels: {
@@ -139,6 +142,8 @@ describe("parseConfig channels", () => {
       statusCard: false,
       notify: { finished: true, failed: undefined },
       icons: { "^coord": "🎯" },
+      reactions: {},
+      media: { maxBytes: 10 * 1024 * 1024, mimes: DEFAULT_MEDIA_MIMES },
     })
     for (const bad of [
       { statusCard: "yes" },
@@ -430,5 +435,35 @@ describe("loadConfig", () => {
           : (process.env[k] = prev[i]),
       )
     }
+  })
+})
+
+describe("telegram reactions and media settings", () => {
+  const tg = (extra: Record<string, unknown>) =>
+    parseConfig({
+      channels: { telegram: { token: { env: "TG" }, ...extra } },
+    }) as Config | { error: string }
+
+  it("reads them, and refuses what cannot work", () => {
+    const ok = tg({
+      reactions: { agents: { Build: "🔥" }, queued: "🙈" },
+      media: { maxBytes: 1000, mimes: ["image/*", "application/pdf"] },
+    }) as Config
+    const t = opts(ok, "telegram")
+    assert.deepEqual(t.reactions, { agents: { build: "🔥" }, queued: "🙈" })
+    assert.deepEqual(t.media, {
+      maxBytes: 1000,
+      mimes: ["image/*", "application/pdf"],
+    })
+    for (const bad of [
+      { reactions: [] },
+      { reactions: { nope: "x" } },
+      { reactions: { agents: { a: 3 } } },
+      { media: { maxBytes: 0 } },
+      { media: { maxBytes: 21 * 1024 * 1024 } },
+      { media: { mimes: ["PDF"] } },
+      { media: { other: 1 } },
+    ])
+      assert.ok("error" in (tg(bad) as object), JSON.stringify(bad))
   })
 })
