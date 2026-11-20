@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { describe, it } from "node:test"
 
 import { Bridge, type BridgeEvent, type Host } from "./bridge.ts"
+import type { InboundFile } from "./connectors/types.ts"
 import { parseConfig, type Config } from "./config.ts"
 import { fakeTelegram } from "./connectors/fake-telegram.test-util.ts"
 import {
@@ -29,6 +30,8 @@ async function chatRig(
     busy?: boolean
     directory?: string
     posts?: string[]
+    agent?: string
+    failPrompt?: boolean
   } = {},
 ) {
   const tg = await fakeTelegram()
@@ -61,7 +64,11 @@ async function chatRig(
     chat: o.chat,
     redact: o.redact,
   }) as Config
-  const prompts: Array<{ sessionID: string; text: string }> = []
+  const prompts: Array<{
+    sessionID: string
+    text: string
+    files?: InboundFile[]
+  }> = []
   const deliveries: string[] = []
   const replies: unknown[] = []
   const state = { busy: o.busy ?? false }
@@ -70,7 +77,7 @@ async function chatRig(
       id === "root"
         ? {
             id,
-            agent: "coord",
+            agent: o.agent ?? "coord",
             directory: o.directory ?? "/w/shop",
             title: "Fix",
           }
@@ -79,8 +86,9 @@ async function chatRig(
     replyForm: async (sessionID, formID, answer) => {
       replies.push({ sessionID, formID, answer })
     },
-    prompt: async (sessionID, text, delivery) => {
-      prompts.push({ sessionID, text })
+    prompt: async (sessionID, text, delivery, files) => {
+      if (o.failPrompt) throw new Error("boom")
+      prompts.push({ sessionID, text, ...(files ? { files } : {}) })
       deliveries.push(delivery)
     },
     busy: () => state.busy,
@@ -140,31 +148,79 @@ describe("chat from Telegram: access", () => {
     await r.done()
   })
 
-  it("maps the topic to its session, acknowledges with 👀 and says where it went", async () => {
+  it("maps the topic to its session and acknowledges with a reaction only", async () => {
     const r = await chatRig()
     await chatOn(r)
+    const before = r.sends().length
     r.tg.message(CHAT, "run the tests", undefined, 9001)
     await r.tg.waitFor(() => r.prompts[0])
     assert.deepEqual(r.prompts, [{ sessionID: "root", text: "run the tests" }])
     const react = await r.tg.waitFor(() => r.tg.of("setMessageReaction")[0])
     assert.deepEqual(react.body.reaction, [{ type: "emoji", emoji: "👀" }])
-    const line = await r.tg.waitFor(() =>
-      r.sends().find((b) => /→ sent to/.test(b.text)),
-    )
-    assert.equal(line.text, "→ sent to coord · shop")
-    assert.equal(line.message_thread_id, 9001)
-    assert.equal(line.disable_notification, true)
+    assert.equal(react.body.message_id, r.tg.lastMessageId)
+    await sleep(100)
+    assert.equal(r.sends().length, before, "no 'sent to' line")
     await r.done()
   })
 
-  it("says queued when the session is busy", async () => {
+  it("the reaction names the agent: the built-in map, the config over it, 👀 for an unknown one", async () => {
+    const emojiFor = async (
+      agent: string,
+      reactions?: Record<string, unknown>,
+    ) => {
+      const r = await chatRig({ agent, tg: { reactions } as never })
+      await chatOn(r)
+      r.tg.message(CHAT, "hi", undefined, 9001)
+      const react = await r.tg.waitFor(() => r.tg.of("setMessageReaction")[0])
+      await r.done()
+      return react.body.reaction[0].emoji
+    }
+    assert.equal(await emojiFor("build"), "👨‍💻")
+    assert.equal(await emojiFor("plan"), "🤔")
+    assert.equal(await emojiFor("Coordinator"), "🫡")
+    assert.equal(await emojiFor("zzz"), "👀")
+    assert.equal(
+      await emojiFor("coord", { agents: { coord: "🎯" } }),
+      "👀",
+      "🎯 is not allowed for bots",
+    )
+    assert.equal(await emojiFor("coord", { agents: { coord: "🔥" } }), "🔥")
+    assert.equal(await emojiFor("build", { agents: { build: "🤓" } }), "🤓")
+  })
+
+  it("a busy session gets the queued reaction, and still sends the prompt", async () => {
     const r = await chatRig({ busy: true })
     await chatOn(r)
+    const before = r.sends().length
     r.tg.message(CHAT, "and then this", undefined, 9001)
-    await r.tg.waitFor(() =>
-      r.sends().find((b) => /→ queued for coord · shop/.test(b.text)),
-    )
+    const react = await r.tg.waitFor(() => r.tg.of("setMessageReaction")[0])
+    assert.deepEqual(react.body.reaction, [{ type: "emoji", emoji: "✍" }])
     assert.equal(r.prompts.length, 1)
+    await sleep(100)
+    assert.equal(r.sends().length, before, "no 'queued for' line")
+    await r.done()
+  })
+
+  it("a reaction Telegram refuses falls back to the old line, so the sender still learns where it went", async () => {
+    const r = await chatRig()
+    await chatOn(r)
+    r.tg.fail("setMessageReaction", 400, { description: "REACTION_INVALID" })
+    r.tg.message(CHAT, "run it", undefined, 9001)
+    const line = await r.tg.waitFor(() =>
+      r.sends().find((b) => /→ sent to coord · shop/.test(b.text)),
+    )
+    assert.equal(line.message_thread_id, 9001)
+    await r.done()
+  })
+
+  it("a prompt that could not be sent still gets a text message", async () => {
+    const r = await chatRig({ failPrompt: true })
+    await chatOn(r)
+    r.tg.message(CHAT, "run it", undefined, 9001)
+    await r.tg.waitFor(() =>
+      r.sends().find((b) => /Could not send that to the session/.test(b.text)),
+    )
+    assert.equal(r.tg.of("setMessageReaction").length, 0)
     await r.done()
   })
 
@@ -770,17 +826,17 @@ describe("chat from Telegram: steering", () => {
     await chatOn(r)
     r.tg.message(CHAT, "plain one", undefined, 9001)
     await r.tg.waitFor(() => r.prompts[0])
-    await r.tg.waitFor(() =>
-      r.sends().find((b) => /→ queued for coord · shop/.test(b.text)),
-    )
+    await r.tg.waitFor(() => r.tg.of("setMessageReaction")[0])
     r.tg.message(CHAT, "!  change course", undefined, 9001)
     await r.tg.waitFor(() => r.prompts[1])
     assert.equal(r.prompts[1].text, "change course")
     assert.deepEqual(r.deliveries, ["queue", "steer"])
-    const ack = await r.tg.waitFor(() =>
-      r.sends().find((b) => /⚡ steered in/.test(b.text)),
+    const second = await r.tg.waitFor(() => r.tg.of("setMessageReaction")[1])
+    assert.deepEqual(
+      r.tg.of("setMessageReaction").map((c) => c.body.reaction[0].emoji),
+      ["✍", "⚡"],
     )
-    assert.equal(ack.text, "⚡ steered in · coord · shop")
+    assert.equal(second.body.message_id, r.tg.lastMessageId)
     await r.done()
   })
 
@@ -788,9 +844,8 @@ describe("chat from Telegram: steering", () => {
     const r = await chatRig({ busy: false })
     await chatOn(r)
     r.tg.message(CHAT, "!now", undefined, 9001)
-    await r.tg.waitFor(() =>
-      r.sends().find((b) => b.text === "→ sent to coord · shop"),
-    )
+    const react = await r.tg.waitFor(() => r.tg.of("setMessageReaction")[0])
+    assert.deepEqual(react.body.reaction, [{ type: "emoji", emoji: "👀" }])
     assert.deepEqual(r.deliveries, ["steer"])
     await r.done()
   })
@@ -927,6 +982,165 @@ describe("chat from Telegram: faster streaming", () => {
     })
     await r.tg.waitFor(() => gaps[0] || undefined)
     assert.equal(gaps[0], 2500)
+    await r.done()
+  })
+})
+
+const JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4])
+const PDF = new TextEncoder().encode("%PDF-1.7\n1 0 obj\n")
+
+describe("chat from Telegram: files", () => {
+  const notice = (r: Rig, re: RegExp) =>
+    r.tg.waitFor(() => r.sends().find((b) => re.test(b.text)))
+
+  it("a photo goes into the session as an inline file, its caption is the prompt", async () => {
+    const r = await chatRig()
+    await chatOn(r)
+    r.tg.file("p-big", JPEG)
+    r.tg.file("p-small", new Uint8Array([1]))
+    r.tg.media(
+      CHAT,
+      {
+        photo: [
+          { file_id: "p-small", file_size: 1, width: 10, height: 10 },
+          { file_id: "p-big", file_size: JPEG.length, width: 800, height: 600 },
+        ],
+      },
+      "what is wrong here?",
+      9001,
+    )
+    await r.tg.waitFor(() => r.prompts[0])
+    assert.equal(r.prompts[0].text, "what is wrong here?")
+    const f = r.prompts[0].files![0]
+    assert.match(f.name, /^photo-\d+\.jpg$/)
+    assert.equal(f.mime, "image/jpeg")
+    assert.equal(f.data, Buffer.from(JPEG).toString("base64"))
+    assert.deepEqual(r.tg.downloads, ["p-big"], "only the largest size")
+    const react = await r.tg.waitFor(() => r.tg.of("setMessageReaction")[0])
+    assert.deepEqual(react.body.reaction, [{ type: "emoji", emoji: "👀" }])
+    await r.done()
+  })
+
+  it("a document with no caption is announced to the session by name", async () => {
+    const r = await chatRig()
+    await chatOn(r)
+    r.tg.file("d1", PDF)
+    r.tg.media(
+      CHAT,
+      {
+        document: {
+          file_id: "d1",
+          file_name: "../../etc/spec.pdf",
+          mime_type: "application/pdf",
+          file_size: PDF.length,
+        },
+      },
+      undefined,
+      9001,
+    )
+    await r.tg.waitFor(() => r.prompts[0])
+    assert.equal(r.prompts[0].text, "Attached: spec.pdf")
+    assert.equal(r.prompts[0].files![0].mime, "application/pdf")
+    await r.done()
+  })
+
+  it("refuses a file over the limit, or of a type not allowed, before downloading it", async () => {
+    const r = await chatRig({
+      tg: { media: { maxBytes: 100, mimes: ["application/pdf"] } },
+    })
+    await chatOn(r)
+    r.tg.file("big", new Uint8Array(500))
+    r.tg.media(
+      CHAT,
+      {
+        document: {
+          file_id: "big",
+          mime_type: "application/pdf",
+          file_size: 500,
+        },
+      },
+      undefined,
+      9001,
+    )
+    await notice(r, /the limit is/)
+    r.tg.file("zip", new Uint8Array(10))
+    r.tg.media(
+      CHAT,
+      {
+        document: {
+          file_id: "zip",
+          mime_type: "application/zip",
+          file_size: 10,
+        },
+      },
+      undefined,
+      9001,
+    )
+    await notice(r, /application\/zip are not accepted/)
+    assert.deepEqual(r.tg.downloads, [])
+    assert.equal(r.prompts.length, 0)
+    await r.done()
+  })
+
+  it("does not trust a declared type: a PDF that is not one, a binary called text, a photo that is not a picture", async () => {
+    const r = await chatRig()
+    await chatOn(r)
+    r.tg.file("fake", new Uint8Array([1, 2, 3, 4]))
+    r.tg.media(
+      CHAT,
+      {
+        document: {
+          file_id: "fake",
+          mime_type: "application/pdf",
+          file_size: 4,
+        },
+      },
+      undefined,
+      9001,
+    )
+    await notice(r, /not really application\/pdf/)
+    r.tg.file("bin", new Uint8Array([104, 105, 0, 0]))
+    r.tg.media(
+      CHAT,
+      { document: { file_id: "bin", mime_type: "text/plain", file_size: 4 } },
+      undefined,
+      9001,
+    )
+    await notice(r, /not really text\/plain/)
+    r.tg.file("pic", new Uint8Array([9, 9, 9, 9]))
+    r.tg.media(
+      CHAT,
+      { photo: [{ file_id: "pic", file_size: 4 }] },
+      undefined,
+      9001,
+    )
+    await notice(r, /does not look like a picture/)
+    assert.equal(r.prompts.length, 0)
+    await r.done()
+  })
+
+  it("answers voice and video with not supported, and sends nothing to the session", async () => {
+    const r = await chatRig()
+    await chatOn(r)
+    r.tg.media(CHAT, { voice: { file_id: "v", duration: 3 } }, undefined, 9001)
+    await notice(r, /Voice and video messages are not supported/)
+    r.tg.media(CHAT, { video: { file_id: "v2", duration: 3 } }, undefined, 9001)
+    await r.tg.waitFor(
+      () => r.sends().filter((b) => /not supported/.test(b.text)).length === 2,
+    )
+    assert.equal(r.prompts.length, 0)
+    await r.done()
+  })
+
+  it("a file still needs chat to be on for the session", async () => {
+    const r = await chatRig()
+    r.router.set("root", true)
+    await r.ev("session.execution.started")
+    await r.tg.waitFor(() => r.tg.of("createForumTopic")[0])
+    r.tg.file("p", JPEG)
+    r.tg.media(CHAT, { photo: [{ file_id: "p", file_size: 8 }] }, "hi", 9001)
+    await notice(r, /Chat is off for this session/)
+    assert.equal(r.prompts.length, 0)
     await r.done()
   })
 })

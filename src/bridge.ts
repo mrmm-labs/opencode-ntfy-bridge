@@ -13,6 +13,7 @@ import type {
   Connector,
   ConnectorStatus,
   Inbound,
+  InboundFile,
   Outcome,
   Pairing,
   Push,
@@ -63,7 +64,12 @@ export interface Host {
    * waits behind a running turn. `steer` is injected into the running turn:
    * the types describe a steered prompt as part of the turn it joined.
    */
-  prompt(sessionID: string, text: string, delivery: Delivery): Promise<void>
+  prompt(
+    sessionID: string,
+    text: string,
+    delivery: Delivery,
+    files?: InboundFile[],
+  ): Promise<void>
   /** Whether a turn is running in the session. */
   busy(sessionID: string): boolean
   /** What is known of a session right now, without asking: for views that must not wait. */
@@ -314,6 +320,8 @@ export class Bridge {
     { model?: string; variant?: string; agent?: string }
   >()
   private readonly commands: Commands
+  /** What each connector was last told of a session, to show a change of watch state. */
+  private readonly lastStates = new Map<string, SessionState>()
   private readonly states = new Map<
     string,
     { state: SessionState["state"]; at: number; started?: number }
@@ -869,13 +877,44 @@ export class Bridge {
       state: next.state,
       at: next.at,
       chat: this.chat.has(r.rootID),
+      watch: this.watchOf(r.rootID),
     }
+    this.lastStates.set(r.rootID, s)
     await Promise.all(
       r.to.map((c) =>
         c.track ? this.safely(c, () => c.track!(s)) : undefined,
       ),
     )
     return next
+  }
+
+  /** How a session is watched: forced on through a channel, by the away rule, or not at all. */
+  watchOf(root: string): NonNullable<SessionState["watch"]> {
+    return {
+      mode: this.router.mode(root),
+      channel: this.channelOf(root),
+      minutes: this.cfg.away.minutes,
+    }
+  }
+
+  /**
+   * Routing or chat changed: tells the connectors that already show the session
+   * (a topic, a card). A session never shown has nothing to update.
+   */
+  async retrack(root: string): Promise<void> {
+    const last = this.lastStates.get(root)
+    if (!last) return
+    const s: SessionState = {
+      ...last,
+      chat: this.chat.has(root),
+      watch: this.watchOf(root),
+    }
+    this.lastStates.set(root, s)
+    await Promise.all(
+      this.targets(root).map((c) =>
+        c.track ? this.safely(c, () => c.track!(s)) : undefined,
+      ),
+    )
   }
 
   chatEnabled(root: string): boolean {
@@ -1352,12 +1391,14 @@ export class Bridge {
     if (
       !ch.capabilities.inboundPrompt ||
       !root ||
-      !text ||
+      (!text && !m.files?.length) ||
       this.host.root(root) !== root
     ) {
       log("inbound_ignored", { connector: ch.id, kind: m.kind })
       return undefined
     }
+    // A file with no caption still needs some text for the prompt.
+    if (!text) text = `Attached: ${m.files!.map((f) => f.name).join(", ")}`
     info.root = root
     if (!this.chat.has(root)) {
       info.outcome = "off"
@@ -1377,7 +1418,7 @@ export class Bridge {
     const delivery: Delivery =
       bang || (busy && this.delivery(root) === "steer") ? "steer" : "queue"
     try {
-      await this.host.prompt(root, text, delivery)
+      await this.host.prompt(root, text, delivery, m.files)
     } catch (err) {
       log("prompt_error", { message: (err as Error).message })
       info.outcome = "failed"
@@ -1389,6 +1430,10 @@ export class Bridge {
     return {
       ok: true,
       sent: true,
+      delivered: {
+        agent: facts?.agent,
+        how: info.outcome as "sent" | "queued" | "steered",
+      },
       text: !busy
         ? `→ sent to ${where}`
         : delivery === "steer"

@@ -77,6 +77,7 @@ export function applyRouting(
 ): void {
   app.router.set(root, mode === "auto" ? undefined : mode === "on", channel)
   saveSession(app, root)
+  void app.bridge.retrack(root)
 }
 
 /** How big the sidebar block is: the TUI choice, else the config's. */

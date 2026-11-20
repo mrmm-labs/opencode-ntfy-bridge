@@ -833,7 +833,7 @@ describe("TelegramConnector forum topics", () => {
       type: "session.execution.succeeded",
       data: { sessionID: "root" },
     })
-    assert.equal(a.tg.of("createForumTopic")[0].body.name, "shop · Fix")
+    assert.equal(a.tg.of("createForumTopic")[0].body.name, "👁 on · shop · Fix")
     await a.done()
     const b = await bridgeRig({ redact: "title" })
     b.tg.forum = true
@@ -841,7 +841,7 @@ describe("TelegramConnector forum topics", () => {
       type: "session.execution.succeeded",
       data: { sessionID: "root" },
     })
-    assert.equal(b.tg.of("createForumTopic")[0].body.name, "shop")
+    assert.equal(b.tg.of("createForumTopic")[0].body.name, "👁 on · shop")
     await b.done()
   })
 })
@@ -1172,7 +1172,7 @@ describe("Telegram: status card, rename and icons", () => {
     assert.equal(card.disable_notification, true)
     assert.match(
       card.text,
-      /^.+ 🟢 <b>Working<\/b>\n📌 Fix\n🤖 coordinator · opus\n📁 shop\n🆔 <code>123456<\/code>\n🕐 14:02$/,
+      /^.+ 🟢 <b>Working<\/b>\n📌 Fix\n🤖 coordinator · opus\n📁 shop\n🆔 <code>123456<\/code>\n💬 Chat off\n🕐 14:02$/,
     )
     const pin = r.tg.of("pinChatMessage")[0].body
     assert.deepEqual(pin, {
@@ -1285,7 +1285,7 @@ describe("Telegram: status card, rename and icons", () => {
     const first = b.tg.of("editForumTopic")
     assert.equal(first.length, 1)
     assert.equal(first[0].body.message_thread_id, 9001)
-    assert.equal(first[0].body.name, "shop · Plan the move")
+    assert.equal(first[0].body.name, "👁 on · shop · Plan the move")
 
     clock.t += 20_000
     await b.bridge.onEvent(
@@ -1298,13 +1298,61 @@ describe("Telegram: status card, rename and icons", () => {
     )
     assert.equal(
       b.tg.of("editForumTopic")[1].body.name,
-      "shop · Plan the move, v2",
+      "👁 on · shop · Plan the move, v2",
     )
     assert.match(
       b.tg.of("editMessageText").at(-1)!.body.text,
       /📌 Plan the move, v2/,
     )
     await b.done()
+  })
+
+  it("the topic and the card show how the session is watched, and follow a change within the rename gap", async () => {
+    const clock = { t: 1_000_000 }
+    const b = await bridgeRig({}, { statusCard: true, now: () => clock.t })
+    b.tg.forum = true
+    await b.bridge.onEvent(ev("session.execution.started"))
+    assert.equal(b.tg.of("createForumTopic")[0].body.name, "👁 on · shop · Fix")
+    assert.match(
+      b.tg.of("sendMessage")[0].body.text,
+      /\n👁 <b>Watched<\/b>: on\n💬 Chat off\n/,
+    )
+
+    b.router.set("root", undefined)
+    await b.bridge.retrack("root")
+    assert.equal(b.tg.of("editForumTopic").length, 1)
+    assert.equal(b.tg.of("editForumTopic")[0].body.name, "⏱ auto · shop · Fix")
+
+    clock.t += 20_000
+    b.router.set("root", false)
+    await b.bridge.retrack("root")
+    assert.equal(b.tg.of("editForumTopic").length, 1, "too soon to rename")
+    assert.match(
+      b.tg.of("editMessageText").at(-1)!.body.text,
+      /\n🔕 <b>Not watched<\/b>\n/,
+    )
+    clock.t += 41_000
+    await b.bridge.retrack("root")
+    assert.equal(b.tg.of("editForumTopic").length, 2)
+    assert.equal(b.tg.of("editForumTopic")[1].body.name, "🔕 off · shop · Fix")
+    await b.done()
+  })
+
+  it("switching a session off opens no topic for it, but a session already shown keeps its topic", async () => {
+    const r = await rig()
+    r.tg.forum = true
+    const off = { mode: "off" as const, channel: "all", minutes: 10 }
+    await r.channel.track(state({ watch: off }))
+    assert.equal(r.tg.of("createForumTopic").length, 0)
+    assert.equal(r.tg.of("sendMessage").length, 0)
+    await r.channel.track(
+      state({ watch: { ...off, mode: "on", channel: "telegram" } }),
+    )
+    assert.equal(
+      r.tg.of("createForumTopic")[0].body.name,
+      "👁 on·telegram · shop · Fix",
+    )
+    await r.done()
   })
 
   const topicBody = (r: Awaited<ReturnType<typeof rig>>) =>
