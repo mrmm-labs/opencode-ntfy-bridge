@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.1](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.13.0...v0.13.1) (2026-11-21)
+
+
+### Bug Fixes
+
+* register the RPC from every plugin instance, own the bridge per process ([#39](https://github.com/mrmm-labs/opencode-oob-bridge/issues/39)) ([a01cc9a](https://github.com/mrmm-labs/opencode-oob-bridge/commit/a01cc9ae743b9c3abdd06b2d70f6028872c0803f))
+
 ## [0.13.0](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.12.1...v0.13.0) (2026-11-21)
 
 
