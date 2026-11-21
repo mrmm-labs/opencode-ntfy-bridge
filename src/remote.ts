@@ -264,10 +264,14 @@ export function formRelay(o: {
     answer: never
   }) => Promise<void>
 }): (event: { data?: unknown }) => void {
+  // The server emits through every location of the process; a window acts once.
+  const seen = new Set<string>()
   return (event) => {
     const d = event.data
     if (!isObject(d) || d.to !== o.id) return
     const r = d as unknown as FormRelay
+    if (seen.has(r.token)) return
+    seen.add(r.token)
     void o
       .reply({
         sessionID: r.sessionID,

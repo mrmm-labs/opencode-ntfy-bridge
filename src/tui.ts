@@ -101,12 +101,11 @@ export async function setup(
   const off = [
     ctx.data.on(
       ("rpc." + RPC_ID + ".form") as never,
-      ((event: { data?: unknown }) =>
-        formRelay({
-          id: remote.id,
-          call,
-          reply: (r) => ctx.data.session.form.reply(r as never),
-        })(event)) as never,
+      formRelay({
+        id: remote.id,
+        call,
+        reply: (r) => ctx.data.session.form.reply(r as never),
+      }) as never,
     ),
   ]
 

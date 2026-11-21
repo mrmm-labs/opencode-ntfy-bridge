@@ -1,12 +1,13 @@
 import assert from "node:assert/strict"
-import { mkdtemp, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, unlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { describe, it } from "node:test"
+import { afterEach, describe, it } from "node:test"
 
 import { fakeNtfy } from "./connectors/fake-ntfy.test-util.ts"
 import { fakeServer } from "./fake-server.test-util.ts"
 import plugin from "./index.ts"
+import { formRelay } from "./remote.ts"
 import { RPC_ID, type Snapshot } from "./rpc.ts"
 import { startServer } from "./server.ts"
 
@@ -26,6 +27,12 @@ async function withEnv<T>(
       else process.env[k] = v
   }
 }
+
+// A test that fails before it stops its instances must not leave them in the process hub.
+const running: Array<() => Promise<void>> = []
+afterEach(async () => {
+  for (const stop of running.splice(0)) await stop().catch(() => {})
+})
 
 async function setup() {
   const n = await fakeNtfy()
@@ -48,6 +55,7 @@ async function setup() {
     load: async () => {
       const server = fakeServer()
       const stop = await withEnv(env, () => startServer(server.ctx))
+      if (stop) running.push(stop)
       return { server, stop }
     },
   }
@@ -96,22 +104,157 @@ describe("the server half", () => {
     await t.n.close()
   })
 
-  it("lets exactly one loader own the bridge: a second one stands by and takes over when the first stops", async () => {
+  it("two instances in one process: one poller, and both answer", async () => {
     const t = await setup()
     const a = await t.load()
     const b = await t.load()
+    // The host keeps its RPC registry per location, so each instance has to register.
     assert.equal(a.server.registrations(), 1)
-    assert.equal(b.server.registrations(), 0)
-    // The standby has nothing to stop, and stopping it leaves the owner alone.
-    await b.stop!()
+    assert.equal(b.server.registrations(), 1)
+    await t.n.waitFor(() => t.n.subscribes.length > 0)
+    const [sa, sb] = [
+      await status(a.server, "wa"),
+      await status(b.server, "wb"),
+    ]
+    assert.equal(sa.owner.pid, process.pid)
+    assert.equal(sb.owner.pid, process.pid)
+    assert.equal(sb.afk.tuis, 2, "one controller behind both")
     const c = await t.load()
-    assert.equal(c.server.registrations(), 0)
+    assert.equal((await status(c.server, "wc")).afk.tuis, 3)
+    assert.equal(
+      t.n.subscribes.length,
+      1,
+      "one subscription, not one per instance",
+    )
     await c.stop!()
-    assert.equal((await status(a.server)).owner.pid, process.pid)
+    await b.stop!()
     await a.stop!()
+    await t.n.close()
+  })
+
+  it("an instance that is not the owner still reaches the bridge, and gets form replies to relay", async () => {
+    const t = await setup()
+    const a = await t.load()
+    const b = await t.load()
+    const relayed: Array<Record<string, unknown>> = []
+    b.server.onTui("rpc.oob-bridge.form", (e) => relayed.push(e.data as never))
+    await b.server.call({
+      method: "op",
+      input: { op: "afk", args: { mode: "on" } },
+    })
+    await status(b.server, "win")
+    a.server.emit("form.created", {
+      form: {
+        id: "frm_1",
+        sessionID: "root",
+        metadata: { kind: "question" },
+        fields: [{ key: "q0", type: "string", options: [{ label: "Yes" }] }],
+      },
+    })
+    const pub = await t.n.waitFor(() => t.n.published[0])
+    await t.n.waitFor(() => t.n.subscribes.length > 0)
+    t.n.send("r1", (pub.body.actions as Array<{ body: string }>)[0].body)
+    await t.n.waitFor(() => relayed[0])
+    assert.equal(relayed[0].to, "win")
+    assert.equal(relayed[0].formID, "frm_1")
+    const done = (await b.server.call({
+      method: "formDone",
+      input: { token: relayed[0].token, ok: true },
+    })) as { output: { ok: boolean } }
+    assert.equal(done.output.ok, true)
+    await b.stop!()
+    await a.stop!()
+    await t.n.close()
+  })
+
+  it("a window acts once on a form reply the server emitted through several locations", async () => {
+    const calls: string[] = []
+    const relay = formRelay({
+      id: "w",
+      call: async (m, i) => void calls.push(m + ":" + i.ok),
+      reply: async () => void calls.push("reply"),
+    })
+    const e = {
+      data: { to: "w", token: "t1", sessionID: "s", formID: "f", answer: {} },
+    }
+    relay(e)
+    relay(e)
+    relay({ data: { ...e.data, to: "other", token: "t2" } })
+    await new Promise((r) => setTimeout(r, 20))
+    assert.deepEqual(calls, ["reply", "formDone:true"])
+  })
+
+  it("when the owner instance goes, another takes over and keeps serving", async () => {
+    const t = await setup()
+    const a = await t.load()
+    const b = await t.load()
+    await t.n.waitFor(() => t.n.subscribes.length > 0)
+    await a.stop!()
+    assert.equal(a.server.disposed(), 1)
+    await b.server.call({
+      method: "op",
+      input: { op: "afk", args: { mode: "on" } },
+    })
+    await assert.rejects(status(a.server), /unavailable/)
+    assert.equal((await status(b.server)).owner.pid, process.pid)
+    // The new owner reads the events of its own location.
+    b.server.emit("form.created", {
+      form: {
+        id: "frm_2",
+        sessionID: "root",
+        metadata: { kind: "question" },
+        fields: [{ key: "q0", type: "string", options: [{ label: "Yes" }] }],
+      },
+    })
+    await t.n.waitFor(() => t.n.published[0])
+    await t.n.waitFor(() => t.n.subscribes.length > 1)
+    await b.stop!()
+    // Nothing is left: the lock is free for the next process.
     const d = await t.load()
     assert.equal(d.server.registrations(), 1)
+    assert.equal((await status(d.server)).owner.pid, process.pid)
     await d.stop!()
+    await t.n.close()
+  })
+
+  it("another process owns the lock: every instance still answers, and the standby is logged once", async () => {
+    const t = await setup()
+    const logFile = join(t.dir, "test.log")
+    await writeFile(
+      join(t.dir, "owner.lock"),
+      JSON.stringify({ pid: process.ppid, startedAt: 1 }),
+    )
+    const env = { ...t.env, OPENCODE_OOB_BRIDGE_LOG: logFile }
+    const load = async (standbyMs?: number) => {
+      const server = fakeServer()
+      const stop = await withEnv(env, () =>
+        startServer(server.ctx, { standbyMs }),
+      )
+      return { server, stop }
+    }
+    const a = await load(40)
+    const b = await load(40)
+    const c = await load(40)
+    assert.equal(
+      a.server.registrations() +
+        b.server.registrations() +
+        c.server.registrations(),
+      3,
+    )
+    await assert.rejects(status(b.server), /another OpenCode process/)
+    await new Promise((r) => setTimeout(r, 200))
+    assert.equal(t.n.subscribes.length, 0, "no poller here")
+    const standby = (await readFile(logFile, "utf8"))
+      .split("\n")
+      .filter((l) => l.includes("server_standby"))
+    assert.equal(standby.length, 1)
+    // The other process goes away: a retry here takes the lock.
+    await unlink(join(t.dir, "owner.lock"))
+    await t.n.waitFor(() => t.n.subscribes.length > 0)
+    assert.equal((await status(c.server)).owner.pid, process.pid)
+    await c.stop!()
+    await b.stop!()
+    await a.stop!()
     await t.n.close()
   })
 
