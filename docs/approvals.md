@@ -70,7 +70,7 @@ The bridge keeps an explicit **presence mode**. It decides which path a caller t
 | `present` | The operator is at the machine | The machine first (biometric or attended prompt). No phone prompt: the bridge refuses a request with `409 needs_local` and `reason: present` |
 
 - **Switching.** `/oob afk on|off|auto` in the TUI. `auto` is the default and uses the away rule: AFK after
-  `away.minutes` without a prompt typed in any window, present again at the next typed prompt. `on` and `off`
+  `away.minutes` without a prompt typed in any window (and always when no window is attached), present again at the next typed prompt. `on` and `off`
   hold until changed. The mode is a runtime setting in `settings.json` and holds no secret.
 - **Only from the TUI.** Nothing sent from a channel and nothing on the socket can change the mode.
 - **Shown** in the sidebar and on the pinned status card of each topic.
@@ -138,23 +138,22 @@ not sending secret values: the filter is a net, not a contract.
 
 ### 4.3 Who owns the socket
 
-The first OpenCode window whose plugin starts owns the bot and the socket. Every other window is a client.
+The bridge runs once, in the OpenCode server, as a server plugin. It owns the bot and the socket. Windows
+(TUIs) own neither: each one pilots the bridge and reports its last typed input, which the away rule needs.
 
-- **Election.** An exclusive lock on `owner.lock` in the state directory. The holder binds `approvals.sock` and is
-  the only reader of the bot's updates. The other windows connect to that socket and report their last typed
-  input, which the away rule needs.
-- **Hand-over.** The lock is released when the owner exits, and by the OS if it crashes. Clients retry every two
-  seconds. The first to take the lock removes the stale socket, binds, loads the idempotency store and resumes
-  reading updates from the stored offset (kept in the state directory, so none are lost or replayed).
-- **Pending requests** at a hand-over expire with `reason_code: bridge_restart`. Callers retry with the same
+- **Election.** An exclusive lock on `owner.lock` in the state directory, held by the server-side bridge. The holder
+  binds `approvals.sock` and is the only reader of the bot's updates. A second loader of the plugin (another
+  location of the same server, or another process) finds the lock held and does nothing.
+- **Restart.** The lock is released when the server exits, and goes stale if it crashes (no heartbeat for 30 s, or
+  a dead pid). A waiting loader takes it, removes the stale socket, binds, loads the idempotency store and
+  resumes reading updates from the stored offset (kept in the state directory, so none are lost or replayed).
+  There is no hand-over between windows: closing or opening a window changes nothing for the socket.
+- **Pending requests** at a restart expire with `reason_code: bridge_restart`. Callers retry with the same
   idempotency key.
-- **Consequence: no phone approvals while OpenCode is closed.** With no window there is no owner and no socket.
-  Callers behave as in `present` and use the machine. A server without a TUI (`opencode serve`) has no plugin
-  either.
-- **Deferred.** A standalone daemon that owns the bot and socket independently of any window, for headless
-  callers, is a future option. This spec does not cover it.
-- **Not decided here.** Whether questions and pushes from the other windows also go through the owner. Approvals
-  and the away rule across windows need one owner either way.
+- **Phone approvals need only the server.** With no window open the bridge still runs, and the away rule counts the
+  operator as away. A request that needs the machine waits for a window or expires.
+- **Deferred.** A standalone daemon that owns the bot and socket independently of the OpenCode server, for
+  headless callers, is a future option. This spec does not cover it.
 
 ## 5. Flow and rules
 
@@ -362,7 +361,7 @@ good L3 path (the operator is at the screen). The endpoint is still needed becau
 
 | Step | Work | Estimate |
 | --- | --- | --- |
-| 1 | First check that the host process can call the Security framework (7.3). Then owner election, AFK mode, Keychain keys, endpoint, Telegram L1 and L2, signing, caller pairing, first caller: a local secrets tool | 1.5 days (estimate before AFK mode and owner hand-over, which add to it) |
+| 1 | First check that the host process can call the Security framework (7.3). Then owner election (server-side bridge), AFK mode, Keychain keys, endpoint, Telegram L1 and L2, signing, caller pairing, first caller: a local secrets tool | 1.5 days (estimate before AFK mode and owner election, which add to it) |
 | 2 | Command line resolver for a task-runner's blocked items, using `--via-oob` | 0.5 day |
 | 3 | A workflow engine adopts the contract for its own escalations | later |
 
