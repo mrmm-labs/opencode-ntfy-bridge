@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.12.1...v0.13.0) (2026-11-21)
+
+
+### Features
+
+* run the bridge once in the server, pilot it from the TUI ([#37](https://github.com/mrmm-labs/opencode-oob-bridge/issues/37)) ([d4ede04](https://github.com/mrmm-labs/opencode-oob-bridge/commit/d4ede04454c23cf2221db8c40a66815b955869e5))
+
 ## [0.12.1](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.12.0...v0.12.1) (2026-11-20)
 
 
