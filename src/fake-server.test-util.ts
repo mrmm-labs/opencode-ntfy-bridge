@@ -9,6 +9,16 @@ type Fn = (input: unknown) => Promise<unknown>
 
 export type FakeServer = ReturnType<typeof fakeServer>
 
+/** What the host demands of an RPC answer or event: JSON values only, so no `undefined` keys. */
+function assertJson(v: unknown, path = "$"): void {
+  if (v === undefined || typeof v === "function" || typeof v === "bigint")
+    throw new Error("Expected JSON value at " + path)
+  if (typeof v === "number" && !Number.isFinite(v))
+    throw new Error("Expected JSON value at " + path)
+  if (v && typeof v === "object")
+    for (const [k, x] of Object.entries(v)) assertJson(x, path + "." + k)
+}
+
 export function fakeServer(
   sessions: Record<string, Record<string, unknown>> = {
     root: {
@@ -83,8 +93,10 @@ export function fakeServer(
             handlers.clear()
           },
           events: {
-            emit: async (name: string, data: unknown) =>
-              tuiEvents.get("rpc.oob-bridge." + name)?.({ data }),
+            emit: async (name: string, data: unknown) => {
+              assertJson(data)
+              tuiEvents.get("rpc.oob-bridge." + name)?.({ data })
+            },
           },
         }
       },
@@ -107,7 +119,9 @@ export function fakeServer(
     call: async ({ method, input }: { method: string; input: unknown }) => {
       const h = handlers.get(method)
       if (!h) throw new Error("RPC is unavailable: oob-bridge")
-      return { output: await h(input) }
+      const output = await h(input)
+      assertJson(output)
+      return { output }
     },
     /** What a TUI's `ctx.data.on` registers for RPC events. */
     onTui(type: string, fn: (e: { data?: unknown }) => void) {
