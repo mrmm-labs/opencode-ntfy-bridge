@@ -1470,6 +1470,7 @@ export class Bridge {
       return no("This OpenCode cannot resume a session from here. " + where)
     try {
       await this.host.resume(root)
+      log("resume", { ok: true })
       return {
         ok: true,
         text: "▶ Resuming: the session is picking up its waiting messages.",

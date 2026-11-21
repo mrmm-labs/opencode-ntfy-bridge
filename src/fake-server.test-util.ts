@@ -31,6 +31,7 @@ export function fakeServer(
   const opts = { resume: true }
 
   const ctx = {
+    location: { directory: "/w/shop" },
     session: {
       get: async ({ sessionID }: { sessionID: string }) => {
         const s = sessions[sessionID]
@@ -77,7 +78,10 @@ export function fakeServer(
         registrations++
         for (const [k, v] of Object.entries(h)) handlers.set(k, v)
         return {
-          dispose: async () => void disposed++,
+          dispose: async () => {
+            disposed++
+            handlers.clear()
+          },
           events: {
             emit: async (name: string, data: unknown) =>
               tuiEvents.get("rpc.oob-bridge." + name)?.({ data }),
@@ -102,7 +106,7 @@ export function fakeServer(
     /** What a TUI's `ctx.client.rpc.call` reaches. */
     call: async ({ method, input }: { method: string; input: unknown }) => {
       const h = handlers.get(method)
-      if (!h) throw new Error("no such rpc method: " + method)
+      if (!h) throw new Error("RPC is unavailable: oob-bridge")
       return { output: await h(input) }
     },
     /** What a TUI's `ctx.data.on` registers for RPC events. */

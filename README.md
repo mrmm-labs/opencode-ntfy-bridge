@@ -24,10 +24,14 @@ logic: it pilots the server half over the plugin RPC.
 | Server | the OpenCode server    | Telegram and ntfy connectors, topics, pushes, chat, reactions, media, the pending store, settings, the away rule, the suspended-session watcher. |
 | TUI    | each attached terminal | `/oob` and the sidebar: shows the server half's state, sends it commands, reports input for the away rule, answers question forms.               |
 
-- **One owner.** The server half takes `owner.lock` in the state directory (pid and start time,
-  refreshed every 10 s; stale after 30 s or when the pid is gone). A second loader in the same or
-  another process logs `server_standby` and does nothing, so exactly one `getUpdates` consumer
-  exists. If the owner dies, a standby takes over within 15 s.
+- **One owner.** OpenCode sets the plugin up once per location of the server (a project directory
+  or workspace), all in one process, and keeps its RPC registry per location. So every instance
+  registers the RPC and answers through the one bridge of the process; the first instance runs it.
+  When that instance goes (its location closes), another takes over. The server half takes `owner.lock` in the state directory (pid and start time,
+  refreshed every 10 s; stale after 30 s or when the pid is gone). A second process
+  logs `server_standby` once and does not run a bridge, so exactly one `getUpdates` consumer exists;
+  its instances answer the RPC with an error naming the owner's pid. If the owner process dies, a
+  standby takes over within 15 s.
 - **Away is instance-wide.** The TUIs report their last input; the bridge counts as away after
   `away.minutes` without input in _any_ of them, and always when no TUI is attached. `/oob afk
 on|off|auto` overrides it for the instance.

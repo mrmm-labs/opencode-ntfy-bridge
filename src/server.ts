@@ -321,9 +321,10 @@ async function boot(
   forms: FormRelays,
   emit: (r: FormRelay & { to?: string }) => void,
   restart: () => Promise<void>,
+  dir: string,
+  instances = 1,
 ): Promise<Running> {
   const tel = new Telemetry(resolveOtel(cfg.otel))
-  const dir = dataDir()
   const settings = new SettingsStore(join(dir, "settings.json"))
   await settings.load()
   const connectors: Connector[] = Object.entries(cfg.channels).map(
@@ -423,6 +424,8 @@ async function boot(
     channels: connectors.map((c) => c.id),
     rules: cfg.rules.length,
     probe: probe !== undefined,
+    instances,
+    directory: (ctx.location as { directory?: string } | undefined)?.directory,
   })
   return {
     control,
@@ -437,58 +440,78 @@ async function boot(
   }
 }
 
-/** Starts the bridge in this server unless another loader already runs it. */
-export async function startServer(
-  ctx: Context,
-): Promise<(() => Promise<void>) | undefined> {
-  const cfg = await loadConfig()
-  if (!cfg) return undefined
-  if ("error" in cfg) {
-    log("config_error", { message: cfg.error })
-    return undefined
-  }
-  const lockFile = join(dataDir(), "owner.lock")
-  const forms = new FormRelays()
-  let running: Running | undefined
-  let reg:
-    | {
-        dispose(): Promise<void>
-        events: { emit: (...a: never[]) => Promise<void> }
-      }
-    | undefined
-  let lock: Lock | undefined
-  let stopped = false
-  let timer: ReturnType<typeof setInterval> | undefined
+type Registration = {
+  dispose(): Promise<void>
+  events: { emit: (...a: never[]) => Promise<void> }
+}
 
-  const emit = (r: FormRelay & { to?: string }) =>
-    void (
-      reg?.events.emit as unknown as (n: string, d: unknown) => Promise<void>
-    )?.("form", r).catch((err: Error) =>
-      log("form_relay_error", { message: err.message }),
+/** One plugin instance: OpenCode sets the plugin up once per location of the server, all in one process. */
+type Member = { ctx: Context; reg?: Registration }
+
+type Held = Extract<Lock, { held: true }>
+
+/**
+ * What every instance in this process shares. The RPC registry of the host is
+ * per location, so each instance registers it; one of them, the owner, runs
+ * the bridge, and every instance answers through it. The file lock only keeps
+ * a second process out.
+ */
+class Hub {
+  readonly members = new Set<Member>()
+  readonly forms = new FormRelays()
+  cfg: Config | undefined
+  /** Read once, when the first instance joins: a retry later must not look elsewhere. */
+  private dir = ""
+  private lock: Held | undefined
+  private running: Running | undefined
+  private owner: Member | undefined
+  private foreign: number | undefined
+  private timer: ReturnType<typeof setInterval> | undefined
+  private chain: Promise<unknown> = Promise.resolve()
+
+  private readonly standbyMs: number
+
+  constructor(standbyMs = STANDBY_MS) {
+    this.standbyMs = standbyMs
+  }
+
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.chain.then(fn, fn)
+    this.chain = next.catch(() => {})
+    return next
+  }
+
+  /** Asks the instances' locations to relay a form reply: only the window it names acts. */
+  readonly emit = (r: FormRelay & { to?: string }): void => {
+    for (const m of this.members)
+      void (
+        m.reg?.events.emit as unknown as
+          | ((n: string, d: unknown) => Promise<void>)
+          | undefined
+      )?.("form", r).catch((err: Error) =>
+        log("form_relay_error", { message: err.message }),
+      )
+  }
+
+  /** The controller, or why there is none. */
+  control(): Control {
+    if (this.running) return this.running.control
+    throw new Error(
+      this.foreign && this.foreign > 0
+        ? "The bridge runs in another OpenCode process (pid " +
+            this.foreign +
+            ")"
+        : "The bridge is starting",
     )
-
-  const restart = async () => {
-    if (!lock?.held) return
-    await running?.stop()
-    running = await boot(ctx, cfg, lock, forms, emit, restart)
   }
 
-  const take = async (): Promise<boolean> => {
-    const l = await acquire(lockFile)
-    if (!l.held) {
-      log("server_standby", { owner: l.owner?.pid })
-      return false
-    }
-    if (stopped) {
-      await l.release()
-      return true
-    }
-    lock = l
-    const ctl = () => {
-      if (!running) throw new Error("The bridge is restarting")
-      return running.control
-    }
-    reg = (await ctx.rpc.register(definition, {
+  async join(ctx: Context, cfg: Config): Promise<() => Promise<void>> {
+    this.cfg = cfg
+    this.dir ||= dataDir()
+    const member: Member = { ctx }
+    this.members.add(member)
+    const ctl = () => this.control()
+    member.reg = (await ctx.rpc.register(definition, {
       status: async (input: unknown) => {
         const i = (isObject(input) ? input : {}) as {
           tui?: string
@@ -516,28 +539,96 @@ export async function startServer(
           error?: string
         }
         return {
-          ok: forms.done(String(i.token ?? ""), i.ok === true, i.error),
+          ok: this.forms.done(String(i.token ?? ""), i.ok === true, i.error),
         } as never
       },
-    } as never)) as unknown as typeof reg
-    running = await boot(ctx, cfg, l, forms, emit, restart)
-    return true
+    } as never)) as unknown as Registration
+    await this.serial(() => this.elect())
+    return () => this.leave(member)
   }
 
-  if (!(await take())) {
-    timer = setInterval(() => {
-      if (stopped || running) return
-      void take().then((ok) => {
-        if (ok && timer) clearInterval(timer)
-      })
-    }, STANDBY_MS)
-    timer.unref?.()
+  private async elect(): Promise<void> {
+    const owner = [...this.members][0]
+    if (this.running || !owner || !this.cfg) return
+    if (!this.lock) {
+      const l = await acquire(join(this.dir, "owner.lock"))
+      if (!l.held) {
+        if (this.foreign !== l.owner?.pid)
+          log("server_standby", { owner: l.owner?.pid })
+        this.foreign = l.owner?.pid ?? -1
+        this.timer ??= setInterval(() => {
+          void this.serial(() => this.elect())
+        }, this.standbyMs)
+        this.timer.unref?.()
+        return
+      }
+      this.lock = l
+    }
+    this.foreign = undefined
+    if (this.timer) clearInterval(this.timer)
+    this.timer = undefined
+    this.owner = owner
+    this.running = await boot(
+      owner.ctx,
+      this.cfg,
+      this.lock,
+      this.forms,
+      this.emit,
+      () => this.restart(),
+      this.dir,
+      this.members.size,
+    )
   }
+
+  /** Restarts the bridge only: the instances and the RPC stay. */
+  private restart(): Promise<void> {
+    return this.serial(async () => {
+      await this.running?.stop()
+      this.running = undefined
+      this.owner = undefined
+      await this.elect()
+    })
+  }
+
+  private leave(member: Member): Promise<void> {
+    return this.serial(async () => {
+      if (!this.members.delete(member)) return
+      await member.reg?.dispose().catch(() => {})
+      if (this.owner === member) {
+        await this.running?.stop()
+        this.running = undefined
+        this.owner = undefined
+      }
+      if (this.members.size > 0) return this.elect()
+      if (this.timer) clearInterval(this.timer)
+      this.timer = undefined
+      this.foreign = undefined
+      this.dir = ""
+      await this.lock?.release()
+      this.lock = undefined
+    })
+  }
+}
+
+const HUB = Symbol.for("oob-bridge.hub.1")
+
+/** Joins this instance to the bridge of the process, starting it if no instance has. */
+export async function startServer(
+  ctx: Context,
+  o: { standbyMs?: number } = {},
+): Promise<(() => Promise<void>) | undefined> {
+  const cfg = await loadConfig()
+  if (!cfg) return undefined
+  if ("error" in cfg) {
+    log("config_error", { message: cfg.error })
+    return undefined
+  }
+  // On globalThis so a second copy of this module still finds the same hub.
+  const g = globalThis as unknown as { [HUB]?: Hub }
+  const hub = (g[HUB] ??= new Hub(o.standbyMs))
+  const leave = await hub.join(ctx, cfg)
   return async () => {
-    stopped = true
-    if (timer) clearInterval(timer)
-    await running?.stop()
-    await reg?.dispose().catch(() => {})
-    if (lock?.held) await lock.release()
+    await leave()
+    if (hub.members.size === 0 && g[HUB] === hub) delete g[HUB]
   }
 }
