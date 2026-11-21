@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.2](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.13.1...v0.13.2) (2026-11-21)
+
+
+### Bug Fixes
+
+* **server:** answer the RPC with JSON values only ([#41](https://github.com/mrmm-labs/opencode-oob-bridge/issues/41)) ([8b0eef8](https://github.com/mrmm-labs/opencode-oob-bridge/commit/8b0eef8199d32ace751ed1d217e37aa7b2f134f8))
+
 ## [0.13.1](https://github.com/mrmm-labs/opencode-oob-bridge/compare/v0.13.0...v0.13.1) (2026-11-21)
 
 
