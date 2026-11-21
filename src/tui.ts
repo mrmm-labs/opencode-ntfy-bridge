@@ -1,142 +1,30 @@
 /**
- * TUI entry: wires OpenCode 2 TUI events and the form reply API to the bridge,
- * and adds the `/oob` command and settings menu. Without a config file it
- * returns before touching the network.
+ * TUI entry: a pilot of the bridge that runs in the OpenCode server (see
+ * src/server.ts). It adds the `/oob` command and the sidebar, shows what the
+ * server half reports, and sends it commands. It answers the question forms
+ * the server cannot, because only a TUI has the form-reply call. Without a
+ * config file it returns before making any request.
  */
 import type { Plugin } from "@opencode/plugin/tui"
 import { join } from "node:path"
 
-import { Bridge, type BridgeEvent, type Host } from "./bridge.ts"
-import { connectorTypes } from "./connectors/index.ts"
-import type { Connector } from "./connectors/types.ts"
 import { dataDir, loadConfig } from "./config.ts"
 import { log } from "./logger.ts"
-import { commandIndex, runCommand, saveSession, type App } from "./menu.ts"
+import { commandIndex, runCommand, type App } from "./menu.ts"
+import { Remote, formRelay, type Transport } from "./remote.ts"
+import { RPC_ID } from "./rpc.ts"
+import { SettingsStore } from "./settings.ts"
 import { slashEntries } from "./subcommands.ts"
 import { registerSidebar, type SidebarView } from "./sidebar.ts"
-import { resolveOtel, Telemetry } from "./otel.ts"
-import { PendingStore } from "./pending.ts"
-import { Router } from "./routing.ts"
-import { SettingsStore } from "./settings.ts"
 
 type Context = Plugin.Context
 
-const EVENTS: BridgeEvent["type"][] = [
-  "form.created",
-  "form.replied",
-  "form.cancelled",
-  "permission.asked",
-  "permission.replied",
-  "session.inbox.enqueued",
-  "session.execution.started",
-  "session.execution.succeeded",
-  "session.execution.failed",
-  "session.execution.interrupted",
-  "session.renamed",
-  "session.model.selected",
-  "session.agent.selected",
-  "session.text.delta",
-  "session.text.ended",
-]
-
-export function host(ctx: Context): Host {
-  return {
-    async session(id) {
-      let info = ctx.data.session.get(id)
-      if (!info) {
-        try {
-          info = await ctx.client.session.get({ sessionID: id })
-        } catch {
-          return undefined
-        }
-      }
-      return {
-        id: info.id,
-        parentID: info.parentID,
-        agent: info.agent,
-        directory: info.location?.directory,
-        title: info.title,
-        model: info.model?.id,
-        modelRef: info.model
-          ? {
-              providerID: info.model.providerID,
-              id: info.model.id,
-              variant: info.model.variant,
-            }
-          : undefined,
-      }
-    },
-    root: (id) => ctx.data.session.root(id) || id,
-    peek: (id) => {
-      const info = ctx.data.session.get(id)
-      return info && { agent: info.agent, directory: info.location?.directory }
-    },
-    replyForm: (sessionID, formID, answer) =>
-      ctx.data.session.form.reply({ sessionID, formID, answer }),
-    // Queued behind a running turn, so a message sent while the agent works never interrupts a step.
-    prompt: async (sessionID, text, delivery, files) => {
-      await ctx.client.session.prompt({
-        sessionID,
-        text,
-        delivery,
-        // Inline data: the bytes travel with the prompt; no file is left on disk.
-        files: files?.map((f) => ({
-          uri: `data:${f.mime};base64,${f.data}`,
-          source: { type: "inline" as const },
-          name: f.name,
-        })),
-      })
-    },
-    busy: (id) => ctx.data.session.status(id) === "running",
-    createSession: async ({ directory, agent, model }) => {
-      const info = await ctx.client.session.create({
-        location: { directory },
-        agent,
-        model,
-      })
-      return { id: info.id }
-    },
-    switchModel: (sessionID, model) =>
-      ctx.client.session.switchModel({ sessionID, model }),
-    switchAgent: (sessionID, agent) =>
-      ctx.client.session.switchAgent({ sessionID, agent }),
-    interrupt: async (sessionID) =>
-      (await ctx.client.session.interrupt({ sessionID })).interrupted,
-    compact: async (sessionID) => {
-      await ctx.client.session.compact({ sessionID })
-    },
-    rename: (sessionID, title) =>
-      ctx.client.session.update({ sessionID, title }),
-    agents: async () => {
-      let list = ctx.data.location.agent.list()
-      if (!list) {
-        await ctx.data.location.agent.sync()
-        list = ctx.data.location.agent.list()
-      }
-      return (list ?? [])
-        .filter((a) => a.mode !== "subagent" && !a.hidden)
-        .map((a) => a.name)
-    },
-    models: async () => {
-      let list = ctx.data.location.model.list()
-      if (!list) {
-        await ctx.data.location.model.sync()
-        list = ctx.data.location.model.list()
-      }
-      return (list ?? [])
-        .filter(
-          (m) =>
-            m.enabled &&
-            m.status !== "deprecated" &&
-            (m.type === undefined || m.type === "chat"),
-        )
-        .map((m) => ({
-          ref: `${m.providerID}/${m.modelID}`,
-          name: m.name,
-          variants: m.variants.map((v) => v.id),
-        }))
-    },
-  }
+/** The route the TUI is on, as a top-level session. */
+function currentRoot(ctx: Context): string | undefined {
+  const route = ctx.ui.router.current()
+  return route.type === "session"
+    ? ctx.data.session.root(route.sessionID) || route.sessionID
+    : undefined
 }
 
 /**
@@ -185,73 +73,51 @@ export async function setup(
       return undefined
     })
 
-  // Off unless an endpoint is configured, here or in the OTLP environment variables.
-  const tel = new Telemetry(resolveOtel(cfg.otel))
+  // This window's own choices live apart from the server's settings: two writers would overwrite each other.
   const dir = dataDir()
-  const settings = new SettingsStore(join(dir, "settings.json"))
+  const settings = new SettingsStore(join(dir, "tui.json"))
   await settings.load()
-  const connectors: Connector[] = Object.entries(cfg.channels).map(
-    ([name, c]) => {
-      const connector = connectorTypes[c.type].create(
-        {
-          name,
-          dir,
-          tel,
-          settings: {
-            get: () => settings.channel(name),
-            set: (patch) => settings.set(name, patch),
-          },
-        },
-        c.options,
-      )
-      // A choice made in the TUI wins over the file.
-      connector.enabled = settings.channel(name).enabled ?? c.enabled
-      return connector
-    },
-  )
+  if (!settings.sidebar()) {
+    const old = new SettingsStore(join(dir, "settings.json"))
+    await old.load()
+    const was = old.sidebar()
+    if (was) settings.setSidebar(was)
+  }
 
-  const store = new PendingStore(join(dir, "pending.jsonl"))
-  await store.load()
-  const router = new Router(cfg)
-  for (const [id, v] of Object.entries(settings.sessions()))
-    router.set(id, v.on, v.channel)
-  const bridge = new Bridge(
-    cfg,
-    host(ctx),
-    connectors,
-    store,
-    router,
-    Date.now,
-    tel,
-  )
-  app = { router, bridge, settings }
-  for (const [id, v] of Object.entries(settings.sessions()))
-    if (v.chat) bridge.restoreChat(id)
-  for (const [id, v] of Object.entries(settings.sessions()))
-    if (v.delivery === "queue" || v.delivery === "steer")
-      bridge.restoreDelivery(id, v.delivery)
-  bridge.onChat((root) => saveSession(app!, root))
+  const call: Transport = async (method, input) =>
+    (
+      await ctx.client.rpc.call({
+        rpcID: RPC_ID,
+        method,
+        input: input as never,
+      })
+    ).output
+  const remote = new Remote({
+    call,
+    roots: () => [currentRoot(ctx)].filter((r) => r !== undefined),
+  })
+  app = { pilot: remote, settings }
 
-  const off = EVENTS.map((type) =>
+  const off = [
     ctx.data.on(
-      type,
-      (event) => void bridge.onEvent(event as unknown as BridgeEvent),
+      ("rpc." + RPC_ID + ".form") as never,
+      ((event: { data?: unknown }) =>
+        formRelay({
+          id: remote.id,
+          call,
+          reply: (r) => ctx.data.session.form.reply(r as never),
+        })(event)) as never,
     ),
-  )
+  ]
 
   void sidebar?.then((s) => s?.attach(app!))
-  bridge.start()
-  log("started", {
-    otel: tel.enabled(),
-    channels: connectors.map((c) => c.id),
-    rules: cfg.rules.length,
-  })
+  await remote.start()
+  log("tui_attached", { tui: remote.id })
   return async () => {
     for (const f of off) f()
+    remote.stop()
     ;(await sidebar)?.dispose()
-    await bridge.stop()
     await settings.flush()
-    await tel.dispose()
   }
 }
 

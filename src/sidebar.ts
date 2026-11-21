@@ -9,10 +9,19 @@ import type { Plugin } from "@opencode/plugin/tui"
 import type { Delivery, SidebarMode } from "./config.ts"
 import { applyRouting, runCommand, sidebarMode, type App } from "./menu.ts"
 import type { Pending } from "./pending.ts"
+import type { Afk } from "./settings.ts"
+import type { InstanceView } from "./view.ts"
 
 type Context = Plugin.Context
 
-export type RowId = "notify" | "chat" | "replies" | "waiting"
+export type RowId =
+  | "notify"
+  | "chat"
+  | "replies"
+  | "waiting"
+  | "away"
+  | "stuck"
+  | "bridge"
 export type Tone = "normal" | "muted" | "ok" | "warn"
 export type Part = { text: string; tone: Tone }
 export type Row = { id: RowId; label: string; value: string; tone: Tone }
@@ -50,6 +59,20 @@ export type SidebarState = {
   awayMinutes: number
   pending: PendingItem[]
   now: number
+  /** The bridge in the OpenCode server: running or not, and what it says of the instance. */
+  bridge: BridgeState
+}
+
+export type BridgeState = {
+  online: boolean
+  pid?: number
+  startedAt?: number
+  afk?: Afk
+  away?: boolean
+  windows?: number
+  /** The first enabled channel that is not connected or last failed. */
+  problem?: string
+  stuck: Array<{ id: string; title?: string; pending: number; since: number }>
 }
 
 export type Outcome = { ok: boolean; text: string }
@@ -65,11 +88,11 @@ export type DialogSpec = { title: string; options: Choice[]; current?: string }
 export const TITLE = "OOB - Remote access"
 
 export function sidebarState(app: App, root: string): SidebarState {
-  const b = app.bridge
+  const b = app.pilot
   return {
-    mode: app.router.mode(root),
+    mode: b.mode(root),
     channel: b.channelOf(root),
-    via: app.router.channel(root),
+    via: b.channel(root),
     channels: b.connectors().map((c) => c.id),
     defaultChannel: b.defaultChannel(),
     chat: b.chatEnabled(root),
@@ -81,6 +104,31 @@ export function sidebarState(app: App, root: string): SidebarState {
     awayMinutes: b.awayMinutes(),
     pending: b.openPromptList(root),
     now: Date.now(),
+    bridge: bridgeState(b.instance(), b.status().channels),
+  }
+}
+
+function bridgeState(
+  i: InstanceView | undefined,
+  channels: Array<{
+    id: string
+    enabled: boolean
+    connected?: boolean
+    lastError?: string
+  }>,
+): BridgeState {
+  if (!i?.online) return { online: false, stuck: [] }
+  return {
+    problem: channels.find(
+      (c) => c.enabled && (c.connected === false || c.lastError),
+    )?.id,
+    online: true,
+    pid: i.owner?.pid,
+    startedAt: i.owner?.startedAt,
+    afk: i.afk?.mode,
+    away: i.afk?.away,
+    windows: i.afk?.tuis,
+    stuck: i.stuck,
   }
 }
 
@@ -111,8 +159,29 @@ const waitingValue = (s: SidebarState) => {
   return `${n} ${word}${n === 1 ? "" : "s"}`
 }
 
-/** Notify, then Chat and Replies when a channel can chat, then Waiting when something waits. */
+const duration = (ms: number) => {
+  const m = Math.max(0, Math.round(ms / 60_000))
+  return m < 60
+    ? `${m}m`
+    : m < 2880
+      ? `${Math.round(m / 60)}h`
+      : `${Math.round(m / 1440)}d`
+}
+
+const afkValue = (b: BridgeState) =>
+  `${b.away ? "away" : "here"} · ${b.afk ?? "auto"}`
+
+const bridgeValue = (s: SidebarState) =>
+  s.bridge.problem
+    ? `${s.bridge.problem} error`
+    : s.bridge.online
+      ? `${s.bridge.pid}${s.bridge.startedAt !== undefined ? ` · up ${duration(s.now - s.bridge.startedAt)}` : ""}`
+      : "offline"
+
+/** Notify, then Chat and Replies when a channel can chat, Waiting when something waits, then the bridge itself. */
 export function sidebarRows(s: SidebarState): Row[] {
+  if (!s.bridge.online)
+    return [{ id: "bridge", label: "Bridge", value: "offline", tone: "warn" }]
   const rows: Row[] = [
     {
       id: "notify",
@@ -138,6 +207,25 @@ export function sidebarRows(s: SidebarState): Row[] {
       value: waitingValue(s),
       tone: "warn",
     })
+  rows.push({
+    id: "away",
+    label: "Away",
+    value: afkValue(s.bridge),
+    tone: s.bridge.away ? "warn" : "normal",
+  })
+  if (s.bridge.stuck.length > 0)
+    rows.push({
+      id: "stuck",
+      label: "Stuck",
+      value: `${s.bridge.stuck.length} suspended`,
+      tone: "warn",
+    })
+  rows.push({
+    id: "bridge",
+    label: "Bridge",
+    value: bridgeValue(s),
+    tone: s.bridge.problem ? "warn" : "muted",
+  })
   return rows
 }
 
@@ -147,7 +235,9 @@ export function compactParts(s: SidebarState): Part[] {
   const parts: Part[] = [
     { text: "OOB - Remote", tone: "muted" },
     dot,
-    { text: s.channel, tone: "normal" },
+    s.bridge.online
+      ? { text: s.channel, tone: "normal" }
+      : { text: "bridge offline", tone: "warn" },
     dot,
     { text: `notify ${notifyValue(s)}`, tone: MODE_TONE[s.mode] },
   ]
@@ -155,6 +245,10 @@ export function compactParts(s: SidebarState): Part[] {
     parts.push(dot, { text: `chat ${chatValue(s)}`, tone: chatTone(s) })
   if (s.pending.length > 0)
     parts.push(dot, { text: `${s.pending.length} waiting`, tone: "warn" })
+  if (s.bridge.online && s.bridge.away)
+    parts.push(dot, { text: "away", tone: "warn" })
+  if (s.bridge.stuck.length > 0)
+    parts.push(dot, { text: `${s.bridge.stuck.length} stuck`, tone: "warn" })
   parts.push({ text: " ▾", tone: "muted" })
   return parts
 }
@@ -246,6 +340,37 @@ export function rowDialog(s: SidebarState, row: RowId): DialogSpec {
         },
       ],
     }
+  if (row === "away")
+    return {
+      title: "When are you away?",
+      current: s.bridge.afk ?? "auto",
+      options: [
+        {
+          title: `Auto — away after ${s.awayMinutes} min without input in any window`,
+          value: "auto",
+        },
+        { title: "Away — push as if you were not here", value: "on" },
+        { title: "Here — never count as away", value: "off" },
+      ],
+    }
+  if (row === "stuck")
+    return {
+      title: "Suspended with messages waiting: pick one to resume it",
+      options: s.bridge.stuck.map((x) => ({
+        title: short(x.title ?? x.id, 60),
+        value: x.id,
+        description: `${x.pending} waiting, ${age(s.now - x.since)}`,
+      })),
+    }
+  if (row === "bridge")
+    return {
+      title: s.bridge.online
+        ? `The bridge runs in the OpenCode server (pid ${s.bridge.pid})`
+        : "The bridge is not running in the OpenCode server",
+      options: s.bridge.online
+        ? [{ title: "Restart the bridge (not the server)", value: "restart" }]
+        : [],
+    }
   return {
     title: "Open questions: pick one to go to its session",
     options: s.pending.map((p) => ({
@@ -264,7 +389,7 @@ export async function applyPick(
   value: string,
   go: (sessionID: string) => boolean,
 ): Promise<Outcome> {
-  const b = app.bridge
+  const b = app.pilot
   if (row === "notify") {
     const [mode, channel] = value.split(":") as [string, string | undefined]
     if (mode !== "on" && mode !== "off" && mode !== "auto")
@@ -275,7 +400,8 @@ export async function applyPick(
       !b.connectors().some((c) => c.id === channel)
     )
       return { ok: false, text: `No channel "${channel}".` }
-    applyRouting(app, root, mode, channel)
+    const out = await applyRouting(app, root, mode, channel)
+    if (!out.ok) return out
     return {
       ok: true,
       text:
@@ -294,9 +420,23 @@ export async function applyPick(
   if (row === "replies") {
     if (value !== "queue" && value !== "steer" && value !== "default")
       return { ok: false, text: "Unknown choice." }
-    b.setDelivery(root, value === "default" ? undefined : value)
+    const out = await b.setDelivery(
+      root,
+      value === "default" ? undefined : value,
+    )
+    if (!out.ok) return out
     return { ok: true, text: `Replies: ${repliesValue(b.delivery(root))}` }
   }
+  if (row === "away") {
+    if (value !== "auto" && value !== "on" && value !== "off")
+      return { ok: false, text: "Unknown choice." }
+    return b.setAfk(value)
+  }
+  if (row === "stuck") return b.resume(value)
+  if (row === "bridge")
+    return value === "restart"
+      ? b.restart()
+      : { ok: false, text: "Unknown choice." }
   const p = b.openPromptList(root).find((x) => x.id === value)
   if (!p) return { ok: false, text: "That prompt is no longer open." }
   return go(p.sessionID)
@@ -407,7 +547,7 @@ export function registerSidebar(
     attach(next) {
       off?.()
       app = next
-      off = next.bridge.subscribe(emit)
+      off = next.pilot.subscribe(emit)
       emit()
     },
     dispose() {

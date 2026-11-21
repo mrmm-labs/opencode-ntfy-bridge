@@ -1,12 +1,10 @@
 /** What the `/oob` sub-commands do; which ones there are is in `buildCommands`. */
 import type { Plugin } from "@opencode/plugin/tui"
 
-import type { Bridge } from "./bridge.ts"
 import type { Delivery, SidebarMode } from "./config.ts"
-import type { Connector } from "./connectors/types.ts"
 import { renderQr } from "./qr.ts"
-import type { Router } from "./routing.ts"
-import type { SettingsStore } from "./settings.ts"
+import type { Afk, SettingsStore } from "./settings.ts"
+import type { ChannelView, Outcome, Pilot } from "./view.ts"
 import { rowDialog, sidebarState, TITLE } from "./sidebar.ts"
 import {
   dispatch,
@@ -20,17 +18,17 @@ import {
 type Context = Plugin.Context
 
 export type App = {
-  router: Router
-  bridge: Bridge
-  settings: SettingsStore
+  pilot: Pilot
+  /** This window's own choices (the sidebar size). */
+  settings: Pick<SettingsStore, "sidebar" | "setSidebar">
 }
 
 /** Connectors that can bind to a chat. */
 const pairable = (app: App) =>
-  app.bridge.connectors().filter((c) => c.capabilities.pairing && c.pair)
+  app.pilot.connectors().filter((c) => c.capabilities.pairing && c.pair)
 
 const find = (app: App, name: string) =>
-  app.bridge.connectors().find((c) => c.id.toLowerCase() === name.toLowerCase())
+  app.pilot.connectors().find((c) => c.id.toLowerCase() === name.toLowerCase())
 
 const toast = (
   ctx: Context,
@@ -53,7 +51,7 @@ function setRouting(
 ) {
   const root = sessionRoot(ctx)
   if (!root) return toast(ctx, "Open a session first", "warning")
-  const ids = app.bridge.connectors().map((c) => c.id)
+  const ids = app.pilot.connectors().map((c) => c.id)
   if (channel !== undefined && channel !== "all") {
     const c = find(app, channel)
     if (!c)
@@ -64,8 +62,13 @@ function setRouting(
       )
     channel = c.id
   }
-  applyRouting(app, root, mode, channel)
-  toast(ctx, `oob routing: ${describe(app, root)}`)
+  return applyRouting(app, root, mode, channel).then((out) =>
+    toast(
+      ctx,
+      out.ok ? `oob routing: ${describe(app, root)}` : out.text,
+      out.ok ? "info" : "warning",
+    ),
+  )
 }
 
 /** Sets the routing of a session and keeps it. */
@@ -74,62 +77,42 @@ export function applyRouting(
   root: string,
   mode: "on" | "off" | "auto",
   channel?: string,
-): void {
-  app.router.set(root, mode === "auto" ? undefined : mode === "on", channel)
-  saveSession(app, root)
-  void app.bridge.retrack(root)
+): Promise<Outcome> {
+  return app.pilot.route(root, mode, channel)
 }
 
 /** How big the sidebar block is: the TUI choice, else the config's. */
 export function sidebarMode(app: App): SidebarMode {
-  return app.settings.sidebar() ?? app.bridge.defaultSidebar()
+  return app.settings.sidebar() ?? app.pilot.defaultSidebar()
 }
 
 export function setSidebarMode(app: App, mode: SidebarMode): void {
   app.settings.setSidebar(mode)
-  app.bridge.notify()
+  app.pilot.notify()
 }
 
-/** Keeps a session's routing and chat choices across restarts. */
-export function saveSession(app: App, root: string): void {
-  const mode = app.router.mode(root)
-  const chat = app.bridge.chatEnabled(root)
-  const delivery = app.bridge.deliveryOverride(root)
-  app.settings.setSession(
-    root,
-    mode === "auto" && !chat && !delivery
-      ? undefined
-      : {
-          on: mode === "auto" ? undefined : mode === "on",
-          channel: app.router.channel(root),
-          chat: chat || undefined,
-          delivery,
-        },
-  )
-  app.bridge.notify()
-}
-
-function setDelivery(ctx: Context, app: App, d: Delivery | undefined) {
+async function setDelivery(ctx: Context, app: App, d: Delivery | undefined) {
   const root = sessionRoot(ctx)
   if (!root) return toast(ctx, "Open a session first", "warning")
-  app.bridge.setDelivery(root, d)
-  toast(ctx, `Delivery for this session: ${app.bridge.delivery(root)}`)
+  const out = await app.pilot.setDelivery(root, d)
+  if (!out.ok) return toast(ctx, out.text, "warning")
+  toast(ctx, `Delivery for this session: ${app.pilot.delivery(root)}`)
 }
 
 async function setChat(ctx: Context, app: App, on: boolean): Promise<void> {
   const root = sessionRoot(ctx)
   if (!root) return toast(ctx, "Open a session first", "warning")
-  const out = await app.bridge.setChat(root, on)
+  const out = await app.pilot.setChat(root, on)
   toast(ctx, out.text, out.ok ? "success" : "warning")
 }
 
 const describe = (app: App, root: string) => {
-  const via = app.router.channel(root)
+  const via = app.pilot.channel(root)
   const base =
-    app.router.mode(root) === "on" && via
+    app.pilot.mode(root) === "on" && via
       ? `on via ${via}`
-      : app.router.mode(root)
-  return app.bridge.chatEnabled(root) ? `${base}, chat on` : base
+      : app.pilot.mode(root)
+  return app.pilot.chatEnabled(root) ? `${base}, chat on` : base
 }
 
 const SESSION = "Open a session first"
@@ -145,7 +128,7 @@ export function buildCommands(ctx: Context, app: App): SubCommand[] {
   const root = () => sessionRoot(ctx)!
   const dialog = (row: "chat" | "replies") => () =>
     rowDialog(sidebarState(app, root()), row)
-  const channelIds = () => app.bridge.connectors().map((c) => c.id)
+  const channelIds = () => app.pilot.connectors().map((c) => c.id)
   const cmds: SubCommand[] = [
     sub({
       name: "on",
@@ -178,7 +161,7 @@ export function buildCommands(ctx: Context, app: App): SubCommand[] {
                 ]
               : []),
           ],
-          current: () => app.router.channel(root()),
+          current: () => app.pilot.channel(root()),
         },
       ],
       run: (v) => setRouting(ctx, app, "on", v.channel),
@@ -256,7 +239,7 @@ export function buildCommands(ctx: Context, app: App): SubCommand[] {
           title: "Which channel?",
           placeholder: "channel",
           options: () =>
-            app.bridge.status().channels.map((c) => ({
+            app.pilot.status().channels.map((c) => ({
               value: c.id,
               title: c.id,
               description: c.enabled ? "on" : "off",
@@ -269,16 +252,18 @@ export function buildCommands(ctx: Context, app: App): SubCommand[] {
           placeholder: "on|off",
           options: () => onOff(),
           current: (g) =>
-            app.bridge.status().channels.find((c) => c.id === g.name)?.enabled
+            app.pilot.status().channels.find((c) => c.id === g.name)?.enabled
               ? "on"
               : "off",
         },
       ],
-      run: (v) => {
-        const enabled = v.state === "on"
-        app.bridge.setEnabled(v.name!, enabled)
-        app.settings.set(v.name!, { enabled })
-        toast(ctx, `${v.name}: ${v.state}`)
+      run: async (v) => {
+        const out = await app.pilot.setEnabled(v.name!, v.state === "on")
+        toast(
+          ctx,
+          out.ok ? `${v.name}: ${v.state}` : out.text,
+          out.ok ? "info" : "warning",
+        )
       },
     }),
     sub({
@@ -347,10 +332,133 @@ export function buildCommands(ctx: Context, app: App): SubCommand[] {
       },
     }),
     sub({
+      name: "afk",
+      title: "Away: any window",
+      description:
+        "When you count as away, for the whole OpenCode instance: on, off, or auto after the away time without input in any window.",
+      group: "Instance",
+      args: [
+        {
+          name: "state",
+          kind: "enum",
+          title: "Count me as away",
+          placeholder: "on|off|auto",
+          options: () => [
+            {
+              value: "auto",
+              title: "Auto",
+              description: `after ${app.pilot.awayMinutes()} min without input in any window`,
+            },
+            { value: "on", title: "On", description: "away now: push" },
+            { value: "off", title: "Off", description: "here: never away" },
+          ],
+          current: () => app.pilot.instance()?.afk?.mode,
+        },
+      ],
+      run: async (v) => {
+        const out = await app.pilot.setAfk(v.state as Afk)
+        toast(
+          ctx,
+          out.ok ? `Away: ${v.state}` : out.text,
+          out.ok ? "success" : "warning",
+        )
+      },
+    }),
+    sub({
+      name: "session",
+      title: "Another session",
+      description:
+        "Notify and chat settings of any session of this instance: on, off, auto, chat or chat-off.",
+      group: "Instance",
+      args: [
+        {
+          name: "id",
+          kind: "enum",
+          title: "Which session?",
+          placeholder: "session",
+          options: () =>
+            (app.pilot.instance()?.sessions ?? []).map((s) => ({
+              value: s.id,
+              title: s.name ?? s.title ?? s.id,
+              description: `${s.mode}${s.chat ? ", chat on" : ""}${s.busy ? ", working" : ""}`,
+            })),
+        },
+        {
+          name: "action",
+          kind: "enum",
+          title: "Do what?",
+          placeholder: "on|off|auto|chat|chat-off",
+          options: () => [
+            { value: "on", title: "Notify: on" },
+            { value: "off", title: "Notify: off" },
+            { value: "auto", title: "Notify: when away" },
+            { value: "chat", title: "Chat: on" },
+            { value: "chat-off", title: "Chat: off" },
+          ],
+          current: (g) => {
+            const s = app.pilot.instance()?.sessions.find((x) => x.id === g.id)
+            return s?.mode
+          },
+        },
+      ],
+      run: async (v) => {
+        const id = v.id!
+        const out =
+          v.action === "chat" || v.action === "chat-off"
+            ? await app.pilot.setChat(id, v.action === "chat")
+            : await app.pilot.route(id, v.action as "on" | "off" | "auto")
+        toast(
+          ctx,
+          out.text || `${v.action}: done`,
+          out.ok ? "success" : "warning",
+        )
+      },
+    }),
+    sub({
+      name: "resume",
+      title: "Resume a session",
+      description:
+        "Wake a session that is suspended with messages waiting in its inbox.",
+      group: "Instance",
+      unavailable: () =>
+        (app.pilot.instance()?.stuck.length ?? 0) === 0
+          ? "No session is suspended with messages waiting"
+          : undefined,
+      args: [
+        {
+          name: "id",
+          kind: "enum",
+          title: "Resume which session?",
+          placeholder: "session",
+          options: () =>
+            (app.pilot.instance()?.stuck ?? []).map((s) => ({
+              value: s.id,
+              title: s.title ?? s.id,
+              description: `${s.pending} waiting`,
+            })),
+        },
+      ],
+      run: async (v) => {
+        const out = await app.pilot.resume(v.id!)
+        toast(ctx, out.text || "Resumed", out.ok ? "success" : "warning")
+      },
+    }),
+    sub({
+      name: "restart",
+      title: "Restart the bridge",
+      description:
+        "Restart the bridge in the OpenCode server: channels reconnect. The server keeps running.",
+      group: "Instance",
+      run: async () => {
+        const out = await app.pilot.restart()
+        toast(ctx, out.text || "Done", out.ok ? "success" : "warning")
+      },
+    }),
+    sub({
       name: "status",
       title: "Status",
       description:
-        "Show each channel's connection, the open prompts and this session's settings.",
+        "Show the bridge, who counts as away, each channel, the open prompts and this session's settings.",
       group: "Plugin",
       run: () => status(ctx, app),
     }),
@@ -393,12 +501,12 @@ export async function runCommand(
       "oob bridge is not configured or still starting",
       "warning",
     )
-  app.router.touch()
+  app.pilot.touch()
   await dispatch(uiOf(ctx), TITLE, buildCommands(ctx, app), input)
 }
 
 async function test(ctx: Context, app: App): Promise<void> {
-  const results = await app.bridge.test()
+  const results = await app.pilot.test()
   if (results.length === 0)
     return toast(ctx, "No channel is enabled", "warning")
   toast(
@@ -408,22 +516,62 @@ async function test(ctx: Context, app: App): Promise<void> {
   )
 }
 
-async function status(ctx: Context, app: App): Promise<void> {
-  const st = app.bridge.status()
-  const root = sessionRoot(ctx)
-  const lines = st.channels.map((c) => {
-    const state = !c.enabled
-      ? "off"
-      : c.connected === undefined
-        ? "on"
-        : c.connected
-          ? "on, connected"
-          : "on, not connected"
+const ago = (ms: number) => {
+  const m = Math.max(0, Math.round(ms / 60_000))
+  return m < 1
+    ? "just now"
+    : m < 60
+      ? `${m} min ago`
+      : `${Math.round(m / 60)} h ago`
+}
+
+function instanceLines(app: App): string[] {
+  const i = app.pilot.instance()
+  if (!i?.online)
     return [
-      `${c.id}: ${state}${c.lastError ? ` (last error: ${c.lastError})` : ""}`,
-      ...(c.warning ? [`  ⚠ ${c.warning}`] : []),
-    ].join("\n")
-  })
+      "Bridge: not running in the OpenCode server (is the plugin installed for the server, and oob-bridge.jsonc valid?)",
+    ]
+  const o = i.owner
+  const lines = [
+    `Bridge: running in the server, pid ${o?.pid}, v${o?.version}, up ${o ? ago(Date.now() - o.startedAt).replace(" ago", "") : "?"}`,
+  ]
+  if (i.afk)
+    lines.push(
+      `Away: ${i.afk.away ? "away" : "here"} (${i.afk.mode}), ${i.afk.tuis} window${i.afk.tuis === 1 ? "" : "s"}, last input ${ago(Date.now() - i.afk.lastInputAt)}`,
+    )
+  for (const s of i.stuck)
+    lines.push(
+      `Suspended: ${s.title ?? s.id} (${s.pending} waiting, ${ago(Date.now() - s.since)})`,
+    )
+  const watched = i.sessions.filter((s) => s.mode !== "auto" || s.chat)
+  if (watched.length > 0)
+    lines.push(
+      `Sessions: ${watched.map((s) => `${s.name ?? s.title ?? s.id} (${s.mode}${s.chat ? ", chat" : ""})`).join(", ")}`,
+    )
+  return lines
+}
+
+async function status(ctx: Context, app: App): Promise<void> {
+  await app.pilot.refresh()
+  const st = app.pilot.status()
+  const root = sessionRoot(ctx)
+  const lines = instanceLines(app)
+  lines.push("")
+  lines.push(
+    ...st.channels.map((c) => {
+      const state = !c.enabled
+        ? "off"
+        : c.connected === undefined
+          ? "on"
+          : c.connected
+            ? "on, connected"
+            : "on, not connected"
+      return [
+        `${c.id}: ${state}${c.lastError ? ` (last error: ${c.lastError})` : ""}`,
+        ...(c.warning ? [`  ⚠ ${c.warning}`] : []),
+      ].join("\n")
+    }),
+  )
   lines.push(`Open prompts: ${st.pending}`)
   if (root) lines.push(`This session: ${describe(app, root)}`)
   await ctx.ui.dialog.alert({
@@ -436,7 +584,7 @@ async function status(ctx: Context, app: App): Promise<void> {
 async function pair(
   ctx: Context,
   app: App,
-  c: Connector | undefined,
+  c: ChannelView | undefined,
 ): Promise<Promise<void> | undefined> {
   if (!c?.capabilities.pairing || !c.pair)
     return void toast(
@@ -446,11 +594,7 @@ async function pair(
         : "No channel can be paired: add one that supports it to the config file",
       "warning",
     )
-  if (!c.enabled) {
-    app.bridge.setEnabled(c.id, true)
-    app.settings.set(c.id, { enabled: true })
-  }
-  const p = await app.bridge.pair(c)
+  const p = await app.pilot.pair(c.id)
   if (!p)
     return void toast(ctx, `${c.id}: pairing failed, see the log`, "error")
   const lines = [`Pair ${c.id} with OpenCode.`]

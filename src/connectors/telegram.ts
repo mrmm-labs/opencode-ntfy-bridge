@@ -431,7 +431,18 @@ export class TelegramConnector implements Connector {
                       one.custom,
                       new Set(),
                     )
-                  : undefined,
+                  : push.action
+                    ? {
+                        inline_keyboard: [
+                          [
+                            {
+                              text: push.action.label,
+                              callback_data: "ctl:" + push.action.control,
+                            },
+                          ],
+                        ],
+                      }
+                    : undefined,
             },
             undefined,
             undefined,
@@ -1299,6 +1310,19 @@ export class TelegramConnector implements Connector {
         time: Math.floor(Date.now() / 1000),
         sessionKey,
         text: "chat off",
+        from: { connector: this.id, chat: String(cb.message.chat.id) },
+        inline: true,
+      })
+    }
+    if (cb.data === "ctl:resume") {
+      const sessionKey = await this.sessionAt(cb.message.message_thread_id)
+      if (!sessionKey) return this.toast(cb.id, "Unknown session.")
+      return this.answer(cb.id, {
+        kind: "control",
+        id: "cb" + cb.id,
+        time: Math.floor(Date.now() / 1000),
+        sessionKey,
+        text: "resume",
         from: { connector: this.id, chat: String(cb.message.chat.id) },
         inline: true,
       })
