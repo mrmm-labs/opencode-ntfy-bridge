@@ -17,7 +17,10 @@ export type SessionSetting = {
   /** How prompts from a chat reach the session, when it differs from `chat.delivery`. */
   delivery?: "queue" | "steer"
 }
+export type Afk = "auto" | "on" | "off"
 export type Settings = {
+  /** The away override chosen with `/oob afk`. */
+  afk?: Afk
   /** The sidebar block's size, when chosen in the TUI. */
   sidebar?: SidebarMode
   channels?: Record<string, ConnectorSettings>
@@ -56,6 +59,16 @@ export class SettingsStore {
         [id]: { ...this.channel(id), ...patch },
       },
     }
+    this.save()
+  }
+
+  afk(): Afk {
+    const v = this.data.afk
+    return v === "on" || v === "off" ? v : "auto"
+  }
+
+  setAfk(mode: Afk): void {
+    this.data = { ...this.data, afk: mode === "auto" ? undefined : mode }
     this.save()
   }
 

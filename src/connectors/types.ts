@@ -109,6 +109,8 @@ export type Push = {
   prompt?: { id: string; questions: Question[] }
   /** Set only for connectors with `rich`. */
   card?: Card
+  /** One button of the connector's own (`control` comes back as an inbound of kind `control`). Only for connectors with `buttons`. */
+  action?: { label: string; control: string }
   /** The connector may record transport facts here; it is never shown to anyone. */
   stats?: SendStats
 }

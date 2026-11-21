@@ -5,6 +5,8 @@ import { join } from "node:path"
 import { after, before, describe, it } from "node:test"
 
 import { fakeNtfy } from "./connectors/fake-ntfy.test-util.ts"
+import { fakeServer, type FakeServer } from "./fake-server.test-util.ts"
+import { startServer } from "./server.ts"
 import { fakeTelegram } from "./connectors/fake-telegram.test-util.ts"
 import type { SidebarView } from "./sidebar.ts"
 import { commandIndex } from "./menu.ts"
@@ -13,9 +15,12 @@ import plugin, { setup } from "./tui.ts"
 type Handler = (e: unknown) => void
 
 // One entry per sub-command, besides /oob itself.
-const SUBS = 11
+const SUBS = 15
 
-function fakeCtx(size?: { width: number; height: number }) {
+function fakeCtx(
+  size?: { width: number; height: number },
+  server?: FakeServer,
+) {
   const handlers = new Map<string, Handler>()
   const replies: unknown[] = []
   const toasts: string[] = []
@@ -64,7 +69,11 @@ function fakeCtx(size?: { width: number; height: number }) {
     data: {
       on: (type: string, h: Handler) => {
         handlers.set(type, h)
-        return () => handlers.delete(type)
+        const off = type.startsWith("rpc.") ? server?.onTui(type, h) : undefined
+        return () => {
+          off?.()
+          handlers.delete(type)
+        }
       },
       session: {
         get: (id: string) => sessions[id],
@@ -77,7 +86,13 @@ function fakeCtx(size?: { width: number; height: number }) {
       },
     },
     renderer: size,
-    client: { session: { get: async () => undefined } },
+    client: {
+      session: { get: async () => undefined },
+      rpc: {
+        call: (i: { method: string; input: unknown }) =>
+          server ? server.call(i) : Promise.reject(new Error("no server")),
+      },
+    },
     keymap: {
       layer: (f: () => { mode?: string; commands: typeof commands }) => {
         const l = f()
@@ -127,6 +142,16 @@ function fakeCtx(size?: { width: number; height: number }) {
     cleared: () => cleared,
   }
 }
+
+/** Starts the server half in a fake server, as the OpenCode server would load it. */
+async function serve(env: Record<string, string>) {
+  const server = fakeServer()
+  const stop = await withEnv(env, () => startServer(server.ctx))
+  return { server, stop }
+}
+
+const fire = (server: FakeServer, e: { type: string; data: unknown }) =>
+  server.emit(e.type, e.data)
 
 async function withEnv<T>(
   vars: Record<string, string>,
@@ -202,24 +227,23 @@ describe("TUI entry", () => {
         token: { env: "NTFYB_T" },
       }),
     )
-    const f = fakeCtx()
-    const cleanup = await withEnv(
-      {
-        OPENCODE_OOB_BRIDGE_CONFIG: cfg,
-        OPENCODE_OOB_BRIDGE_DATA: dir,
-        NTFYB_T: "tk_test_token_abcdefghijklmnop",
-      },
-      () => setup(f.ctx),
-    )
+    const env = {
+      OPENCODE_OOB_BRIDGE_CONFIG: cfg,
+      OPENCODE_OOB_BRIDGE_DATA: dir,
+      NTFYB_T: "tk_test_token_abcdefghijklmnop",
+    }
+    const { server, stop } = await serve(env)
+    const f = fakeCtx(undefined, server)
+    const cleanup = await withEnv(env, () => setup(f.ctx))
     assert.ok(cleanup)
-    assert.ok(f.handlers.has("form.created"))
+    assert.ok(f.handlers.has("rpc.oob-bridge.form"))
     const cmd = f.commands.find((c) => c.slash?.name === "oob")!
     await cmd.run("on")
     assert.equal(f.toasts.at(-1), "oob routing: on")
     await cmd.run("bogus")
     assert.match(f.toasts.at(-1)!, /No sub-command "bogus"/)
 
-    f.handlers.get("form.created")!({
+    fire(server, {
       type: "form.created",
       data: {
         form: {
@@ -252,6 +276,7 @@ describe("TUI entry", () => {
     })
 
     await cleanup()
+    await stop!()
     assert.equal(f.handlers.size, 0)
     await n.close()
   })
@@ -284,17 +309,20 @@ describe("/oob menu and channels", () => {
     dir ??= await mkdtemp(join(tmpdir(), "oobb-menu-"))
     const cfg = join(dir, "c.jsonc")
     await writeFile(cfg, JSON.stringify({ channels, ...extra }))
-    const f = fakeCtx(size)
-    const cleanup = await withEnv(
-      {
-        OPENCODE_OOB_BRIDGE_CONFIG: cfg,
-        OPENCODE_OOB_BRIDGE_DATA: dir,
-      },
-      () => setup(f.ctx, loadView),
-    )
-    assert.ok(cleanup)
+    const env = {
+      OPENCODE_OOB_BRIDGE_CONFIG: cfg,
+      OPENCODE_OOB_BRIDGE_DATA: dir,
+    }
+    const { server, stop } = await serve(env)
+    const f = fakeCtx(size, server)
+    const tui = await withEnv(env, () => setup(f.ctx, loadView))
+    assert.ok(tui)
     const cmd = f.commands.find((c) => c.slash?.name === "oob")!
-    return { f, dir, cmd, cleanup }
+    const cleanup = async () => {
+      await tui()
+      await stop!()
+    }
+    return { f, dir, cmd, cleanup, server }
   }
 
   it("registers /oob (alias ntfy, in the palette) and one /oob-<sub> per sub-command, synchronously", async () => {
@@ -330,6 +358,10 @@ describe("/oob menu and channels", () => {
         "oob-pair",
         "oob-test",
         "oob-sidebar",
+        "oob-afk",
+        "oob-session",
+        "oob-resume",
+        "oob-restart",
         "oob-status",
         "oob-help",
       ],
@@ -396,6 +428,10 @@ describe("/oob menu and channels", () => {
         "pair",
         "test",
         "sidebar",
+        "afk",
+        "session",
+        "resume",
+        "restart",
         "status",
         "help",
       ],
@@ -405,7 +441,7 @@ describe("/oob menu and channels", () => {
     assert.equal(delivery.category, "This session")
     assert.ok(delivery.description)
     assert.deepEqual(
-      m.search!("stat", m.options!).map((o) => o.value),
+      m.search!("statu", m.options!).map((o) => o.value),
       ["status"],
     )
 
@@ -497,19 +533,22 @@ describe("/oob menu and channels", () => {
         channels: { ntfy: { server: n2.url, topics: { out: "o", in: "i" } } },
       }),
     )
-    const f2 = fakeCtx()
-    const cleanup2 = await withEnv(
-      {
-        OPENCODE_OOB_BRIDGE_CONFIG: join(dir, "c.jsonc"),
-        OPENCODE_OOB_BRIDGE_DATA: dir,
-      },
-      () => setup(f2.ctx),
-    )
+    const env2 = {
+      OPENCODE_OOB_BRIDGE_CONFIG: join(dir, "c.jsonc"),
+      OPENCODE_OOB_BRIDGE_DATA: dir,
+    }
+    const s2 = await serve(env2)
+    const f2 = fakeCtx(undefined, s2.server)
+    const tui2 = await withEnv(env2, () => setup(f2.ctx))
+    const cleanup2 = async () => {
+      await tui2!()
+      await s2.stop!()
+    }
     await new Promise((r) => setTimeout(r, 100))
     assert.equal(n2.subscribes.length, 0)
     await f2.commands.find((c) => c.slash?.name === "oob")!.run("test")
     assert.equal(f2.toasts.at(-1), "No channel is enabled")
-    await cleanup2!()
+    await cleanup2()
     await n2.close()
   })
 
@@ -568,13 +607,13 @@ describe("/oob menu and channels", () => {
       join(dir, "settings.json"),
       JSON.stringify({ sessions: { root: { on: true } } }),
     )
-    const { f, cmd, cleanup } = await started(
+    const { f, cmd, cleanup, server } = await started(
       { telegram: { token: { env: "OOBB_TG" }, chatId: 7, apiBase: tg.url } },
       {},
       undefined,
       dir,
     )
-    f.handlers.get("session.execution.started")!({
+    fire(server, {
       type: "session.execution.started",
       data: { sessionID: "root" },
     })
@@ -644,11 +683,17 @@ describe("/oob menu and channels", () => {
         ? m.rows.map((r) => `${r.label}: ${r.value}`)
         : []
     }
-    assert.deepEqual(rows(), [
+    assert.deepEqual(rows().slice(0, 3), [
       "Notify: when away",
       "Chat: off",
       "Replies: after turn",
     ])
+    assert.deepEqual(
+      rows()
+        .slice(3)
+        .map((r) => r.split(":")[0]),
+      ["Away", "Bridge"],
+    )
     // A change made from the command shows without a new render.
     let changes = 0
     seen[0].subscribe(() => changes++)
@@ -821,7 +866,7 @@ describe("/oob menu and channels", () => {
       ntfy: { server: n.url, topics: { out: "o", in: "i" } },
       telegram: { token: { env: "OOBB_TG" }, chatId: 7, apiBase: tg.url },
     }
-    const { f, dir, cmd, cleanup } = await started(channels)
+    const { f, dir, cmd, cleanup, server } = await started(channels)
     await cmd.run("on telegram")
     assert.equal(f.toasts.at(-1), "oob routing: on via telegram")
     await cmd.run("on bogus")
@@ -833,7 +878,7 @@ describe("/oob menu and channels", () => {
     assert.match(f.toasts.at(-1)!, /Usage/)
 
     // The session now asks: only Telegram hears it.
-    f.handlers.get("form.created")!({
+    fire(server, {
       type: "form.created",
       data: {
         form: {

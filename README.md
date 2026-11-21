@@ -13,6 +13,40 @@ Renamed from `opencode-ntfy-bridge` in 0.4.0, because ntfy is no longer the only
 config file (`ntfy-bridge.jsonc`), state directory and `OPENCODE_NTFY_BRIDGE_*`
 variables are still read when the new ones are absent.
 
+## How it runs
+
+The bridge runs **once, in the OpenCode server**, as a server plugin (`index.js`). It sees every
+session of the instance, with no TUI, one or several attached. The TUI (`tui.tsx`) holds no bridge
+logic: it pilots the server half over the plugin RPC.
+
+| Half   | Where                  | Does                                                                                                                                             |
+| ------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Server | the OpenCode server    | Telegram and ntfy connectors, topics, pushes, chat, reactions, media, the pending store, settings, the away rule, the suspended-session watcher. |
+| TUI    | each attached terminal | `/oob` and the sidebar: shows the server half's state, sends it commands, reports input for the away rule, answers question forms.               |
+
+- **One owner.** The server half takes `owner.lock` in the state directory (pid and start time,
+  refreshed every 10 s; stale after 30 s or when the pid is gone). A second loader in the same or
+  another process logs `server_standby` and does nothing, so exactly one `getUpdates` consumer
+  exists. If the owner dies, a standby takes over within 15 s.
+- **Away is instance-wide.** The TUIs report their last input; the bridge counts as away after
+  `away.minutes` without input in _any_ of them, and always when no TUI is attached. `/oob afk
+on|off|auto` overrides it for the instance.
+- **Suspended sessions.** When a session holds messages it is not working on (a prompt you queued
+  that never ran, subagent results nobody delivered), the bridge sends a notice to the session's
+  topic with a **▶ Resume** button. The button wakes the session through the host's synthetic-message
+  call. If the host refuses, the notice says to open it at the Mac. Away mode itself cannot be
+  changed from a chat.
+- **Question forms.** The server plugin API has no form-reply call; only a TUI has one. A form
+  answered from a chat is handed to an attached TUI, which makes the reply. With no TUI attached
+  the answer is refused and the chat says to answer at the Mac.
+
+### Upgrading from 0.12.x
+
+The bridge no longer runs in the TUI. Install the plugin where the **server** loads it, restart
+OpenCode, and check `/oob status` (it shows the owner pid). Settings and the Telegram chat carry
+over. The sidebar size now lives in `tui.json` in the state directory, seeded from the old
+`settings.json`. A server that is not running the plugin shows `bridge offline` in the sidebar.
+
 ## Install
 
 Needs OpenCode 2 and Node 24 to build.
@@ -29,7 +63,7 @@ Put the folder where OpenCode loads plugins from (OpenCode 2 loads a directory t
 ```
 
 Then copy [`oob-bridge.example.jsonc`](oob-bridge.example.jsonc) to
-`~/.config/opencode/oob-bridge.jsonc` and restart the TUI. **Without a config file the plugin does
+`~/.config/opencode/oob-bridge.jsonc` and restart OpenCode. **Without a config file the plugin does
 nothing and opens no connection.**
 
 ## Configuration
@@ -388,23 +422,27 @@ Typing is the fast path:
 
 The host completes only slash names, so every sub-command is also its own slash entry:
 `/oob-on`, `/oob-off`, `/oob-auto`, `/oob-chat`, `/oob-delivery`, `/oob-channel`, `/oob-pair`,
-`/oob-test`, `/oob-sidebar`, `/oob-status` and `/oob-help` show up in the prompt's slash list with
+`/oob-test`, `/oob-sidebar`, `/oob-afk`, `/oob-session`, `/oob-resume`, `/oob-restart`, `/oob-status` and `/oob-help` show up in the prompt's slash list with
 their usage. `/oob-chat on` does exactly what `/oob chat on` does, and `/oob-chat` alone asks for
 the value. Bare `/oob` (and `/ntfy`) stays the picker.
 
-| Command                                 | What it does                                                                                            |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `/oob on [<channel\|all>]`              | Push this session's questions and notices now, through one channel or all.                              |
-| `/oob off`                              | Never push this session.                                                                                |
-| `/oob auto`                             | Push this session after the away time without input, if the rules pick it.                              |
-| `/oob chat <on\|off>`                   | Let messages in the session's topic reach it, or stop taking them.                                      |
-| `/oob delivery <queue\|steer\|default>` | How your messages from a channel reach a busy session: queue, steer, or the config's default.           |
-| `/oob channel <channel> <on\|off>`      | Turn a channel on or off for every session; kept across restarts.                                       |
-| `/oob pair <channel>`                   | Show the code or link that binds a channel to a chat (the name can be left out when only one can pair). |
-| `/oob test`                             | Push a test message through every enabled channel.                                                      |
-| `/oob sidebar <full\|compact\|off>`     | How big the section in the session sidebar is: full, compact or off.                                    |
-| `/oob status`                           | Show each channel's connection, the open prompts and this session's settings.                           |
-| `/oob help`                             | List every sub-command with its usage.                                                                  |
+| Command                                                  | What it does                                                                                                               |
+| -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `/oob on [<channel\|all>]`                               | Push this session's questions and notices now, through one channel or all.                                                 |
+| `/oob off`                                               | Never push this session.                                                                                                   |
+| `/oob auto`                                              | Push this session after the away time without input, if the rules pick it.                                                 |
+| `/oob chat <on\|off>`                                    | Let messages in the session's topic reach it, or stop taking them.                                                         |
+| `/oob delivery <queue\|steer\|default>`                  | How your messages from a channel reach a busy session: queue, steer, or the config's default.                              |
+| `/oob channel <channel> <on\|off>`                       | Turn a channel on or off for every session; kept across restarts.                                                          |
+| `/oob pair <channel>`                                    | Show the code or link that binds a channel to a chat (the name can be left out when only one can pair).                    |
+| `/oob test`                                              | Push a test message through every enabled channel.                                                                         |
+| `/oob sidebar <full\|compact\|off>`                      | How big the section in the session sidebar is: full, compact or off.                                                       |
+| `/oob afk <on\|off\|auto>`                               | When you count as away, for the whole OpenCode instance: on, off, or auto after the away time without input in any window. |
+| `/oob session <session> <on\|off\|auto\|chat\|chat-off>` | Notify and chat settings of any session of this instance: on, off, auto, chat or chat-off.                                 |
+| `/oob resume <session>`                                  | Wake a session that is suspended with messages waiting in its inbox.                                                       |
+| `/oob restart`                                           | Restart the bridge in the OpenCode server: channels reconnect. The server keeps running.                                   |
+| `/oob status`                                            | Show the bridge, who counts as away, each channel, the open prompts and this session's settings.                           |
+| `/oob help`                                              | List every sub-command with its usage.                                                                                     |
 
 ## Sidebar
 
@@ -418,6 +456,8 @@ OOB - Remote access         telegram
   Chat      on                     ▾
   Replies   after turn             ▾
   Waiting   1 question             ▾
+  Away      here · auto            ▾
+  Bridge    1835 · up 3d           ▾
 ```
 
 Click a row to open a list of every choice, the current one marked. The sidebar updates at once.
@@ -428,6 +468,9 @@ Click a row to open a list of every choice, the current one marked. The sidebar 
 | Chat    | Whether you can write to the session from the channel: `on`, `off`, `denied`. | On, Off. When `chat.deny` blocks the session, the list says which rule and On is disabled. Left out when no selected channel can chat. |
 | Replies | How your messages arrive: `after turn` (queue) or `immediately` (steer).      | Immediately, After turn, Default (follow `chat.delivery`). A choice is kept per session in the settings file.                          |
 | Waiting | Open questions and requests; only when there are some.                        | The open prompts, oldest first; pick one to go to its session.                                                                         |
+| Away    | Whether you count as away, instance-wide: `here · auto`, `away · on`.         | Auto (after `away.minutes` without input in any window), Away, Here.                                                                   |
+| Stuck   | Sessions suspended with messages waiting; only when there are some.           | The sessions; pick one to resume it.                                                                                                   |
+| Bridge  | The owner's pid and uptime, or `offline`, or the channel that is failing.     | Restart the bridge (not the server).                                                                                                   |
 
 `sidebar` sets the size: `"full"` (default), `"compact"` or `"off"`. Compact is one line, and a
 click opens the `/oob` picker:
@@ -561,10 +604,12 @@ themselves.
 
 ## Limitations
 
-- OpenCode 2 only. The bridge runs in the TUI process, the only place a plugin can answer a
-  question, so a server without a TUI (`opencode serve`) sends nothing.
-- Each running TUI sends its own pushes: with two TUIs open you get every push twice.
-- Away means no prompt typed in any session of this TUI; keystrokes alone do not count.
+- OpenCode 2 only. The bridge runs in the server, so a server without a TUI (`opencode serve`)
+  sends pushes, but a question can only be answered from a chat while a TUI is attached.
+- Away means no input in any attached TUI; keystrokes alone do not count. With no TUI it is always
+  away.
+- Waking a suspended session uses the host's synthetic-message call; the host has no dedicated
+  resume call, so a session it refuses to wake has to be opened at the Mac.
 - Tier 2 (remote permission replies) is not implemented.
 - In OpenCode 2.3 the built-in subagents have no `question` tool, so subagent questions only come
   from agents you give it to. Subagent permission prompts are mirrored as usual.

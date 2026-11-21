@@ -61,6 +61,8 @@ const auto = (routes: boolean, reason: string) => ({
 
 export class Router {
   private lastInput: number
+  private afk: "auto" | "on" | "off" = "auto"
+  private present: () => boolean = () => true
   private readonly manual = new Map<string, { on: boolean; channel?: string }>()
   private readonly classified = new Map<string, Promise<boolean>>()
 
@@ -80,12 +82,33 @@ export class Router {
     this.lastInput = now()
   }
 
-  /** Records operator input in the TUI. */
-  touch(): void {
-    this.lastInput = this.now()
+  /** Records operator input in a TUI; `at` is when it happened, if a TUI reports it later. */
+  touch(at?: number): void {
+    this.lastInput = Math.max(this.lastInput, at ?? this.now())
+  }
+
+  /** When the operator last gave input, in epoch ms. */
+  lastInputAt(): number {
+    return this.lastInput
+  }
+
+  /** `on` and `off` force away and present; `auto` follows the time since the last input. */
+  setAfk(mode: "auto" | "on" | "off"): void {
+    this.afk = mode
+  }
+
+  afkMode(): "auto" | "on" | "off" {
+    return this.afk
+  }
+
+  /** Whether any TUI is attached: with none, auto counts as away. */
+  setPresence(fn: () => boolean): void {
+    this.present = fn
   }
 
   away(): boolean {
+    if (this.afk !== "auto") return this.afk === "on"
+    if (!this.present()) return true
     return this.now() - this.lastInput >= this.cfg.away.minutes * 60_000
   }
 

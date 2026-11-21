@@ -90,6 +90,8 @@ export interface Host {
   interrupt(sessionID: string): Promise<boolean>
   compact(sessionID: string): Promise<void>
   rename(sessionID: string, title: string): Promise<void>
+  /** Wakes a session that holds messages it is not working on. Absent when the host cannot. */
+  resume?(sessionID: string): Promise<void>
   /** Primary agents the session can switch to. */
   agents(): Promise<string[]>
   /** Chat models of the configured providers. */
@@ -1449,11 +1451,78 @@ export class Bridge {
     info: { outcome: string; root?: string },
   ): Promise<Outcome | undefined> {
     const root = m.sessionKey
-    if (!ch.capabilities.inboundPrompt || !root || m.text !== "chat off")
-      return undefined
+    if (!ch.capabilities.inboundPrompt || !root) return undefined
+    if (m.text === "resume") {
+      info.root = root
+      info.outcome = "applied"
+      return this.resume(root)
+    }
+    if (m.text !== "chat off") return undefined
     info.root = root
     info.outcome = "applied"
     return this.setChat(root, false)
+  }
+
+  /** Wakes a session; says so, or says it must be done at the computer. */
+  async resume(root: string): Promise<Outcome> {
+    const where = "Open it at the Mac to resume it."
+    if (!this.host.resume)
+      return no("This OpenCode cannot resume a session from here. " + where)
+    try {
+      await this.host.resume(root)
+      return {
+        ok: true,
+        text: "▶ Resuming: the session is picking up its waiting messages.",
+      }
+    } catch (err) {
+      log("resume_error", { message: (err as Error).message })
+      return no("Could not resume it. " + where)
+    }
+  }
+
+  /**
+   * A message has waited on a session that is not working on it. Told to the
+   * session's channels, with a button that wakes it where the channel has buttons.
+   */
+  async stalled(
+    root: string,
+    o: { pending: number; minutes: number },
+  ): Promise<boolean> {
+    const r = await this.routed(root)
+    if (!r) return false
+    const text =
+      (o.pending === 1 ? "A message" : o.pending + " messages") +
+      " to this session " +
+      (o.pending === 1 ? "has" : "have") +
+      " waited " +
+      o.minutes +
+      " min and it is not working on " +
+      (o.pending === 1 ? "it" : "them") +
+      ". Resume wakes it, or open it at the Mac."
+    const f = this.fmt("notice", { text })
+    const { ok } = await this.dispatch(
+      "notice",
+      r.to,
+      (ch) => ({
+        ...f,
+        ...this.shape(ch, r.session),
+        ...this.card(ch, "notice", r.facts, () => ({ kind: "notice", text })),
+        action:
+          ch.capabilities.buttons && this.host.resume
+            ? { label: "▶ Resume", control: "resume" }
+            : undefined,
+      }),
+      { root },
+    )
+    return Object.values(ok).some(Boolean)
+  }
+
+  /** Top-level sessions shown to a channel, newest first, with what was last shown. */
+  known(): Array<{ id: string; state?: SessionState }> {
+    const ids = new Set<string>([...this.lastStates.keys(), ...this.chat])
+    return [...ids]
+      .map((id) => ({ id, state: this.lastStates.get(id) }))
+      .sort((a, b) => (b.state?.at ?? 0) - (a.state?.at ?? 0))
   }
 
   private async apply(
