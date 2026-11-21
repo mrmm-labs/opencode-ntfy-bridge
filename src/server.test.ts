@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { afterEach, describe, it } from "node:test"
 
 import { fakeNtfy } from "./connectors/fake-ntfy.test-util.ts"
+import { fakeTelegram } from "./connectors/fake-telegram.test-util.ts"
 import { fakeServer } from "./fake-server.test-util.ts"
 import plugin from "./index.ts"
 import { formRelay } from "./remote.ts"
@@ -102,6 +103,41 @@ describe("the server half", () => {
     await stop!()
     assert.equal(server.disposed(), 1)
     await t.n.close()
+  })
+
+  it("answers with JSON values only: a connector status holding undefined is not refused by the host", async () => {
+    const tg = await fakeTelegram()
+    const dir = await mkdtemp(join(tmpdir(), "oobb-json-"))
+    const cfg = join(dir, "c.jsonc")
+    await writeFile(
+      cfg,
+      JSON.stringify({
+        channels: {
+          telegram: {
+            token: { env: "OOBB_JSON_TOKEN" },
+            chatId: 7,
+            apiBase: tg.url,
+          },
+        },
+      }),
+    )
+    const server = fakeServer()
+    const stop = await withEnv(
+      {
+        OPENCODE_OOB_BRIDGE_CONFIG: cfg,
+        OPENCODE_OOB_BRIDGE_DATA: dir,
+        OOBB_JSON_TOKEN: "123456:TESTTOKEN",
+      },
+      () => startServer(server.ctx),
+    )
+    if (stop) running.push(stop)
+    const s = await status(server)
+    assert.deepEqual(
+      s.channels.map((c) => c.id),
+      ["telegram"],
+    )
+    await stop!()
+    await tg.close()
   })
 
   it("two instances in one process: one poller, and both answer", async () => {

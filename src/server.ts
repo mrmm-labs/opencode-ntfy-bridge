@@ -440,6 +440,24 @@ async function boot(
   }
 }
 
+/**
+ * The host accepts only JSON values in an RPC answer or event: an object key
+ * holding `undefined` is refused as `rpc.invalid_output`. A round trip drops those keys.
+ */
+const plain = <T>(v: T): T => JSON.parse(JSON.stringify(v ?? null)) as T
+
+/** Logs what a handler throws before the host turns it into `rpc.internal`. */
+const guard =
+  <A, R>(method: string, fn: (input: A) => Promise<R>) =>
+  async (input: A): Promise<R> => {
+    try {
+      return plain(await fn(input))
+    } catch (err) {
+      log("rpc_error", { method, message: (err as Error).message })
+      throw err
+    }
+  }
+
 type Registration = {
   dispose(): Promise<void>
   events: { emit: (...a: never[]) => Promise<void> }
@@ -488,7 +506,7 @@ class Hub {
         m.reg?.events.emit as unknown as
           | ((n: string, d: unknown) => Promise<void>)
           | undefined
-      )?.("form", r).catch((err: Error) =>
+      )?.("form", plain(r)).catch((err: Error) =>
         log("form_relay_error", { message: err.message }),
       )
   }
@@ -512,7 +530,7 @@ class Hub {
     this.members.add(member)
     const ctl = () => this.control()
     member.reg = (await ctx.rpc.register(definition, {
-      status: async (input: unknown) => {
+      status: guard("status", async (input: unknown) => {
         const i = (isObject(input) ? input : {}) as {
           tui?: string
           inputAt?: number
@@ -524,15 +542,15 @@ class Hub {
         ctl().heartbeat(String(i.tui ?? "tui"), i.inputAt)
         ctl().watch(roots)
         return ctl().snapshot(roots) as never
-      },
-      op: async (input: unknown) => {
+      }),
+      op: guard("op", async (input: unknown) => {
         const i = (isObject(input) ? input : {}) as {
           op?: string
           args?: Record<string, unknown>
         }
         return (await ctl().op(String(i.op ?? ""), i.args)) as never
-      },
-      formDone: async (input: unknown) => {
+      }),
+      formDone: guard("formDone", async (input: unknown) => {
         const i = (isObject(input) ? input : {}) as {
           token?: string
           ok?: boolean
@@ -541,7 +559,7 @@ class Hub {
         return {
           ok: this.forms.done(String(i.token ?? ""), i.ok === true, i.error),
         } as never
-      },
+      }),
     } as never)) as unknown as Registration
     await this.serial(() => this.elect())
     return () => this.leave(member)
